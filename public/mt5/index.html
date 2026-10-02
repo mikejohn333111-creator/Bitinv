@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1419">
+<title>Tbot MT5 Dashboard</title>
+<link rel="icon" href="../icon.svg" type="image/svg+xml">
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --text: #14181f; --muted: #667085; --line: #e4e7ec;
+    --buy: #12805c; --buy-bg: #e3f4ed; --sell: #c4332b; --sell-bg: #fbe9e7;
+    --warn: #9a6200; --warn-bg: #fff4dc; --accent: #1f7a5c; --chip: #eef0f3;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0f1419; --card: #171d24; --text: #e8ecf1; --muted: #8b96a5; --line: #252d37;
+      --buy: #3ccf95; --buy-bg: #133227; --sell: #ff7a70; --sell-bg: #3a1a18;
+      --warn: #f3c25b; --warn-bg: #352a10; --accent: #3ccf95; --chip: #222a33;
+    }
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text);
+         font: 15px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+  main { max-width: 760px; margin: 0 auto; padding: 16px 16px 48px; }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 4px 0 16px; }
+  h1 { font-size: 22px; margin: 0; letter-spacing: -0.01em; }
+  .live { display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 13px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .dot.on { background: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 20%, transparent); }
+  .banner { background: var(--warn-bg); color: var(--warn); border-radius: 10px; padding: 10px 12px; margin-bottom: 12px; font-size: 14px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 20px 0 8px; font-weight: 600; }
+  .bots { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; }
+  .bot-top { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+  .bot-name { font-weight: 600; }
+  .sym { color: var(--muted); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .pills { display: flex; flex-wrap: wrap; gap: 6px; margin: 8px 0; }
+  .pill { font-size: 12px; padding: 2px 8px; border-radius: 999px; background: var(--chip); color: var(--muted); }
+  .pill.ok { background: var(--buy-bg); color: var(--buy); }
+  .pill.bad { background: var(--sell-bg); color: var(--sell); }
+  .pill.warn { background: var(--warn-bg); color: var(--warn); }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 12px; font-size: 13px; }
+  .stats span { color: var(--muted); }
+  .stats b { font-weight: 600; font-variant-numeric: tabular-nums; }
+  .filters { display: flex; gap: 6px; margin-bottom: 10px; }
+  .filters button { border: 1px solid var(--line); background: var(--card); color: var(--text); border-radius: 999px;
+                    padding: 6px 14px; font: inherit; font-size: 14px; cursor: pointer; }
+  .filters button[aria-pressed="true"] { background: var(--text); color: var(--bg); border-color: var(--text); }
+  .list { display: flex; flex-direction: column; gap: 8px; }
+  .ev { display: grid; grid-template-columns: auto 1fr auto; gap: 4px 12px; align-items: start; }
+  .side { font-weight: 700; font-size: 12px; padding: 4px 8px; border-radius: 6px; min-width: 46px; text-align: center; }
+  .side.BUY { background: var(--buy-bg); color: var(--buy); }
+  .side.SELL { background: var(--sell-bg); color: var(--sell); }
+  .ev-title { font-weight: 600; }
+  .ev-title small { font-weight: 400; color: var(--muted); }
+  .ev-time { color: var(--muted); font-size: 12px; text-align: right; white-space: nowrap; }
+  .levels { grid-column: 2 / 4; display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 13px; font-variant-numeric: tabular-nums; }
+  .levels span { color: var(--muted); }
+  .reason { grid-column: 2 / 4; color: var(--muted); font-size: 13px; }
+  .pos { color: var(--buy); } .neg { color: var(--sell); }
+  .empty { text-align: center; color: var(--muted); padding: 32px 16px; }
+  footer { color: var(--muted); font-size: 12px; margin-top: 28px; text-align: center; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>MT5 bots</h1>
+    <div class="live"><span class="dot" id="dot"></span><span id="updated">connecting…</span></div>
+  </header>
+  <div id="banner"></div>
+
+  <h2>Bots</h2>
+  <div class="bots" id="bots"></div>
+
+  <h2>Activity</h2>
+  <div class="filters" role="group" aria-label="Filter activity">
+    <button data-f="all" aria-pressed="true">All</button>
+    <button data-f="signal" aria-pressed="false">Signals</button>
+    <button data-f="trade" aria-pressed="false">Trades</button>
+  </div>
+  <div class="list" id="list"></div>
+
+  <footer>Signals come from automated rules and a model. They are not financial advice, and past results don't guarantee future profit.</footer>
+</main>
+
+<script src="dashboard.js" defer></script>
+</body>
+</html>

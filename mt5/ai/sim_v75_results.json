@@ -1,0 +1,100 @@
+{
+  "features": [
+    "ret_1",
+    "ret_2",
+    "ret_3",
+    "ret_5",
+    "ret_10",
+    "ret_15",
+    "ret_30",
+    "ret_60",
+    "dist_sma20",
+    "dist_sma60",
+    "range",
+    "body",
+    "upper_wick",
+    "lower_wick",
+    "rsi14",
+    "vol_ratio",
+    "pos_in_range60"
+  ],
+  "n_features": 17,
+  "classes": [
+    "down",
+    "none",
+    "up"
+  ],
+  "barrier_atr": 3.0,
+  "horizon_bars": 60,
+  "margin": 0.1,
+  "suggested_threshold": 0.575,
+  "validation_expectancy_R": 0.1581,
+  "trained_from": "2025-12-24 23:59:00",
+  "trained_to": "2026-06-24 22:59:00",
+  "walk_forward": {
+    "folds": 5,
+    "trades": 2130,
+    "win_rate": 0.496,
+    "avg_gross_R": -0.0034,
+    "avg_net_R": -0.0034,
+    "total_net_R": -7.3
+  },
+  "folds": [
+    {
+      "test_from": "2025-07-01",
+      "threshold": 0.55,
+      "acc": 0.485,
+      "majority": 0.491,
+      "trades": 274,
+      "win_rate": 0.526,
+      "gross_R": 0.066,
+      "net_R": 0.066,
+      "total_net_R": 18.2
+    },
+    {
+      "test_from": "2025-09-01",
+      "threshold": null,
+      "acc": 0.487,
+      "majority": 0.487,
+      "trades": 0,
+      "win_rate": null,
+      "gross_R": null,
+      "net_R": null,
+      "total_net_R": 0.0
+    },
+    {
+      "test_from": "2025-11-01",
+      "threshold": 0.55,
+      "acc": 0.492,
+      "majority": 0.492,
+      "trades": 659,
+      "win_rate": 0.495,
+      "gross_R": -0.011,
+      "net_R": -0.011,
+      "total_net_R": -7.4
+    },
+    {
+      "test_from": "2026-01-01",
+      "threshold": 0.55,
+      "acc": 0.483,
+      "majority": 0.485,
+      "trades": 422,
+      "win_rate": 0.464,
+      "gross_R": -0.063,
+      "net_R": -0.063,
+      "total_net_R": -26.4
+    },
+    {
+      "test_from": "2026-03-01",
+      "threshold": 0.5,
+      "acc": 0.486,
+      "majority": 0.494,
+      "trades": 775,
+      "win_rate": 0.503,
+      "gross_R": 0.011,
+      "net_R": 0.011,
+      "total_net_R": 8.4
+    }
+  ],
+  "onnx_max_abs_diff": 1.1920928955078125e-07
+}

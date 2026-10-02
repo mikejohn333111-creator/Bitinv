@@ -1,0 +1,166 @@
+{
+  "features": [
+    "ret_1",
+    "ret_2",
+    "ret_3",
+    "ret_5",
+    "ret_10",
+    "ret_15",
+    "ret_30",
+    "ret_60",
+    "dist_sma20",
+    "dist_sma60",
+    "range",
+    "body",
+    "upper_wick",
+    "lower_wick",
+    "rsi14",
+    "vol_ratio",
+    "pos_in_range60"
+  ],
+  "n_features": 17,
+  "classes": [
+    "down",
+    "none",
+    "up"
+  ],
+  "barrier_atr": 3.0,
+  "horizon_bars": 60,
+  "margin": 0.1,
+  "suggested_threshold": null,
+  "validation_expectancy_R": 0.0,
+  "trained_from": "2024-12-31 16:57:00",
+  "trained_to": "2025-12-31 15:54:00",
+  "walk_forward": {
+    "folds": 11,
+    "trades": 0,
+    "win_rate": null,
+    "avg_gross_R": null,
+    "avg_net_R": null,
+    "total_net_R": 0.0
+  },
+  "folds": [
+    {
+      "test_from": "2023-01-02",
+      "threshold": null,
+      "acc": 0.48,
+      "majority": 0.474,
+      "trades": 0,
+      "win_rate": null,
+      "gross_R": null,
+      "net_R": null,
+      "total_net_R": 0.0
+    },
+    {
+      "test_from": "2023-04-02",
+      "threshold": null,
+      "acc": 0.474,
+      "majority": 0.478,
+      "trades": 0,
+      "win_rate": null,
+      "gross_R": null,
+      "net_R": null,
+      "total_net_R": 0.0
+    },
+    {
+      "test_from": "2023-07-02",
+      "threshold": null,
+      "acc": 0.479,
+      "majority": 0.484,
+      "trades": 0,
+      "win_rate": null,
+      "gross_R": null,
+      "net_R": null,
+      "total_net_R": 0.0
+    },
+    {
+      "test_from": "2023-10-02",
+      "threshold": null,
+      "acc": 0.484,
+      "majority": 0.483,
+      "trades": 0,
+      "win_rate": null,
+      "gross_R": null,
+      "net_R": null,
+      "total_net_R": 0.0
+    },
+    {
+      "test_from": "2024-01-02",
+      "threshold": null,
+      "acc": 0.473,
+      "majority": 0.482,
+      "trades": 0,
+      "win_rate": null,
+      "gross_R": null,
+      "net_R": null,
+      "total_net_R": 0.0
+    },
+    {
+      "test_from": "2024-04-02",
+      "threshold": null,
+      "acc": 0.48,
+      "majority": 0.476,
+      "trades": 0,
+      "win_rate": null,
+      "gross_R": null,
+      "net_R": null,
+      "total_net_R": 0.0
+    },
+    {
+      "test_from": "2024-07-02",
+      "threshold": null,
+      "acc": 0.485,
+      "majority": 0.49,
+      "trades": 0,
+      "win_rate": null,
+      "gross_R": null,
+      "net_R": null,
+      "total_net_R": 0.0
+    },
+    {
+      "test_from": "2024-10-02",
+      "threshold": null,
+      "acc": 0.479,
+      "majority": 0.484,
+      "trades": 0,
+      "win_rate": null,
+      "gross_R": null,
+      "net_R": null,
+      "total_net_R": 0.0
+    },
+    {
+      "test_from": "2025-01-02",
+      "threshold": null,
+      "acc": 0.486,
+      "majority": 0.478,
+      "trades": 0,
+      "win_rate": null,
+      "gross_R": null,
+      "net_R": null,
+      "total_net_R": 0.0
+    },
+    {
+      "test_from": "2025-04-02",
+      "threshold": null,
+      "acc": 0.475,
+      "majority": 0.479,
+      "trades": 0,
+      "win_rate": null,
+      "gross_R": null,
+      "net_R": null,
+      "total_net_R": 0.0
+    },
+    {
+      "test_from": "2025-07-02",
+      "threshold": null,
+      "acc": 0.475,
+      "majority": 0.48,
+      "trades": 0,
+      "win_rate": null,
+      "gross_R": null,
+      "net_R": null,
+      "total_net_R": 0.0
+    }
+  ],
+  "onnx_max_abs_diff": 1.1920928955078125e-07
+}

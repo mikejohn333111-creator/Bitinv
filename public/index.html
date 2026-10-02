@@ -1,0 +1,127 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0f1419">
+<meta name="description" content="Tbot: a Deriv Multipliers bot that runs in your browser.">
+<title>Tbot Web</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="css/app.css">
+<script type="module" src="js/app.js"></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand"><img src="icon.svg" alt="" width="24" height="24"> Tbot</div>
+  <div class="conn"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></div>
+</header>
+
+<main>
+  <section class="card" id="loginCard" hidden>
+    <h2>Connect your Deriv account</h2>
+    <p class="muted">Live prices and signals work without logging in. To see your balance and let the bot trade, log in with Deriv. Your password goes only to Deriv.</p>
+    <button class="btn primary" id="loginBtn" type="button">Log in with Deriv</button>
+    <details class="sub">
+      <summary>Use a personal access token instead</summary>
+      <p class="muted small">Create a token in your Deriv developer dashboard and paste it here. It stays in this browser tab only and is forgotten when you close the tab.</p>
+      <label class="field"><span>Token</span><input id="patInput" type="password" autocomplete="off" spellcheck="false"></label>
+      <button class="btn" id="patBtn" type="button">Connect with token</button>
+    </details>
+    <p class="note" id="appIdNote" hidden>Add your Deriv App ID under <b>Settings</b> first. The README explains how to get one.</p>
+  </section>
+
+  <section class="card" id="accountCard" hidden>
+    <div class="row between">
+      <label class="field inline"><span>Account</span><select id="accountSelect"></select></label>
+      <button class="btn small ghost" id="logoutBtn" type="button">Log out</button>
+    </div>
+    <div class="row between">
+      <div><div class="muted small">Balance</div><div class="big" id="balance">–</div></div>
+      <div class="right"><div class="muted small">Today</div><div class="big" id="dayPL">–</div></div>
+    </div>
+    <p class="warn" id="realWarn" hidden>This is a <b>real money</b> account. Test on your demo account first.</p>
+  </section>
+
+  <section class="card chart-card">
+    <div class="row between">
+      <select id="symbolSelect" aria-label="Market"></select>
+      <div class="price" id="lastPrice">–</div>
+    </div>
+    <div id="chart" class="chart" aria-label="1-minute chart"></div>
+  </section>
+
+  <section class="card">
+    <div class="seg" role="radiogroup" aria-label="Strategy">
+      <button type="button" data-strategy="rules" aria-pressed="true">Rules</button>
+      <button type="button" data-strategy="ai" aria-pressed="false">AI model</button>
+    </div>
+    <div class="seg" role="radiogroup" aria-label="Mode">
+      <button type="button" data-mode="signals" aria-pressed="true">Signals only</button>
+      <button type="button" data-mode="auto" aria-pressed="false">Auto trade</button>
+    </div>
+    <button class="btn primary big-btn" id="runBtn" type="button">Start bot</button>
+    <dl class="status">
+      <dt>Bot</dt><dd id="botState">stopped</dd>
+      <dt id="infoLabel">Market</dt><dd id="infoText">–</dd>
+      <dt>Trades today</dt><dd id="tradesToday">–</dd>
+      <dt>Cost per trade</dt><dd id="costText">shown after the first quote</dd>
+    </dl>
+    <p class="muted small">The bot runs only while this page is open. Keep the screen on, because phones pause pages in the background.</p>
+  </section>
+
+  <section class="card">
+    <h2>Open trades</h2>
+    <div id="openList" class="list"><p class="muted small">None.</p></div>
+  </section>
+
+  <section class="card">
+    <h2>Activity</h2>
+    <div id="log" class="list log"></div>
+  </section>
+
+  <details class="card" id="settingsCard">
+    <summary><h2>Settings</h2></summary>
+    <form id="settingsForm" class="grid">
+      <fieldset>
+        <legend>Risk</legend>
+        <label class="field"><span>Risk per trade (% of balance)</span><input name="riskPct" type="number" step="0.1" min="0.1" max="5"></label>
+        <label class="field"><span>Daily loss limit (%)</span><input name="maxDailyLossPct" type="number" step="0.5" min="0" max="20"></label>
+        <label class="field"><span>Max open trades</span><input name="maxOpen" type="number" step="1" min="1" max="5"></label>
+        <label class="field"><span>Max trades per day</span><input name="maxTradesPerDay" type="number" step="1" min="0"></label>
+        <label class="field"><span>Pause after this many losses in a row</span><input name="maxConsecLosses" type="number" step="1" min="0"></label>
+        <label class="field"><span>Pause length (minutes)</span><input name="cooldownMinutes" type="number" step="1" min="1"></label>
+        <label class="field"><span>Multiplier</span><select name="multiplier" id="multiplierSelect"></select></label>
+      </fieldset>
+      <fieldset>
+        <legend>Signals</legend>
+        <label class="field"><span>Min minutes between signals</span><input name="signalGap" type="number" step="1" min="1"></label>
+        <label class="check"><input name="notify" type="checkbox"> Phone/desktop notifications</label>
+        <label class="check"><input name="sound" type="checkbox"> Sound</label>
+      </fieldset>
+      <fieldset>
+        <legend>AI model</legend>
+        <label class="field"><span>Confidence threshold</span><input name="aiThreshold" type="number" step="0.01" min="0.35" max="0.95"></label>
+        <label class="field"><span>Stop/target distance (× ATR)</span><input name="aiBarrier" type="number" step="0.5" min="1" max="10"></label>
+        <label class="field"><span>Close after (minutes)</span><input name="aiHorizon" type="number" step="5" min="5" max="240"></label>
+      </fieldset>
+      <fieldset>
+        <legend>Deriv app</legend>
+        <label class="field"><span>App ID</span><input name="appId" type="text" inputmode="numeric" autocomplete="off" spellcheck="false"></label>
+        <p class="muted small" id="redirectHint"></p>
+      </fieldset>
+      <fieldset>
+        <legend>Data for training</legend>
+        <label class="field"><span>Days of 1-minute history</span><input id="histDays" type="number" value="30" min="1" max="365"></label>
+        <button class="btn" id="downloadBtn" type="button">Download CSV</button>
+        <p class="muted small">Use this file with <code>mt5/ai/train.py</code> to retrain and test the AI model on this market.</p>
+      </fieldset>
+    </form>
+  </details>
+
+  <footer>
+    Trading Multipliers can lose your whole stake. No bot wins every trade. Results shown by this bot are not a promise of future profit. Start on a demo account.
+    <br><a href="mt5/">MT5 dashboard</a>
+  </footer>
+</main>
+</body>
+</html>

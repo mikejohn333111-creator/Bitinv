@@ -54,7 +54,7 @@ The login card shows what went wrong. The usual causes:
 
 | What you see | What to do |
 |---|---|
-| An error page on Deriv's site about the redirect URL | The redirect URL registered at developers.deriv.com must be exactly `https://tbot-mauve-eta.vercel.app/`. |
+| An error page on Deriv's site about the redirect URL | The redirect URL registered at developers.deriv.com must be exactly `https://tbot-mauve-eta.vercel.app/`. If you registered it without the slash at the end, tick "My app's redirect URL has no slash at the end" under Settings, Deriv app. |
 | "Deriv didn't accept this App ID" | Copy the App ID of the OAuth app again. |
 | "This login came back in a different tab or browser" | Open the site in Chrome or Safari (not inside WhatsApp, Telegram etc.) and finish the login in that browser. |
 | "Deriv refused the permissions" | Tick the trading scope for the app. If account access isn't allowed, the bot logs in again with trading only by itself. |

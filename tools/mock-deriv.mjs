@@ -9,6 +9,7 @@
 //   MOCK_CLIENT_ID=abc        only this App ID is accepted (others get Deriv's own error page)
 //   MOCK_ALLOWED_SCOPES=trade scopes the app may ask for (default "trade account_manage")
 //   MOCK_NO_ACCOUNTS=1        the login starts with no Options account
+//   MOCK_ACCOUNTS_404=1       ...and Deriv lists no accounts as 404 AccountNotFound instead of []
 //   MOCK_TOKEN_TTL=60         access token lifetime in seconds; MOCK_REFRESH=1 also issues refresh tokens
 //   MOCK_NO_PROXY=1           /api/token is missing, as if the site had no server functions
 //   MOCK_REDIRECT=url         the registered redirect URL (default http://localhost:8787/)
@@ -147,6 +148,7 @@ const server = createServer(async (req, res) => {
       return json(201, { data: [acc] });
     }
     if (!scopes.includes("trade")) return json(403, apiError(403, "AccessDenied", "Missing scope: trade"));
+    if (!accounts.length && process.env.MOCK_ACCOUNTS_404) return json(404, apiError(404, "AccountNotFound", "Resource not found"));
     return json(200, { data: accounts, meta: { endpoint: "/accounts", method: "GET", timing: 3 } });
   }
   // static files

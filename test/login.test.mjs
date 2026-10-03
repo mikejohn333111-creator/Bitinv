@@ -41,9 +41,54 @@ test("token function marks answers that never reached Deriv's OAuth server", asy
   let res = await post({ grant_type: "refresh_token", client_id: "abc", refresh_token: "r" });
   assert.equal(res.status, 502);
   assert.equal((await res.json()).proxy_error, "upstream_not_oauth");
-  stubFetch(() => { throw new TypeError("fetch failed"); });
+  stubFetch(() => { throw new TypeError("fetch failed", { cause: Object.assign(new Error("refused"), { code: "ECONNREFUSED" }) }); });
   res = await post({ grant_type: "refresh_token", client_id: "abc", refresh_token: "r" });
   assert.equal((await res.json()).proxy_error, "upstream_unreachable");
+});
+
+test("token function never lets the page resend a code Deriv may have used", async () => {
+  stubFetch(() => { throw new DOMException("The operation timed out.", "TimeoutError"); });
+  let res = await post({ grant_type: "authorization_code", client_id: "abc", code: "c", redirect_uri: "https://site/", code_verifier: "v" });
+  assert.equal(res.status, 504);
+  assert.deepEqual(Object.keys(await res.json()).sort(), ["error", "error_description"]);
+  stubFetch(() => { throw new TypeError("fetch failed", { cause: Object.assign(new Error("reset"), { code: "ECONNRESET" }) }); });
+  res = await post({ grant_type: "authorization_code", client_id: "abc", code: "c", redirect_uri: "https://site/", code_verifier: "v" });
+  assert.equal((await res.json()).error, "temporarily_unavailable");
+});
+
+test("a 404 'AccountNotFound' list means no accounts yet; other 404s are errors", async () => {
+  const cfg = { apiUrl: "https://api.example", authUrl: "https://auth.example", appId: "abc" };
+  const auth = { kind: "oauth", token: "t", expiresAt: Date.now() + 3600e3 };
+  stubFetch(() => jsonRes(404, { errors: [{ status: 404, code: "AccountNotFound", message: "Resource not found" }] }));
+  assert.deepEqual(await getAccounts(cfg, auth), []);
+  stubFetch(() => jsonRes(404, { errors: [{ status: 404, code: "RouteMissing", message: "No route" }] }));
+  await assert.rejects(getAccounts(cfg, auth), /404/);
+});
+
+test("overlapping calls share one token refresh", async () => {
+  const cfg = { apiUrl: "https://api.example", authUrl: "https://auth.example", appId: "abc" };
+  const auth = { kind: "oauth", token: "old", refreshToken: "r1", clientId: "abc", scope: "trade", expiresAt: Date.now() - 1000 };
+  let refreshes = 0;
+  globalThis.fetch = async (url, opts) => {
+    if (url === "/api/token") { refreshes++; await new Promise((r) => setTimeout(r, 20));
+      return new Response(JSON.stringify({ access_token: "new", expires_in: 3600, refresh_token: "r2" }), { status: 200, headers: { "X-Tbot-Proxy": "1" } }); }
+    return opts.headers.Authorization === "Bearer new" ? jsonRes(200, { data: [{ account_id: "D1", account_type: "demo" }] })
+                                                       : jsonRes(401, { errors: [{ code: "InvalidToken", message: "expired" }] });
+  };
+  const [a, b] = await Promise.all([getAccounts(cfg, auth), getAccounts(cfg, auth)]);
+  assert.equal(a[0].id, "D1"); assert.equal(b[0].id, "D1");
+  assert.equal(refreshes, 1);
+});
+
+test("when the refresh works but the retried call fails, that call's own error is reported", async () => {
+  const cfg = { apiUrl: "https://api.example", authUrl: "https://auth.example", appId: "abc" };
+  const auth = { kind: "oauth", token: "old", refreshToken: "r1", clientId: "abc", scope: "trade", expiresAt: Date.now() + 3600e3 };
+  globalThis.fetch = async (url, opts) => {
+    if (url === "/api/token") return new Response(JSON.stringify({ access_token: "new", expires_in: 3600 }), { status: 200, headers: { "X-Tbot-Proxy": "1" } });
+    return opts.headers.Authorization === "Bearer new" ? jsonRes(503, { errors: [{ code: "Busy", message: "try later" }] })
+                                                       : jsonRes(401, { errors: [{ code: "InvalidToken", message: "expired" }] });
+  };
+  await assert.rejects(getAccounts(cfg, auth), (e) => e.status === 503 && !e.auth);
 });
 
 test("token function rejects anything but a code or refresh exchange", async () => {

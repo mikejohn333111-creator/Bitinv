@@ -26,6 +26,7 @@ const DEFAULT_SETTINGS = {
   riskPct: 1, maxDailyLossPct: 3, maxOpen: 1, maxTradesPerDay: 20, maxConsecLosses: 3, cooldownMinutes: 15,
   multiplier: 0, signalGap: 8, notify: true, sound: true,
   aiThreshold: 0.55, aiBarrier: AI_DEFAULTS.barrierATR, aiHorizon: AI_DEFAULTS.horizonBars,
+  redirectNoSlash: false,
 };
 const store = {
   get(k, fallback) { try { return JSON.parse(localStorage.getItem(k)) ?? fallback; } catch { return fallback; } },
@@ -34,8 +35,9 @@ const store = {
 const settings = { ...DEFAULT_SETTINGS, ...store.get("tbot:settings", {}) };
 const saveSettings = () => store.set("tbot:settings", settings);
 cfg.appId = cleanAppId(settings.appId) || CONFIG.appId;
+cfg.redirectNoSlash = !!settings.redirectNoSlash;
 const saveAuth = (auth) => { try { sessionStorage.setItem("tbot:auth", JSON.stringify(auth)); } catch { /* blocked */ } };
-cfg.onAuthChange = saveAuth;   // keeps a refreshed token for this tab
+cfg.onAuthChange = (auth) => { if (auth === st.auth) saveAuth(auth); };   // keeps a refreshed token, unless logged out meanwhile
 // Deriv only returns logins to the registered address, so other addresses of this site can't log in.
 const onOtherHost = !!CONFIG.siteUrl && location.hostname.endsWith(".vercel.app") && location.origin !== new URL(CONFIG.siteUrl).origin;
 const inAppBrowser = /FBAN|FBAV|Instagram|Line\/|WhatsApp|Telegram|Snapchat|; wv\)/i.test(navigator.userAgent);
@@ -436,6 +438,10 @@ function setLoginBusy(text) {
   $("loginBtn").disabled = !!text;
   if (text) showLoginMsg(text, "note");
 }
+// If the page doesn't actually leave for Deriv (stopped, or the link opened elsewhere), allow another try.
+function leavingForDeriv() {
+  setTimeout(() => { if (!st.auth && $("loginBtn").disabled) { setLoginBusy(""); showLoginMsg(""); } }, 15000);
+}
 function setAppId(value, from) {
   settings.appId = cleanAppId(value);
   saveSettings();
@@ -517,6 +523,7 @@ async function login() {
   setLoginBusy("Opening Deriv's login page…");
   try {
     await startOAuth(cfg, scopeFor(cfg.appId));
+    leavingForDeriv();
   } catch (e) {
     setLoginBusy("");
     log("ERROR", "Login failed", e.message);
@@ -537,7 +544,7 @@ async function returnFromDeriv() {
       store.set(scopeKey(e.clientId), "trade");
       log("INFO", "Deriv refused account access for this app, so logging in again with trading access only");
       setLoginBusy("Logging in again with trading access only…");
-      try { await startOAuth({ ...cfg, appId: e.clientId }, "trade"); return null; } catch (e2) { e = e2; }
+      try { await startOAuth({ ...cfg, appId: e.clientId }, "trade"); leavingForDeriv(); return null; } catch (e2) { e = e2; }
     }
     setLoginBusy("");
     log("ERROR", "Login failed", e.message);
@@ -584,6 +591,11 @@ function renderMultipliers() {
   $("multiplierSelect").innerHTML = st.multipliers.map((m) => `<option value="${m}" ${m === cur ? "selected" : ""}>x${m}</option>`).join("");
 }
 
+function showRedirect() {
+  $("redirectHint").textContent = `Redirect URL to register: ${redirectUri(cfg)}`;
+  document.querySelectorAll(".redirectExact").forEach((el) => (el.textContent = redirectUri(cfg)));
+}
+
 function fillSettingsForm() {
   const f = $("settingsForm");
   for (const el of f.elements) {
@@ -591,8 +603,7 @@ function fillSettingsForm() {
     if (el.type === "checkbox") el.checked = !!settings[el.name];
     else if (el.name !== "multiplier") el.value = settings[el.name];
   }
-  $("redirectHint").textContent = `Redirect URL to register: ${redirectUri()}`;
-  document.querySelectorAll(".redirectExact").forEach((el) => (el.textContent = redirectUri()));
+  showRedirect();
   $("loginAppId").value = settings.appId;
 }
 
@@ -602,6 +613,7 @@ $("settingsForm").addEventListener("change", (ev) => {
   if (el.name === "appId") { setAppId(el.value, "settings"); el.value = settings.appId; return; }
   settings[el.name] = el.type === "checkbox" ? el.checked : el.type === "number" ? Number(el.value) : el.value.trim();
   saveSettings();
+  if (el.name === "redirectNoSlash") { cfg.redirectNoSlash = el.checked; showRedirect(); }
   if (st.guard) st.guard.limits = limits();
   renderControls();
 });
@@ -620,7 +632,11 @@ document.querySelectorAll("[data-mode]").forEach((b) => b.addEventListener("clic
 $("runBtn").addEventListener("click", () => (st.running ? stopBot() : startBot()));
 $("loginBtn").addEventListener("click", login);
 // Coming back with the browser's Back button restores the page as it was when it left for Deriv.
-addEventListener("pageshow", (e) => { if (e.persisted && !st.auth) { setLoginBusy(""); showLoginMsg(""); } });
+addEventListener("pageshow", (e) => {
+  if (!e.persisted || st.auth) return;
+  setLoginBusy(""); showLoginMsg("");
+  if (st.socket?.ws?.readyState !== WebSocket.OPEN) connectPublic();
+});
 $("patBtn").addEventListener("click", () => {
   const token = $("patInput").value.trim();
   const typed = cleanAppId($("loginAppId").value);

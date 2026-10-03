@@ -28,7 +28,7 @@
     <details class="sub">
       <summary>Login not working?</summary>
       <ul class="muted small tips">
-        <li>Your app's redirect URL at developers.deriv.com must be exactly <b class="redirectExact"></b>, including the slash at the end.</li>
+        <li>Your app's redirect URL at developers.deriv.com must be exactly <b class="redirectExact"></b>. If you registered it without the slash at the end, tick that option under Settings, Deriv app.</li>
         <li>Use the App ID of an app of the <b>OAuth</b> type, with the trading permission (trade) ticked.</li>
         <li>Open this page in Chrome or Safari, not inside another app, and finish the login in the same browser.</li>
       </ul>
@@ -119,6 +119,7 @@
         <legend>Deriv app</legend>
         <label class="field"><span>App ID</span><input name="appId" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
         <p class="muted small" id="redirectHint"></p>
+        <label class="check"><input name="redirectNoSlash" type="checkbox"> My app's redirect URL has no slash at the end</label>
       </fieldset>
       <fieldset>
         <legend>Data for training</legend>

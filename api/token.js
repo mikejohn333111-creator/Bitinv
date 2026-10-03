@@ -3,6 +3,7 @@
 // browser, so the page sends its OAuth form here and this forwards it to Deriv.
 // Only the standard OAuth fields are passed on, only to Deriv, and nothing is stored.
 const AUTH_URL = (process.env.DERIV_AUTH_URL || "https://auth.deriv.com").replace(/\/+$/, "");
+const NOT_SENT = new Set(["ENOTFOUND", "EAI_AGAIN", "ECONNREFUSED", "UND_ERR_CONNECT_TIMEOUT", "EHOSTUNREACH", "ENETUNREACH"]);
 const FIELDS = {
   authorization_code: ["code", "redirect_uri", "code_verifier"],
   refresh_token: ["refresh_token"],
@@ -35,13 +36,19 @@ export async function POST(request) {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
       body,
-      signal: AbortSignal.timeout(15000),
+      signal: AbortSignal.timeout(8000),   // stay inside the function's time limit, so it always answers
     });
   } catch (e) {
-    // Deriv never saw the code, so the page can still try the exchange itself.
-    return json({ proxy_error: "upstream_unreachable", detail: String(e.message || e) }, 502);
+    // Only when the connection was never made has Deriv not seen the code, so the page
+    // may try the exchange itself. After a timeout or a dropped answer it may have been used.
+    const code = e?.cause?.code || "";
+    if (NOT_SENT.has(code)) return json({ proxy_error: "upstream_unreachable", detail: code }, 502);
+    return json({ error: "temporarily_unavailable", error_description: "Deriv's login server didn't answer in time" }, 504);
   }
-  const raw = await upstream.text();
+  let raw = "";
+  try { raw = await upstream.text(); } catch {
+    return json({ error: "temporarily_unavailable", error_description: "Deriv's answer was cut off" }, 504);
+  }
   let data = null;
   try { data = JSON.parse(raw); } catch { /* not JSON */ }
   if (!data || typeof data !== "object" || (!data.access_token && !data.error)) {

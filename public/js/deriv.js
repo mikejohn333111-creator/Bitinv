@@ -17,8 +17,14 @@ function randomString(n = 64) {
   return b64url(crypto.getRandomValues(new Uint8Array(n))).slice(0, n);
 }
 
-/** Where Deriv sends the user back. It must equal the app's registered redirect URL exactly. */
-export const redirectUri = () => location.origin + "/";
+/**
+ * Where Deriv sends the user back. It must equal the app's registered redirect URL exactly,
+ * so cfg.redirectNoSlash covers an app registered without the slash at the end.
+ */
+export const redirectUri = (cfg) => location.origin + (cfg?.redirectNoSlash ? "" : "/");
+
+// Network calls give up after this long, so a stalled phone connection gets an error, not a hang.
+const timeout = (ms) => (AbortSignal.timeout ? AbortSignal.timeout(ms) : undefined);
 
 /** App IDs pasted on phones can carry spaces or invisible characters. */
 export const cleanAppId = (s) => String(s ?? "").replace(/[\s​-‍⁠﻿]/g, "");
@@ -76,7 +82,7 @@ export async function startOAuth(cfg, scope = FULL_SCOPE) {
   if (!globalThis.crypto?.subtle) throw new LoginError("insecure", "This browser can't do a secure login here. Open the page in Chrome or Safari.");
   const verifier = randomString(64);
   const challenge = b64url(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier)));
-  const rec = { verifier, state: randomString(32), clientId, redirectUri: redirectUri(), scope, t: Date.now() };
+  const rec = { verifier, state: randomString(32), clientId, redirectUri: redirectUri(cfg), scope, t: Date.now() };
   if (!savePkce(rec)) throw new LoginError("storage", "This browser blocks site storage, so the login can't finish. Open the page in Chrome or Safari.");
   const url = new URL(cfg.authUrl + "/oauth2/auth");
   url.search = new URLSearchParams({
@@ -105,11 +111,13 @@ function describeOAuthError(code, description) {
 export async function finishOAuth(cfg) {
   const q = new URLSearchParams(location.search);
   if (!q.has("code") && !q.has("error")) return null;
-  history.replaceState(null, "", redirectUri());
+  history.replaceState(null, "", location.origin + "/");
   const rec = q.get("state") ? takePkce(q.get("state")) : null;
   if (q.has("error")) {
-    const code = q.get("error");
-    throw new LoginError(code, describeOAuthError(code, q.get("error_description")), { scope: rec?.scope, clientId: rec?.clientId });
+    // Only repeat Deriv's words for a login this browser started; anyone can put text in a link.
+    if (!rec) throw new LoginError("no_pkce", "The Deriv login didn't finish. Please tap Log in again.");
+    const code = /^[a-z_]{1,40}$/.test(q.get("error")) ? q.get("error") : "unknown";
+    throw new LoginError(code, describeOAuthError(code, q.get("error_description")), { scope: rec.scope, clientId: rec.clientId });
   }
   if (!rec) throw new LoginError("no_pkce", "This login came back in a different tab or browser from the one it started in. Open the bot in Chrome or Safari and tap Log in again.");
   if (!(Date.now() - rec.t < PKCE_TTL)) throw new LoginError("expired", "That login took too long. Please tap Log in again.");
@@ -127,20 +135,22 @@ const toAuth = (t, clientId, scope) => ({
 
 async function exchange(cfg, fields) {
   const opts = { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" }, body: new URLSearchParams(fields).toString() };
-  // Deriv's docs want this done on a server, so try this site's /api/token first. If that
-  // isn't there or couldn't reach Deriv, Deriv never saw the code and the page can safely
-  // do the exchange itself, as Deriv's own sample apps do.
+  // Deriv's docs want this done on a server, so this site's /api/token does it. Only when that
+  // function is missing, or says it couldn't reach Deriv at all, has Deriv not seen the code,
+  // and then the page does the exchange itself, as Deriv's own sample apps do.
   let data = null, status = 0;
   try {
-    const res = await fetch("/api/token", opts);
-    if (res.headers.get("X-Tbot-Proxy")) {
-      const d = await res.json().catch(() => null);
-      if (d && !d.proxy_error) { data = d; status = res.status; }
-    }
-  } catch { /* not deployed here */ }
+    const res = await fetch("/api/token", { ...opts, signal: timeout(30000) });
+    const viaProxy = !!res.headers.get("X-Tbot-Proxy");
+    const d = viaProxy ? await res.json().catch(() => null) : null;
+    if (d && !d.proxy_error) { data = d; status = res.status; }
+    else if (viaProxy && !d) throw new Error("bad answer from /api/token");
+  } catch (e) {
+    throw new LoginError("network", `Couldn't finish the login (${e.message}). Check your connection and tap Log in again.`);
+  }
   if (!data) {
     try {
-      const res = await fetch(cfg.authUrl + "/oauth2/token", opts);
+      const res = await fetch(cfg.authUrl + "/oauth2/token", { ...opts, signal: timeout(30000) });
       status = res.status;
       data = await res.json().catch(() => ({}));
     } catch (e) {
@@ -154,12 +164,21 @@ async function exchange(cfg, fields) {
   return data;
 }
 
-async function refresh(cfg, auth) {
-  const next = toAuth(await exchange(cfg, { grant_type: "refresh_token", client_id: auth.clientId, refresh_token: auth.refreshToken }),
-                      auth.clientId, auth.scope);
-  next.refreshToken ||= auth.refreshToken;
-  Object.assign(auth, next);
-  cfg.onAuthChange?.(auth);
+// One refresh at a time per login: Deriv's auth server may revoke a refresh token that is used twice.
+const refreshing = new WeakMap();
+function refresh(cfg, auth) {
+  if (!refreshing.has(auth)) {
+    const run = (async () => {
+      const next = toAuth(await exchange(cfg, { grant_type: "refresh_token", client_id: auth.clientId, refresh_token: auth.refreshToken }),
+                          auth.clientId, auth.scope);
+      next.refreshToken ||= auth.refreshToken;
+      Object.assign(auth, next);
+      cfg.onAuthChange?.(auth);
+    })();
+    refreshing.set(auth, run);
+    run.finally(() => refreshing.delete(auth)).catch(() => {});
+  }
+  return refreshing.get(auth);
 }
 
 // ------------------------------------------------------------------- REST
@@ -181,14 +200,16 @@ async function rest(cfg, auth, method, path, body, retried = false) {
   if (body) headers["Content-Type"] = "application/json";
   let res;
   try {
-    res = await fetch(cfg.apiUrl + path, { method, headers, body: body ? JSON.stringify(body) : undefined });
+    res = await fetch(cfg.apiUrl + path, { method, headers, body: body ? JSON.stringify(body) : undefined, signal: timeout(20000) });
   } catch (e) {
     throw new Error(`Couldn't reach Deriv's API (${e.message}).`);
   }
   const data = await res.json().catch(() => ({}));
   if (res.ok) return data;
   if (res.status === 401 && canRefresh) {
-    try { await refresh(cfg, auth); return await rest(cfg, auth, method, path, body, true); } catch { /* report the 401 */ }
+    let refreshed = false;
+    try { await refresh(cfg, auth); refreshed = true; } catch { /* report the 401 below */ }
+    if (refreshed) return rest(cfg, auth, method, path, body, true);
   }
   const detail = apiErrorText(data);
   throw Object.assign(new Error(`Deriv API ${res.status}${detail ? `: ${detail}` : ""}`),
@@ -209,7 +230,13 @@ export function normalizeAccounts(data) {
 }
 
 export async function getAccounts(cfg, auth) {
-  return normalizeAccounts(await rest(cfg, auth, "GET", "/trading/v1/options/accounts"));
+  try {
+    return normalizeAccounts(await rest(cfg, auth, "GET", "/trading/v1/options/accounts"));
+  } catch (e) {
+    // Deriv documents 404 AccountNotFound for this list: treat it as "no accounts yet".
+    if (e.status === 404 && (!e.detail || /AccountNotFound|not found/i.test(e.detail))) return [];
+    throw e;
+  }
 }
 
 /** Creates the user's demo Options account (needs the account_manage scope). */
@@ -241,7 +268,7 @@ export class DerivSocket {
   }
 
   async connect() {
-    this.closedByUser = false;
+    if (this.closedByUser) return;   // a closed socket stays closed; the app makes a new one
     this.onStatus("connecting");
     let url, ws;
     try {
@@ -249,6 +276,7 @@ export class DerivSocket {
       if (this.closedByUser) return;
       ws = new WebSocket(url);
     } catch (e) {
+      if (this.closedByUser) return;
       this.onStatus("offline"); this.onError(e);
       if (!e.auth) this.#scheduleReconnect();
       return;
@@ -288,7 +316,7 @@ export class DerivSocket {
   #scheduleReconnect() {
     const delay = Math.min(30000, 1000 * 2 ** this.retry++);
     clearTimeout(this.reconnectTimer);
-    this.reconnectTimer = setTimeout(() => this.connect(), delay);
+    this.reconnectTimer = setTimeout(() => { if (!this.closedByUser) this.connect(); }, delay);
   }
 
   #onMessage(text) {

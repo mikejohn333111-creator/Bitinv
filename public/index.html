@@ -20,14 +20,25 @@
   <section class="card" id="loginCard" hidden>
     <h2>Connect your Deriv account</h2>
     <p class="muted">Live prices and signals work without logging in. To see your balance and let the bot trade, log in with Deriv. Your password goes only to Deriv.</p>
+    <label class="field" id="loginAppIdRow"><span>Deriv App ID</span><input id="loginAppId" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="From your app at developers.deriv.com"></label>
     <button class="btn primary" id="loginBtn" type="button">Log in with Deriv</button>
+    <p class="warn" id="loginMsg" role="alert" hidden></p>
+    <p class="note" id="otherHostNote" hidden>Deriv only sends logins back to <a id="siteLink" href="/"></a>. Open the bot there to log in.</p>
+    <p class="muted small" id="inAppHint" hidden>You seem to be inside another app's browser. If the Deriv login doesn't come back here, open this page in Chrome or Safari.</p>
+    <details class="sub">
+      <summary>Login not working?</summary>
+      <ul class="muted small tips">
+        <li>Your app's redirect URL at developers.deriv.com must be exactly <b class="redirectExact"></b>, including the slash at the end.</li>
+        <li>Use the App ID of an app of the <b>OAuth</b> type, with the trading permission (trade) ticked.</li>
+        <li>Open this page in Chrome or Safari, not inside another app, and finish the login in the same browser.</li>
+      </ul>
+    </details>
     <details class="sub">
       <summary>Use a personal access token instead</summary>
       <p class="muted small">Create a token in your Deriv developer dashboard and paste it here. It stays in this browser tab only and is forgotten when you close the tab.</p>
       <label class="field"><span>Token</span><input id="patInput" type="password" autocomplete="off" spellcheck="false"></label>
       <button class="btn" id="patBtn" type="button">Connect with token</button>
     </details>
-    <p class="note" id="appIdNote" hidden>Add your Deriv App ID under <b>Settings</b> first. The README explains how to get one.</p>
   </section>
 
   <section class="card" id="accountCard" hidden>
@@ -106,7 +117,7 @@
       </fieldset>
       <fieldset>
         <legend>Deriv app</legend>
-        <label class="field"><span>App ID</span><input name="appId" type="text" inputmode="numeric" autocomplete="off" spellcheck="false"></label>
+        <label class="field"><span>App ID</span><input name="appId" type="text" autocomplete="off" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
         <p class="muted small" id="redirectHint"></p>
       </fieldset>
       <fieldset>

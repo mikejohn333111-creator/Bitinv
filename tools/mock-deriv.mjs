@@ -4,6 +4,14 @@
 // walk at Volatility-75 strength, and time runs fast (one M1 bar per BAR_MS ms).
 //
 //   node tools/mock-deriv.mjs            -> http://localhost:8787/?api=http://localhost:8787&auth=http://localhost:8787&ws=ws://localhost:8787/trading/v1/options/ws/public
+//
+// Settings for testing login problems (environment variables):
+//   MOCK_CLIENT_ID=abc        only this App ID is accepted (others get Deriv's own error page)
+//   MOCK_ALLOWED_SCOPES=trade scopes the app may ask for (default "trade account_manage")
+//   MOCK_NO_ACCOUNTS=1        the login starts with no Options account
+//   MOCK_TOKEN_TTL=60         access token lifetime in seconds; MOCK_REFRESH=1 also issues refresh tokens
+//   MOCK_NO_PROXY=1           /api/token is missing, as if the site had no server functions
+//   MOCK_REDIRECT=url         the registered redirect URL (default http://localhost:8787/)
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
@@ -11,6 +19,8 @@ import { extname, join, normalize } from "node:path";
 import { WebSocketServer } from "ws";
 
 const PORT = Number(process.env.PORT || 8787);
+process.env.DERIV_AUTH_URL = `http://localhost:${PORT}`;   // the site's /api/token forwards to this mock
+const { POST: tokenProxy } = await import("../api/token.js");
 const BAR_MS = Number(process.env.BAR_MS || 1000);
 const root = new URL("../public/", import.meta.url).pathname;
 // Serve pages with the same Content-Security-Policy as vercel.json, plus this mock's own address.
@@ -35,12 +45,26 @@ for (let i = 0; i < 2000; i++) bars.push(makeBar(clockEpoch + i * 60));
 let forming = makeBar(clockEpoch + 2000 * 60);
 
 // ----------------------------------------------------------------- state
-const codes = new Map();           // code -> {challenge}
-const TOKEN = "mock-access-token";
-const accounts = [
-  { account_id: "DOT90000001", account_type: "demo", currency: "USD", balance: 10000 },
-  { account_id: "ROT10000001", account_type: "real", currency: "USD", balance: 25 },
+const codes = new Map();           // code -> {challenge, clientId, redirectUri, scope}
+const tokens = new Map();          // access token -> {scope, exp}
+const refreshTokens = new Map();   // refresh token -> {scope, clientId}
+const ALLOWED_SCOPES = (process.env.MOCK_ALLOWED_SCOPES || "trade account_manage").split(/\s+/);
+const TOKEN_TTL = Number(process.env.MOCK_TOKEN_TTL || 3600);
+const accounts = process.env.MOCK_NO_ACCOUNTS ? [] : [
+  { account_id: "DOT90000001", account_type: "demo", currency: "USD", balance: 10000, group: "row", status: "active" },
+  { account_id: "ROT10000001", account_type: "real", currency: "USD", balance: 25, group: "row", status: "active" },
 ];
+function issueToken(scope, clientId) {
+  const access = "ory_at_" + randomBytes(12).toString("hex");
+  tokens.set(access, { scope, exp: Date.now() + TOKEN_TTL * 1000 });
+  const out = { access_token: access, token_type: "Bearer", expires_in: TOKEN_TTL, scope };
+  if (process.env.MOCK_REFRESH) {
+    out.refresh_token = "ory_rt_" + randomBytes(12).toString("hex");
+    refreshTokens.set(out.refresh_token, { scope, clientId });
+  }
+  return out;
+}
+const apiError = (status, code, message) => ({ errors: [{ status, code, message }], meta: { timing: 1 } });
 const otps = new Map();            // otp -> account
 const contracts = new Map();       // id -> contract
 let nextContract = 1000;
@@ -59,32 +83,71 @@ const server = createServer(async (req, res) => {
 
   if (url.pathname === "/oauth2/auth") {
     const p = url.searchParams;
-    if (p.get("code_challenge_method") !== "S256" || !p.get("client_id")) return json(400, { error: "invalid_request" });
-    const code = randomBytes(8).toString("hex");
-    codes.set(code, { challenge: p.get("code_challenge") });
+    const page = (code, text) => res.writeHead(code, { "Content-Type": "text/html" }).end(`<h1>Deriv login error</h1><p>${text}</p>`);
+    if (p.get("code_challenge_method") !== "S256" || !p.get("client_id")) return page(400, "invalid_request");
+    if (process.env.MOCK_CLIENT_ID && p.get("client_id") !== process.env.MOCK_CLIENT_ID) return page(401, "invalid_client");
+    if (p.get("redirect_uri") !== (process.env.MOCK_REDIRECT || `http://localhost:${PORT}/`)) return page(400, "The 'redirect_uri' parameter does not match any of the OAuth 2.0 Client's pre-registered redirect urls.");
     const back = new URL(p.get("redirect_uri"));
-    back.searchParams.set("code", code); back.searchParams.set("state", p.get("state"));
+    back.searchParams.set("state", p.get("state"));
+    const asked = (p.get("scope") || "").split(/\s+/).filter(Boolean);
+    const bad = asked.find((x) => !ALLOWED_SCOPES.includes(x));
+    if (bad) {
+      back.searchParams.set("error", "invalid_scope");
+      back.searchParams.set("error_description", `The OAuth 2.0 Client is not allowed to request scope '${bad}'.`);
+      return res.writeHead(302, { Location: back.toString() }).end();
+    }
+    const code = randomBytes(8).toString("hex");
+    codes.set(code, { challenge: p.get("code_challenge"), clientId: p.get("client_id"), redirectUri: p.get("redirect_uri"), scope: asked.join(" ") });
+    back.searchParams.set("code", code);
     return res.writeHead(302, { Location: back.toString() }).end();
+  }
+  if (url.pathname === "/api/token" && req.method === "POST" && !process.env.MOCK_NO_PROXY) {
+    const out = await tokenProxy(new Request(`http://localhost:${PORT}/api/token`, { method: "POST", body }));
+    res.writeHead(out.status, Object.fromEntries(out.headers)).end(await out.text());
+    return;
   }
   if (url.pathname === "/oauth2/token" && req.method === "POST") {
     const p = new URLSearchParams(body);
+    if (p.get("grant_type") === "refresh_token") {
+      const r = refreshTokens.get(p.get("refresh_token"));
+      if (!r || r.clientId !== p.get("client_id")) return json(400, { error: "invalid_grant", error_description: "bad refresh token" });
+      refreshTokens.delete(p.get("refresh_token"));
+      return json(200, issueToken(r.scope, r.clientId));
+    }
     const entry = codes.get(p.get("code"));
     const challenge = createHash("sha256").update(p.get("code_verifier") || "").digest("base64url");
-    if (!entry || entry.challenge !== challenge) return json(400, { error: "invalid_grant" });
+    if (!entry || entry.challenge !== challenge || entry.clientId !== p.get("client_id") || entry.redirectUri !== p.get("redirect_uri"))
+      return json(400, { error: "invalid_grant", error_description: "The provided authorization grant is invalid." });
     codes.delete(p.get("code"));
-    return json(200, { access_token: TOKEN, token_type: "Bearer", expires_in: 3600 });
+    return json(200, issueToken(entry.scope, entry.clientId));
   }
   if (url.pathname.startsWith("/trading/v1/options/accounts")) {
-    if (req.headers.authorization !== `Bearer ${TOKEN}`) return json(401, { error: { message: "unauthorized" } });
+    const tok = tokens.get((req.headers.authorization || "").replace(/^Bearer /, ""));
+    if (!tok || tok.exp < Date.now()) return json(401, apiError(401, "InvalidToken", "Invalid or expired token"));
+    const scopes = tok.scope.split(" ");
     const m = url.pathname.match(/accounts\/([^/]+)\/otp$/);
     if (m && req.method === "POST") {
+      if (!scopes.includes("trade")) return json(403, apiError(403, "AccessDenied", "Missing scope: trade"));
       const acc = accounts.find((a) => a.account_id === m[1]);
-      if (!acc) return json(404, { error: { message: "no such account" } });
+      if (!acc) return json(404, apiError(404, "AccountNotFound", "Resource not found"));
       const otp = randomBytes(6).toString("hex");
       otps.set(otp, acc);
       return json(200, { data: { url: `ws://localhost:${PORT}/trading/v1/options/ws/${acc.account_type}?otp=${otp}` } });
     }
-    return json(200, { data: accounts });
+    if (req.method === "POST") {
+      if (!scopes.includes("account_manage")) return json(403, apiError(403, "AccessDenied", "Missing scope: account_manage"));
+      let b = {};
+      try { b = JSON.parse(body); } catch { return json(400, apiError(400, "InvalidBody", "Invalid JSON")); }
+      if (b.currency !== "USD" || b.group !== "row" || !["demo", "real"].includes(b.account_type)) return json(400, apiError(400, "InvalidBody", "Bad account fields"));
+      const existing = accounts.find((a) => a.account_type === b.account_type);
+      if (existing) return json(200, { data: existing });
+      const acc = { account_id: (b.account_type === "demo" ? "DOT" : "ROT") + String(90000000 + accounts.length + 1),
+                    account_type: b.account_type, currency: "USD", balance: b.account_type === "demo" ? 10000 : 0, group: "row", status: "active" };
+      accounts.push(acc);
+      return json(201, { data: [acc] });
+    }
+    if (!scopes.includes("trade")) return json(403, apiError(403, "AccessDenied", "Missing scope: trade"));
+    return json(200, { data: accounts, meta: { endpoint: "/accounts", method: "GET", timing: 3 } });
   }
   // static files
   try {

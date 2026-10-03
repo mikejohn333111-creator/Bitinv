@@ -2,7 +2,8 @@
 import { CONFIG, SYMBOLS } from "./config.js";
 import { evaluateRules, evaluateAI, RULES_DEFAULTS, AI_DEFAULTS, rulesMinBars } from "./strategy.js";
 import { sizeMultiplier, RiskGuard } from "./risk.js";
-import { startOAuth, finishOAuth, getAccounts, getTradingSocketUrl, DerivSocket, redirectUri } from "./deriv.js";
+import { startOAuth, finishOAuth, getAccounts, createDemoAccount, getTradingSocketUrl, DerivSocket, redirectUri,
+         cleanAppId, hasScope, FULL_SCOPE } from "./deriv.js";
 import { createChart, CrosshairMode } from "../vendor/lightweight-charts.mjs";
 
 const $ = (id) => document.getElementById(id);
@@ -32,7 +33,12 @@ const store = {
 };
 const settings = { ...DEFAULT_SETTINGS, ...store.get("tbot:settings", {}) };
 const saveSettings = () => store.set("tbot:settings", settings);
-cfg.appId = settings.appId || CONFIG.appId;
+cfg.appId = cleanAppId(settings.appId) || CONFIG.appId;
+const saveAuth = (auth) => { try { sessionStorage.setItem("tbot:auth", JSON.stringify(auth)); } catch { /* blocked */ } };
+cfg.onAuthChange = saveAuth;   // keeps a refreshed token for this tab
+// Deriv only returns logins to the registered address, so other addresses of this site can't log in.
+const onOtherHost = !!CONFIG.siteUrl && location.hostname.endsWith(".vercel.app") && location.origin !== new URL(CONFIG.siteUrl).origin;
+const inAppBrowser = /FBAN|FBAV|Instagram|Line\/|WhatsApp|Telegram|Snapchat|; wv\)/i.test(navigator.userAgent);
 
 // ---------------------------------------------------------------- state
 const st = {
@@ -116,7 +122,7 @@ function renderAccount() {
   const loggedIn = !!st.auth;
   $("loginCard").hidden = loggedIn;
   $("accountCard").hidden = !loggedIn;
-  $("appIdNote").hidden = !!cfg.appId;
+  $("loginAppIdRow").hidden = !!CONFIG.appId;
   if (!loggedIn) return;
   $("accountSelect").innerHTML = st.accounts.map((a) =>
     `<option value="${esc(a.id)}" ${a.id === st.account?.id ? "selected" : ""}>${a.type === "demo" ? "Demo" : "REAL"} · ${esc(a.id)} · ${esc(a.currency)}</option>`).join("");
@@ -378,7 +384,10 @@ function makeSocket(urlProvider) {
   st.socket?.close();
   const sock = new DerivSocket(urlProvider, {
     onStatus: (s) => { setConn(s); if (s === "online") onOnline(); },
-    onError: (e) => { log("ERROR", e.message); if (e.auth) logout(); },
+    onError: (e) => {
+      log("ERROR", e.message);
+      if (e.auth) { logout(); showLoginMsg("Your Deriv login has expired. Please log in again."); }
+    },
   });
   st.socket = sock;
   subscribeMarket(sock);
@@ -416,29 +425,125 @@ const limits = () => ({
   maxConsecLosses: +settings.maxConsecLosses, cooldownMinutes: +settings.cooldownMinutes,
 });
 
-async function loginWith(auth) {
-  st.auth = auth;
-  sessionStorage.setItem("tbot:auth", JSON.stringify(auth));
+// --------------------------------------------------------------- login
+function showLoginMsg(text, kind = "warn") {
+  const el = $("loginMsg");
+  el.textContent = text || "";
+  el.className = kind;
+  el.hidden = !text;
+}
+function setLoginBusy(text) {
+  $("loginBtn").disabled = !!text;
+  if (text) showLoginMsg(text, "note");
+}
+function setAppId(value, from) {
+  settings.appId = cleanAppId(value);
+  saveSettings();
+  cfg.appId = settings.appId || CONFIG.appId;
+  if (from !== "login") $("loginAppId").value = settings.appId;
+  if (from !== "settings") $("settingsForm").elements.appId.value = settings.appId;
+}
+// Remembers when an App ID may only ask for trading access, so later logins ask for that directly.
+const scopeKey = (id) => `tbot:scope:${id}`;
+const scopeFor = (id) => store.get(scopeKey(id), FULL_SCOPE);
+
+function loginFailText(e, fresh) {
+  if (e.code === "no_account") return e.message;
+  if (e.status === 401) return fresh
+    ? `Deriv didn't accept the login (${e.detail || "401"}). Check the App ID and tap Log in again.`
+    : "Your Deriv login has expired. Please log in again.";
+  if (e.status === 403) return `Deriv logged you in but refused access to your trading accounts (${e.detail || "403"}). ` +
+    "In your app at developers.deriv.com, make sure the trading permission (trade) is ticked, then log in again.";
+  return e.message;
+}
+
+/** A login with no Options account yet gets a demo one, when the login allows creating it. */
+async function ensureAccount(auth) {
+  const noAccount = (why) => Object.assign(new Error("Your Deriv login has no Options trading account yet" + why), { code: "no_account" });
+  if (auth.kind === "oauth" && auth.scope && !hasScope(auth, "account_manage")) {
+    try { localStorage.removeItem(scopeKey(auth.clientId)); } catch { /* blocked */ }   // ask for account access next time
+    throw noAccount(". Open Deriv's trading site once to create one, or tick account access (account_manage) for your app at developers.deriv.com, then log in again.");
+  }
+  log("INFO", "No Options account yet, so creating your demo account");
   try {
-    st.accounts = await getAccounts(cfg, auth);
-    if (!st.accounts.length) throw new Error("No Options accounts found on this Deriv login.");
-    const saved = sessionStorage.getItem("tbot:account");
-    const pick = st.accounts.find((a) => a.id === saved) || st.accounts.find((a) => a.type === "demo") || st.accounts[0];
+    const created = await createDemoAccount(cfg, auth);
+    return created.length ? created : await getAccounts(cfg, auth);
+  } catch (e) {
+    throw noAccount(`, and creating a demo one failed (${e.message}).`);
+  }
+}
+
+async function loginWith(auth, fresh = false) {
+  st.auth = auth;
+  saveAuth(auth);
+  try {
+    let accounts = await getAccounts(cfg, auth);
+    if (!accounts.length) accounts = await ensureAccount(auth);
+    if (!accounts.length) throw Object.assign(new Error("Deriv didn't return any trading accounts for this login."), { code: "no_account" });
+    st.accounts = accounts;
+    let saved = null;
+    try { saved = sessionStorage.getItem("tbot:account"); } catch { /* blocked */ }
+    const pick = st.accounts.find((a) => a.id === saved) || st.accounts.find((a) => a.type === "demo" && a.active) ||
+                 st.accounts.find((a) => a.type === "demo") || st.accounts[0];
     log("INFO", `Logged in. Using ${pick.type === "demo" ? "demo" : "REAL"} account ${pick.id}`);
+    showLoginMsg("");
     connectAccount(pick);
   } catch (e) {
-    log("ERROR", "Login failed", e.message);
+    const msg = loginFailText(e, fresh);
+    log("ERROR", "Login failed", msg);
     logout();
+    showLoginMsg(msg);
   }
 }
 
 function logout() {
   stopBot();
   st.auth = null; st.account = null; st.accounts = []; st.guard = null; st.balance = NaN;
-  sessionStorage.removeItem("tbot:auth"); sessionStorage.removeItem("tbot:account");
+  try { sessionStorage.removeItem("tbot:auth"); sessionStorage.removeItem("tbot:account"); } catch { /* blocked */ }
   st.contracts.clear(); renderOpen();
   renderAccount(); renderControls();
   connectPublic();
+}
+
+async function login() {
+  if (onOtherHost) { location.assign(CONFIG.siteUrl + "/"); return; }
+  const typed = cleanAppId($("loginAppId").value);
+  if (typed && typed !== settings.appId) setAppId(typed, "login");
+  if (!cfg.appId) {
+    showLoginMsg("Paste your Deriv App ID first. It's shown on your app's page at developers.deriv.com.");
+    $("loginAppId").focus();
+    return;
+  }
+  setLoginBusy("Opening Deriv's login page…");
+  try {
+    await startOAuth(cfg, scopeFor(cfg.appId));
+  } catch (e) {
+    setLoginBusy("");
+    log("ERROR", "Login failed", e.message);
+    showLoginMsg(e.message);
+  }
+}
+
+/** Handles the page load that Deriv's login sends back. Returns the new auth, or null. */
+async function returnFromDeriv() {
+  const q = new URLSearchParams(location.search);
+  if (!q.has("code") && !q.has("error")) return null;
+  setLoginBusy("Finishing your Deriv login…");
+  try {
+    return await finishOAuth(cfg);
+  } catch (e) {
+    if (e.code === "invalid_scope" && e.clientId && e.scope && e.scope !== "trade") {
+      // This app may not ask for account access, so log in again asking for trading only.
+      store.set(scopeKey(e.clientId), "trade");
+      log("INFO", "Deriv refused account access for this app, so logging in again with trading access only");
+      setLoginBusy("Logging in again with trading access only…");
+      try { await startOAuth({ ...cfg, appId: e.clientId }, "trade"); return null; } catch (e2) { e = e2; }
+    }
+    setLoginBusy("");
+    log("ERROR", "Login failed", e.message);
+    showLoginMsg(e.message);
+    return null;
+  }
 }
 
 // ------------------------------------------------------------- run/stop
@@ -487,17 +592,22 @@ function fillSettingsForm() {
     else if (el.name !== "multiplier") el.value = settings[el.name];
   }
   $("redirectHint").textContent = `Redirect URL to register: ${redirectUri()}`;
+  document.querySelectorAll(".redirectExact").forEach((el) => (el.textContent = redirectUri()));
+  $("loginAppId").value = settings.appId;
 }
 
 $("settingsForm").addEventListener("change", (ev) => {
   const el = ev.target;
   if (!el.name || !(el.name in settings)) return;
+  if (el.name === "appId") { setAppId(el.value, "settings"); el.value = settings.appId; return; }
   settings[el.name] = el.type === "checkbox" ? el.checked : el.type === "number" ? Number(el.value) : el.value.trim();
   saveSettings();
-  if (el.name === "appId") { cfg.appId = settings.appId || CONFIG.appId; renderAccount(); }
   if (st.guard) st.guard.limits = limits();
   renderControls();
 });
+// Save the App ID as it's typed, so it isn't lost if the field never loses focus.
+$("settingsForm").elements.appId.addEventListener("input", (ev) => setAppId(ev.target.value, "settings"));
+$("loginAppId").addEventListener("input", (ev) => setAppId(ev.target.value, "login"));
 $("settingsForm").addEventListener("submit", (e) => e.preventDefault());
 
 document.querySelectorAll("[data-strategy]").forEach((b) => b.addEventListener("click", () => {
@@ -508,14 +618,18 @@ document.querySelectorAll("[data-mode]").forEach((b) => b.addEventListener("clic
   settings.mode = b.dataset.mode; saveSettings(); renderControls();
 }));
 $("runBtn").addEventListener("click", () => (st.running ? stopBot() : startBot()));
-$("loginBtn").addEventListener("click", () => startOAuth(cfg).catch((e) => { log("ERROR", e.message); $("appIdNote").hidden = false; }));
+$("loginBtn").addEventListener("click", login);
+// Coming back with the browser's Back button restores the page as it was when it left for Deriv.
+addEventListener("pageshow", (e) => { if (e.persisted && !st.auth) { setLoginBusy(""); showLoginMsg(""); } });
 $("patBtn").addEventListener("click", () => {
   const token = $("patInput").value.trim();
+  const typed = cleanAppId($("loginAppId").value);
+  if (typed && typed !== settings.appId) setAppId(typed, "login");
+  if (!cfg.appId) { showLoginMsg("A token also needs your Deriv App ID. Paste it above first."); return; }
   $("patInput").value = "";
-  if (!cfg.appId) { $("appIdNote").hidden = false; return; }
-  if (token) loginWith({ kind: "pat", token, expiresAt: Date.now() + 12 * 3600 * 1000 });
+  if (token) { showLoginMsg(""); loginWith({ kind: "pat", token, expiresAt: Date.now() + 12 * 3600 * 1000 }, true); }
 });
-$("logoutBtn").addEventListener("click", logout);
+$("logoutBtn").addEventListener("click", () => { logout(); showLoginMsg(""); });
 $("accountSelect").addEventListener("change", (e) => {
   const a = st.accounts.find((x) => x.id === e.target.value);
   if (!a) return;
@@ -581,19 +695,23 @@ async function boot() {
     if (res.ok) st.model = await res.json();
   } catch { /* AI stays disabled */ }
   renderAccount(); renderControls();
-
-  let auth = null;
-  try { auth = await finishOAuth(cfg); }
-  catch (e) { log("ERROR", e.message); }
-  if (!auth) {
-    try { auth = JSON.parse(sessionStorage.getItem("tbot:auth") || "null"); } catch { auth = null; }
-    if (auth && auth.expiresAt && auth.expiresAt < Date.now()) { auth = null; log("INFO", "Your Deriv login expired. Please log in again."); }
+  if (onOtherHost) {
+    $("siteLink").href = CONFIG.siteUrl + "/";
+    $("siteLink").textContent = new URL(CONFIG.siteUrl).host;
+    $("otherHostNote").hidden = false;
   }
-  if (auth) await loginWith(auth);
-  else connectPublic();
+  $("inAppHint").hidden = !inAppBrowser;
   log("INFO", settings.mode === "auto"
     ? "Mode is Auto trade. The bot places trades only after you press Start."
     : "Signals only is on. Nothing will be traded until you switch to Auto trade and start the bot.");
+
+  let auth = await returnFromDeriv(), fresh = !!auth;
+  if (!auth && !$("loginBtn").disabled) {
+    try { auth = JSON.parse(sessionStorage.getItem("tbot:auth") || "null"); } catch { auth = null; }
+    if (auth && !(auth.expiresAt > Date.now()) && !auth.refreshToken) { auth = null; log("INFO", "Your Deriv login expired. Please log in again."); }
+  }
+  if (auth) { await loginWith(auth, fresh); setLoginBusy(""); }
+  else if (!$("loginBtn").disabled) connectPublic();
 }
 
 if (isLocal) window.tbot = { st, settings, handleSignal, evaluate };   // test hook

@@ -39,12 +39,28 @@ Safety limits (Settings): risk per trade (default 1%), daily loss limit (3%: clo
 Deriv only lets registered apps log users in, so register this site once:
 
 1. Go to **developers.deriv.com**, log in with your Deriv account and open the **Dashboard**.
-2. Register a new application, choosing the **OAuth** type.
-3. For the redirect URL, enter your site address exactly as the bot's **Settings → Deriv app** section shows it, e.g. `https://bitinv.vercel.app/`.
-4. Give it the trading scope (and account access if offered). Save it and copy the **App ID**.
-5. On the site, open **Settings**, paste the App ID, then press **Log in with Deriv**. You sign in on Deriv's own page, and the bot never sees your password.
+2. Register a new application, choosing the **OAuth** type, with markup 0.
+3. For the redirect URL, enter the site address exactly, with the slash at the end: `https://tbot-mauve-eta.vercel.app/`. The bot's **Login not working?** tips show the address it uses.
+4. Give it the trading scope (`trade`), and account access (`account_manage`) if offered. Save it and copy the **App ID**.
+5. On the site, paste the App ID into the box on the login card and press **Log in with Deriv**. You sign in on Deriv's own page, and the bot never sees your password.
+
+The App ID is not a secret. To build it into the site, put it in `appId` in `public/js/config.js`; the box then disappears.
 
 Alternatively, a Deriv **personal access token** can be pasted under "Use a personal access token instead". That needs an app of the PAT type. The token is kept only in that browser tab.
+
+### If the login doesn't work
+
+The login card shows what went wrong. The usual causes:
+
+| What you see | What to do |
+|---|---|
+| An error page on Deriv's site about the redirect URL | The redirect URL registered at developers.deriv.com must be exactly `https://tbot-mauve-eta.vercel.app/`. |
+| "Deriv didn't accept this App ID" | Copy the App ID of the OAuth app again. |
+| "This login came back in a different tab or browser" | Open the site in Chrome or Safari (not inside WhatsApp, Telegram etc.) and finish the login in that browser. |
+| "Deriv refused the permissions" | Tick the trading scope for the app. If account access isn't allowed, the bot logs in again with trading only by itself. |
+| "No Options trading account yet" | Open Deriv's trading site once, or allow account access so the bot can create your demo account. |
+
+How the login works: Deriv sends the browser back with a one-time code, and the site's `/api/token` function swaps it for a login token with Deriv, as Deriv's docs ask. If that function is missing, the page does the swap itself, as Deriv's sample apps do. The token stays in that browser tab.
 
 ## Retraining the AI model on Deriv data
 
@@ -59,9 +75,10 @@ Only trust a model whose out-of-sample summary is clearly positive after costs a
 
 ```
 npm install
-npm test                 # strategy, sizing, risk-limit and API tests
+npm test                 # strategy, sizing, risk-limit, login and API tests
 npm run mock             # local fake Deriv: http://localhost:8787/?api=http://localhost:8787&auth=http://localhost:8787&ws=ws://localhost:8787/trading/v1/options/ws/public
+                         # MOCK_ALLOWED_SCOPES, MOCK_NO_ACCOUNTS, MOCK_TOKEN_TTL etc. fake login problems (see the file's header)
 npm run backtest         # backtest with Multiplier economics (add -- --csv file.csv for real data)
 ```
 
-The site is static (`public/`), plus two small functions in `api/` for the MT5 dashboard. `vercel.json` sets a strict Content-Security-Policy, so the page can only talk to Deriv.
+The site is static (`public/`), plus small functions in `api/`: `token.js` for the Deriv login, and `event.js`/`feed.js` for the MT5 dashboard. `vercel.json` sets a strict Content-Security-Policy, so the page can only talk to Deriv.

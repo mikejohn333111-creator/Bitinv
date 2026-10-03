@@ -95,3 +95,7 @@ code { font-size: 12px; background: var(--chip); padding: 1px 4px; border-radius
 footer { color: var(--muted); font-size: 12px; text-align: center; margin-top: 8px; }
 footer a { color: var(--muted); }
 [hidden] { display: none !important; }
+#loginMsg, #otherHostNote { margin: 10px 0 0; }
+.tips { margin: 6px 0 0; padding-left: 18px; }
+.tips li { margin: 4px 0; }
+.redirectExact { word-break: break-all; }

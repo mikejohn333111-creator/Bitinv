@@ -1,10 +1,13 @@
 // Deriv settings for this site.
 //
 // appId: the App ID you get when you register this site as an OAuth app at
-// developers.deriv.com (Dashboard -> register application). You can also paste
-// it in the page under Settings instead of editing this file.
+// developers.deriv.com (Dashboard -> register application). It isn't secret. Leave it
+// empty to have people paste it into the login card instead.
 export const CONFIG = {
   appId: "",
+  // The address registered as the app's redirect URL. Other addresses of this site
+  // (Vercel preview links) can't log in, so the page points people here instead.
+  siteUrl: "https://tbot-mauve-eta.vercel.app",
   authUrl: "https://auth.deriv.com",
   apiUrl: "https://api.derivws.com",
   publicWs: "wss://api.derivws.com/trading/v1/options/ws/public",

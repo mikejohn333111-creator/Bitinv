@@ -53,30 +53,54 @@ const st = {
 };
 
 // ---------------------------------------------------------------- chart
-const dark = matchMedia("(prefers-color-scheme: dark)").matches;
+// Colours match the page's light and dark themes (css/app.css) and follow the device setting live.
+const darkQuery = matchMedia("(prefers-color-scheme: dark)");
+const PALETTE = {
+  light: { text: "#5b6778", grid: "#eef1f5", cross: "#9aa5b4", label: "#354151", up: "#0c9466", down: "#d63c3c" },
+  dark: { text: "#7f8b9d", grid: "#171d26", cross: "#4a5668", label: "#2a3340", up: "#2ad595", down: "#ff6166" },
+};
+const pal = () => PALETTE[darkQuery.matches ? "dark" : "light"];
+const chartTheme = (p) => ({
+  layout: { background: { color: "transparent" }, textColor: p.text, fontSize: 11,
+            fontFamily: '-apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif' },
+  grid: { vertLines: { visible: false }, horzLines: { color: p.grid } },
+  crosshair: { mode: CrosshairMode.Normal, vertLine: { color: p.cross, labelBackgroundColor: p.label }, horzLine: { color: p.cross, labelBackgroundColor: p.label } },
+});
+const seriesTheme = (p) => ({ upColor: p.up, downColor: p.down, wickUpColor: p.up, wickDownColor: p.down, borderVisible: false });
+// Two decimals with thousands separators on the price axis, like the price above the chart.
+const axisPrice = (v) => v.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 const chart = createChart($("chart"), {
   autoSize: true,
-  layout: { background: { color: "transparent" }, textColor: dark ? "#8d98a7" : "#667085", fontSize: 11 },
-  grid: { vertLines: { color: dark ? "#1d242c" : "#eef0f3" }, horzLines: { color: dark ? "#1d242c" : "#eef0f3" } },
-  rightPriceScale: { borderVisible: false },
-  timeScale: { borderVisible: false, timeVisible: true, secondsVisible: false },
-  crosshair: { mode: CrosshairMode.Normal },
+  ...chartTheme(pal()),
+  // The TradingView credit is a text link under the chart (index.html), so no logo sits on the candles.
+  layout: { ...chartTheme(pal()).layout, attributionLogo: false },
+  handleScroll: { vertTouchDrag: false },   // a finger on the chart still scrolls the page
+  localization: { priceFormatter: axisPrice },
+  rightPriceScale: { borderVisible: false, scaleMargins: { top: 0.12, bottom: 0.08 } },
+  timeScale: { borderVisible: false, timeVisible: true, secondsVisible: false, rightOffset: 3 },
 });
-const series = chart.addCandlestickSeries({
-  upColor: dark ? "#3ccf95" : "#12805c", downColor: dark ? "#ff7a70" : "#c4332b",
-  wickUpColor: dark ? "#3ccf95" : "#12805c", wickDownColor: dark ? "#ff7a70" : "#c4332b", borderVisible: false,
-});
+const series = chart.addCandlestickSeries(seriesTheme(pal()));
 let markers = [], priceLines = [];
+darkQuery.addEventListener?.("change", () => {
+  const p = pal();
+  const t = chartTheme(p);
+  chart.applyOptions({ ...t, layout: { ...t.layout, attributionLogo: false } });
+  series.applyOptions(seriesTheme(p));
+  markers = markers.map((m) => ({ ...m, color: m.position === "belowBar" ? p.up : p.down }));
+  series.setMarkers(markers);
+  priceLines.forEach((l) => l.applyOptions({ color: l.options().title === "TP" ? p.up : p.down }));
+});
 function showLevels(sig, entry) {
   priceLines.forEach((l) => series.removePriceLine(l));
   const up = sig.action === "BUY";
+  const p = pal();
   priceLines = [
-    series.createPriceLine({ price: up ? entry - sig.slDist : entry + sig.slDist, color: "#c4332b", lineStyle: 2, lineWidth: 1, title: "SL" }),
-    series.createPriceLine({ price: up ? entry + sig.tpDist : entry - sig.tpDist, color: "#12805c", lineStyle: 2, lineWidth: 1, title: "TP" }),
+    series.createPriceLine({ price: up ? entry - sig.slDist : entry + sig.slDist, color: p.down, lineStyle: 2, lineWidth: 1, title: "SL" }),
+    series.createPriceLine({ price: up ? entry + sig.tpDist : entry - sig.tpDist, color: p.up, lineStyle: 2, lineWidth: 1, title: "TP" }),
   ];
 }
 function addMarker(epoch, side, text) {
-  markers.push({ time: epoch, position: side === "BUY" ? "belowBar" : "aboveBar", color: side === "BUY" ? "#12805c" : "#c4332b",
+  markers.push({ time: epoch, position: side === "BUY" ? "belowBar" : "aboveBar", color: side === "BUY" ? pal().up : pal().down,
                  shape: side === "BUY" ? "arrowUp" : "arrowDown", text });
   markers = markers.filter((m) => m.time >= (st.bars[0]?.epoch ?? 0)).slice(-100);
   series.setMarkers(markers);
@@ -84,16 +108,46 @@ function addMarker(epoch, side, text) {
 
 // ------------------------------------------------------------------ log
 const fmtTime = (ms) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+const ICON = {
+  BUY: '<path d="M12 19V5M5.5 11.5L12 5l6.5 6.5"/>', SELL: '<path d="M12 5v14M5.5 12.5L12 19l6.5-6.5"/>',
+  WIN: '<path d="M5 12.5l4.5 4.5L19 7.5"/>', LOSS: '<path d="M7 7l10 10M17 7L7 17"/>',
+  ERROR: '<path d="M12 6v8M12 18.5h.01"/>', INFO: '<path d="M12 10.5v8M12 6h.01"/>',
+};
+const icon = (k, size = 18) => `<svg viewBox="0 0 24 24" width="${size}" height="${size}" stroke-width="2.4" aria-hidden="true">${ICON[k] || ICON.INFO}</svg>`;
+const TAG_WORD = { BUY: "Buy", SELL: "Sell", WIN: "Win", LOSS: "Loss", ERROR: "Problem", INFO: "Info" };
+const symbolName = (code) => SYMBOLS.find(([v]) => v === code)?.[1] || code;
+// Display only: the feed shows "Volatility 75 Index" where the message has the code "R_75".
+const friendly = (text) => (settings.symbol ? String(text ?? "").split(settings.symbol).join(symbolName(settings.symbol)) : String(text ?? ""));
+// Wins and losses closed while this page was open, per account and UTC day (display only).
+const resultsKey = () => (st.account ? `tbot:ui:results:${st.account.id}` : "");
+function todayResults() {
+  const day = new Date().toISOString().slice(0, 10);
+  const r = resultsKey() ? store.get(resultsKey(), {}) : {};
+  return r.day === day ? r : { day, won: 0, lost: 0 };
+}
+function countResult(tag) {
+  if (!resultsKey()) return;
+  const r = todayResults();
+  if (tag === "WIN") r.won++; else r.lost++;
+  store.set(resultsKey(), r);
+}
 function log(tag, title, detail = "") {
+  if (tag === "WIN" || tag === "LOSS") countResult(tag);
+  title = friendly(title); detail = friendly(detail);
   const el = document.createElement("div");
-  el.className = "item";
-  el.innerHTML = `<span class="tag ${esc(tag)}">${esc(tag)}</span><span class="title">${esc(title)}</span>` +
-                 `<span class="time">${fmtTime(Date.now())}</span>${detail ? `<span class="detail">${esc(detail)}</span>` : ""}`;
+  el.className = `feed-item k-${esc(tag)}`;
+  el.innerHTML = `<span class="feed-ico">${icon(tag)}</span><div class="feed-body"><div class="feed-top">` +
+                 `<span class="feed-title"><span class="sr-only">${esc(TAG_WORD[tag] || tag)}: </span>${esc(title)}</span>` +
+                 `<time>${fmtTime(Date.now())}</time></div>${detail ? `<div class="feed-detail">${esc(detail)}</div>` : ""}</div>`;
   $("log").prepend(el);
   while ($("log").children.length > 200) $("log").lastChild.remove();
 }
-const money = (v) => (Number.isFinite(v) ? `${v.toFixed(2)} ${st.currency}` : "–");
-const px = (v) => (Number.isFinite(v) ? v.toFixed(v > 1000 ? 2 : 4) : "–");
+// Display helpers: thousands separators, and a real minus sign for results.
+const num = (v, d = 2) => v.toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+const money = (v) => (Number.isFinite(v) ? `${num(v)} ${st.currency}` : "–");
+const signed = (v) => (Number.isFinite(v) ? `${v > 0 ? "+" : v < 0 ? "−" : ""}${num(Math.abs(v))} ${st.currency}` : "–");
+const tone = (v) => (v > 0 ? "pos" : v < 0 ? "neg" : "");
+const px = (v) => (Number.isFinite(v) ? num(v, v > 1000 ? 2 : 4) : "–");
 
 // -------------------------------------------------------- notifications
 let audioCtx;
@@ -116,25 +170,63 @@ function notify(title, body) {
 // ------------------------------------------------------------ rendering
 function setConn(status) {
   $("connDot").className = "dot " + (status === "online" ? "online" : status === "offline" ? "offline" : "");
-  const where = st.trading && st.account ? `${st.account.type === "demo" ? "demo" : "REAL"} ${st.account.id}` : "prices only";
+  const where = st.trading && st.account ? `${st.account.type === "demo" ? "demo" : "REAL"} account` : "prices only";
   $("connText").textContent = status === "online" ? `live · ${where}` : status === "offline" ? "reconnecting…" : "connecting…";
 }
 
+let accountsShown = "";
 function renderAccount() {
   const loggedIn = !!st.auth;
+  const real = loggedIn && st.account?.type === "real";
   $("loginCard").hidden = loggedIn;
   $("accountCard").hidden = !loggedIn;
+  $("hdrLogin").hidden = loggedIn;
   $("loginAppIdRow").hidden = !!CONFIG.appId;
-  if (!loggedIn) return;
-  $("accountSelect").innerHTML = st.accounts.map((a) =>
-    `<option value="${esc(a.id)}" ${a.id === st.account?.id ? "selected" : ""}>${a.type === "demo" ? "Demo" : "REAL"} · ${esc(a.id)} · ${esc(a.currency)}</option>`).join("");
-  $("realWarn").hidden = st.account?.type !== "real";
+  $("realWarn").hidden = !real;
+  document.body.dataset.acct = !loggedIn || !st.account ? "none" : real ? "real" : "demo";
+  if (!loggedIn) { accountsShown = ""; return; }
+  // Rebuilt only when the accounts change, so an open picker isn't reset by every balance update.
+  const shown = st.accounts.map((a) => `${a.id}:${a.type}:${a.currency}`).join("|") + "@" + st.account?.id;
+  if (shown !== accountsShown) {
+    accountsShown = shown;
+    $("accountSelect").innerHTML = st.accounts.map((a) =>
+      `<option value="${esc(a.id)}" ${a.id === st.account?.id ? "selected" : ""}>${a.type === "demo" ? "Demo" : "REAL money"} · ${esc(a.id)} · ${esc(a.currency)}</option>`).join("");
+    $("acctList").innerHTML = st.accounts.map((a) => {
+      const demo = a.type === "demo";
+      return `<button type="button" class="acct-row ${demo ? "is-demo" : "is-real"}" data-account="${esc(a.id)}" aria-pressed="${a.id === st.account?.id}">` +
+        `<span class="acct-badge ${demo ? "demo" : "real"}">${demo ? "DEMO" : "REAL MONEY"}</span>` +
+        `<span class="acct-row-main"><b>${esc(a.id)}</b><span>${demo ? "Practice money" : "Your own money"} · ${esc(a.currency)}</span></span>` +
+        `<svg class="tick" viewBox="0 0 24 24" width="20" height="20" stroke-width="2.4" aria-hidden="true"><path d="M5 12.5l4.5 4.5L19 7.5"/></svg></button>`;
+    }).join("");
+  }
+  // Fallback: if the list can't be drawn, the plain account picker is shown, so you can always leave a REAL account.
+  $("accountSelect").hidden = $("acctList").children.length > 0;
+  $("accountCard").dataset.type = real ? "real" : "demo";
+  $("acctBadge").textContent = real ? "REAL MONEY" : "DEMO";
+  $("sheetType").textContent = real ? "REAL MONEY" : "Demo · practice money";
+  $("sheetType").className = "acct-badge " + (real ? "real" : "demo");
+  $("sheetId").textContent = st.account?.id || "";
+  $("accountCard").setAttribute("aria-label", `${real ? "REAL money" : "Demo"} account ${st.account?.id || ""}, balance ${money(st.balance)}. Opens the account menu.`);
   $("balance").textContent = money(st.balance);
+  $("sheetBalance").textContent = money(st.balance);
   if (st.guard && Number.isFinite(equity())) {
     const pl = st.guard.dayPL(equity());
-    $("dayPL").textContent = `${pl >= 0 ? "+" : ""}${pl.toFixed(2)}%`;
-    $("dayPL").className = "big " + (pl > 0 ? "pos" : pl < 0 ? "neg" : "");
+    const start = st.guard.state.startBalance;
+    const amount = start > 0 ? equity() - start : NaN;
+    const pct = `${pl > 0 ? "+" : pl < 0 ? "−" : ""}${Math.abs(pl).toFixed(2)}%`;
+    $("dayPL").textContent = Number.isFinite(amount) ? `${signed(amount)} · ${pct} today` : `${pct} today`;
+    $("dayPL").className = "acct-pl " + tone(pl);
+    $("sheetPL").textContent = Number.isFinite(amount) ? signed(amount) : pct;
+    $("sheetPL").className = tone(pl);
+    $("sheetPLPct").textContent = Number.isFinite(amount) ? pct : "";
+    $("sheetPLPct").className = "pct " + tone(pl);
+  } else {
+    $("dayPL").textContent = ""; $("sheetPL").textContent = "–"; $("sheetPL").className = ""; $("sheetPLPct").textContent = "";
   }
+  const r = todayResults();
+  $("sheetWon").textContent = r.won;
+  $("sheetLost").textContent = r.lost;
+  $("sheetFee").textContent = st.lastCost ? `about ${money(st.lastCost.commission)}` : "shown after the first trade";
 }
 
 function renderControls() {
@@ -143,31 +235,170 @@ function renderControls() {
     b.disabled = b.dataset.strategy === "ai" && !st.model;
   });
   document.querySelectorAll("[data-mode]").forEach((b) => b.setAttribute("aria-pressed", String(b.dataset.mode === settings.mode)));
-  $("runBtn").textContent = st.running ? "Stop bot" : settings.mode === "auto" ? "Start auto trading" : "Start signals";
-  $("runBtn").className = "btn big-btn " + (st.running ? "danger" : "primary");
+  const auto = settings.mode === "auto", running = st.running, market = symbolName(settings.symbol);
+  const real = st.trading && st.account?.type === "real";
+  const needLogin = auto && !st.trading;
+  $("runBtn").textContent = running ? "Stop bot" : needLogin ? "Log in to auto trade" : auto && real ? "Start auto trading · REAL money"
+    : auto ? "Start auto trading" : "Start signals";
+  $("runBtn").className = "run-btn " + (running ? "is-stop" : needLogin ? "is-login" : auto && real ? "is-real" : auto ? "is-auto" : "is-start");
   const guardMsg = st.guard?.blockReason(st.contracts.size) || "";
-  $("botState").textContent = !st.running ? "stopped"
-    : `${settings.mode === "auto" ? "auto trading" : "watching for signals"}${guardMsg && settings.mode === "auto" ? ` · waiting: ${guardMsg}` : ""}`;
-  $("tradesToday").textContent = st.guard ? `${st.guard.state.trades || 0}${settings.maxTradesPerDay ? " / " + settings.maxTradesPerDay : ""}` : "–";
-  $("infoLabel").textContent = settings.strategy === "ai" ? "Model" : "Market";
+  const fullUp = guardMsg === "max open trades reached";   // the normal wait while a trade is open
+  const waiting = running && auto && !!guardMsg && !fullUp;
+  $("botState").textContent = !running ? "Bot is off" : !auto ? "Watching for signals" : waiting ? "Auto trading paused" : "Auto trading";
+  $("barSub").textContent =
+      !running && needLogin ? "Log in first. Signals only works without an account."
+    : !running && auto ? `Places trades on your ${real ? "REAL money" : "demo"} account.`
+    : !running ? "Alerts only. Nothing is traded."
+    : !auto ? `Alerts for ${market}. Nothing is traded.`
+    : fullUp ? `A trade is open (limit ${settings.maxOpen}). Looks again when it closes.`
+    : waiting ? waitText(guardMsg)
+    : `Looking for trades on ${market}.`;
+  const trades = st.guard?.state.trades || 0, max = +settings.maxTradesPerDay;
+  $("tradesToday").textContent = st.guard ? (max ? `${trades} of ${max}` : String(trades)) : "–";
+  $("infoLabel").textContent = settings.strategy === "ai" ? "AI forecast" : "Market now";
+  // display only: the sticky bar, the mode lock while running, and what the chosen mode will do
+  const bar = $("actionBar");
+  bar.dataset.state = running ? settings.mode : "stopped";
+  bar.dataset.wait = waiting ? "1" : "";
+  bar.dataset.acct = !st.trading || !st.account ? "none" : real ? "real" : "demo";
+  $("barMode").textContent = `${settings.strategy === "ai" ? "AI model" : "Rules"} · ${auto ? "Auto trade" : "Signals only"}`;
+  $("barAcct").textContent = real ? "REAL MONEY" : "Demo";
+  $("barAcct").hidden = !st.trading || !st.account;
+  $("modeSeg").classList.toggle("locked", running);
+  const note = $("modeNote");
+  if (!auto) { note.textContent = "You get an alert with entry, stop loss and take profit. Nothing is traded."; note.className = "mode-note"; }
+  else if (!st.trading || !st.account) { note.textContent = "Auto trade needs your Deriv account. Log in first."; note.className = "mode-note is-warn"; }
+  else if (real) { note.textContent = `Trades will use REAL money on ${st.account.id}.`; note.className = "mode-note is-real"; }
+  else { note.textContent = `Trades go to your demo account ${st.account.id} (practice money).`; note.className = "mode-note is-demo"; }
+  if (running) note.textContent += " Stop the bot to switch mode.";
 }
 
+/** The risk guard's reason for not trading, in plain words. */
+function waitText(msg) {
+  const s = st.guard?.state || {};
+  if (msg.startsWith("cooling down")) {
+    const left = Math.max(1, Math.ceil(((s.cooldownUntil || 0) - Date.now()) / 60000));
+    return `A ${settings.cooldownMinutes}-min break after ${settings.maxConsecLosses} losses in a row (${left} min left).`;
+  }
+  if (msg === "max trades for today reached") return `Today's limit of ${settings.maxTradesPerDay} trades is reached. No new trades until tomorrow (UTC).`;
+  if (msg.startsWith("daily loss limit")) {
+    const pct = (msg.match(/\(([^)]+)\)/) || [])[1];
+    return `Stopped for today: daily loss limit reached${pct ? ` (${pct.replace("-", "−")})` : ""}. No new trades until tomorrow (UTC).`;
+  }
+  if (msg === "halted for today") return "Stopped for today. No new trades until tomorrow (UTC).";
+  return `Paused: ${msg}.`;
+}
+
+const REGIME_WORDS = { TREND: "Trending", RANGE: "Moving sideways", UNCLEAR: "No clear direction" };
+const REGIME_PLAIN = {
+  TREND: "Rules wait for a small dip to join the move.",
+  RANGE: "Rules look for bounces off the edges.",
+  UNCLEAR: "No clear pattern, so Rules wait.",
+};
+const NOTE_PLAIN = { "loading history": "Loading price history…", "volatility spike": "Prices are jumping a lot, so the bot holds off for now.",
+                     "model not loaded": "The AI model couldn't be loaded." };
 function renderInfo(res) {
   const i = res.info || {};
-  if (i.note) { $("infoText").textContent = i.note; return; }
-  $("infoText").textContent = settings.strategy === "ai"
-    ? `up ${(i.pUp * 100).toFixed(0)}% · down ${(i.pDn * 100).toFixed(0)}% · flat ${(i.pNone * 100).toFixed(0)}%`
-    : `${i.regime} · ADX ${i.adx?.toFixed(0)} · RSI ${i.rsi?.toFixed(0)}`;
+  if (i.note) {
+    $("infoText").textContent = i.note.charAt(0).toUpperCase() + i.note.slice(1);
+    $("infoPlain").textContent = NOTE_PLAIN[i.note] && NOTE_PLAIN[i.note].toLowerCase() !== i.note + "…" ? NOTE_PLAIN[i.note] : "";
+    $("infoSub").textContent = "";
+    return;
+  }
+  if (settings.strategy === "ai") {
+    const pct = (v) => (v * 100).toFixed(0), top = Math.max(i.pUp, i.pDn, i.pNone);
+    $("infoText").textContent = top === i.pUp ? "Leans up" : top === i.pDn ? "Leans down" : "No clear move";
+    $("infoPlain").textContent = top === i.pUp ? `The AI leans up: ${pct(i.pUp)}% chance of a rise.`
+      : top === i.pDn ? `The AI leans down: ${pct(i.pDn)}% chance of a fall.` : "The AI expects no clear move right now.";
+    $("infoSub").textContent = `Up ${pct(i.pUp)}% · Down ${pct(i.pDn)}% · Flat ${pct(i.pNone)}% · signals at ${Math.round(+settings.aiThreshold * 100)}%`;
+  } else {
+    $("infoText").textContent = REGIME_WORDS[i.regime] || i.regime;
+    $("infoPlain").textContent = REGIME_PLAIN[i.regime] || "";
+    $("infoSub").textContent = `ADX ${i.adx?.toFixed(0)} · RSI ${i.rsi?.toFixed(0)}`;
+  }
 }
 
+const EMPTY_OPEN = `<div class="empty"><span class="empty-ico"><svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">` +
+  `<path d="M3.5 8h17v11h-17zM8.5 8V5.5h7V8"/></svg></span><div><b>No open trades</b>Trades the bot opens show here with live profit and loss.</div></div>`;
 function renderOpen() {
-  if (!st.contracts.size) { $("openList").innerHTML = `<p class="muted small">None.</p>`; return; }
-  $("openList").innerHTML = [...st.contracts.entries()].map(([id, c]) => `
-    <div class="item"><span class="tag ${c.side}">${c.side}</span>
-      <span class="title">${esc(settings.symbol)} · stake ${money(c.buyPrice)}</span>
-      <button class="btn small" data-close="${esc(id)}" type="button">Close</button>
-      <span class="detail">P/L <b class="${c.profit >= 0 ? "pos" : "neg"}">${money(c.profit)}</b>${c.horizon ? ` · auto-close after ${c.horizon} min` : ""}</span>
+  const n = st.contracts.size, list = $("openList");
+  $("openCount").textContent = String(n);
+  $("openCount").hidden = !n;
+  const total = [...st.contracts.values()].reduce((sum, c) => sum + (Number.isFinite(c.profit) ? c.profit : 0), 0);
+  $("openTotal").hidden = n < 2;
+  $("openTotalVal").textContent = signed(total);
+  $("openTotalVal").className = tone(total);
+  if (!n) { list.innerHTML = EMPTY_OPEN; list.dataset.ids = ""; return; }
+  // Rebuilt only when the set of trades changes. Live profit updates change the numbers in place,
+  // so the Close button is never replaced under a finger.
+  const ids = [...st.contracts.keys()].join(" ");
+  if (list.dataset.ids !== ids) {
+    list.dataset.ids = ids;
+    list.innerHTML = [...st.contracts.keys()].map((id) => `
+    <div class="pos-card" data-trade="${esc(id)}">
+      <div class="pos-top">
+        <span class="side-badge"></span>
+        <div class="pos-name"><b></b><span class="pos-stake"></span></div>
+        <div class="pos-pl"><b></b><span></span></div>
+      </div>
+      <div class="pos-foot">
+        <span class="live"></span>
+        <button class="btn btn-outline btn-sm" data-close="${esc(id)}" type="button">Close</button>
+      </div>
     </div>`).join("");
+  }
+  for (const card of list.querySelectorAll("[data-trade]")) {
+    const c = st.contracts.get(card.dataset.trade);
+    if (!c) continue;
+    const buy = c.side !== "SELL";
+    const side = card.querySelector(".side-badge");
+    const sideHtml = c.side === "?" ? "…" : `${icon(buy ? "BUY" : "SELL", 14)}${esc(c.side)}`;
+    if (side.dataset.side !== c.side) { side.dataset.side = c.side; side.className = `side-badge ${buy ? "buy" : "sell"}`; side.innerHTML = sideHtml; }
+    card.querySelector(".pos-name b").textContent = symbolName(settings.symbol);
+    card.querySelector(".pos-stake").textContent = `Stake ${money(c.buyPrice)}`;
+    const pl = card.querySelector(".pos-pl");
+    pl.className = `pos-pl ${tone(c.profit)}`;
+    pl.querySelector("b").textContent = signed(c.profit);
+    pl.querySelector("span").textContent = Number.isFinite(c.profit) && c.buyPrice > 0
+      ? `${c.profit > 0 ? "+" : c.profit < 0 ? "−" : ""}${Math.abs((c.profit / c.buyPrice) * 100).toFixed(2)}%` : "";
+    card.querySelector(".live").textContent = c.horizon ? `Closes by itself after ${c.horizon} min` : "Stop loss and take profit are set";
+  }
+}
+
+/** The latest signal or opened trade, shown above the bot setup. Display only. */
+function renderSignal(d) {
+  try {
+    const buy = d.action === "BUY", size = d.size;
+    const cost = Number.isFinite(d.commission) ? money(d.commission)
+      : st.lastCost ? `about ${money(st.lastCost.commission)}` : "shown after the first trade quote";
+    const stake = size?.ok ? `${money(size.stake)} at x${d.mult}` : size ? size.reason : "Log in to see the stake for your balance";
+    const card = $("signalCard");
+    card.className = "signal " + (buy ? "is-buy" : "is-sell");
+    card.dataset.ts = String(Date.now());
+    card.innerHTML = `
+      <div class="sig-head">
+        <span class="side-badge ${buy ? "buy" : "sell"}">${icon(buy ? "BUY" : "SELL", 14)}${buy ? "BUY" : "SELL"}</span>
+        <div class="sig-title"><b>${d.opened ? "Trade opened" : `${buy ? "Buy" : "Sell"} signal`}</b>
+          <span>${esc(symbolName(settings.symbol))} · <span class="sig-age">just now</span> <span class="sig-old">Old signal</span></span></div>
+        <button class="icon-btn" type="button" data-hide-signal aria-label="Hide this signal">
+          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path d="M6 6l12 12M18 6L6 18"/></svg></button>
+      </div>
+      <div class="levels">
+        <div><span class="k">Signal price</span><b>${px(d.entry)}</b></div>
+        <div><span class="k">Stop loss</span><b>${px(d.sl)}</b>${size?.ok ? `<span class="m neg">−${money(size.stopLoss)}</span>` : ""}</div>
+        <div><span class="k">Take profit</span><b>${px(d.tp)}</b>${size?.ok ? `<span class="m pos">+${money(size.takeProfit)}</span>` : ""}</div>
+      </div>
+      <p class="levels-note">Approximate prices from the last 1-minute close${d.opened ? ". Deriv's actual fill can differ a little" : ""}.</p>
+      <dl class="sig-rows">
+        <dt>Stake</dt><dd>${esc(stake)}</dd>
+        <dt>Deriv fee</dt><dd>${esc(cost)}</dd>
+        <dt>Why</dt><dd class="why">${esc(d.reason)}</dd>
+      </dl>
+      <p class="sig-foot">${d.opened
+        ? `Opened by the bot on your ${st.account?.type === "real" ? "REAL money" : "demo"} account. Follow it under Open trades.`
+        : "Signals only, so nothing was traded."}</p>`;
+    card.hidden = false;
+  } catch { /* display only */ }
 }
 
 // --------------------------------------------------------------- market
@@ -201,9 +432,12 @@ function onCandles(msg) {
   }
 }
 
+let shownPrice = NaN;
 function updatePrice() {
   const p = st.forming?.close ?? st.bars.at(-1)?.close;
   $("lastPrice").textContent = px(p);
+  if (Number.isFinite(p) && Number.isFinite(shownPrice) && p !== shownPrice) $("lastPrice").dataset.dir = p > shownPrice ? "up" : "down";
+  shownPrice = p;
 }
 
 function strategyParams() {
@@ -254,6 +488,7 @@ async function handleSignal(sig) {
     addMarker(lastBar.epoch, sig.action, sig.action);
     showLevels(sig, entry);
     log(sig.action, `${sig.action} ${settings.symbol} @ ${px(entry)}`, `SL ${px(sl)} · TP ${px(tp)} · ${sizeText} · ${sig.reason}`);
+    renderSignal({ action: sig.action, entry, sl, tp, size, mult, reason: sig.reason, opened: false });
     notify(`Tbot: ${sig.action} ${settings.symbol}`, `Entry ${px(entry)} · SL ${px(sl)} · TP ${px(tp)}`);
     return;
   }
@@ -285,6 +520,7 @@ async function handleSignal(sig) {
     showLevels(sig, entry);
     trackContract(buy.contract_id, { side: sig.action, entryEpoch: lastBar.epoch, horizon: sig.horizonBars || 0, buyPrice: Number(buy.buy_price) });
     log(sig.action, `Opened ${sig.action} ${settings.symbol}`, `${sizeText} · ${sig.reason}${Number.isFinite(commission) ? ` · commission ${money(commission)}` : ""}`);
+    renderSignal({ action: sig.action, entry, sl, tp, size, mult, reason: sig.reason, opened: true, commission });
     notify(`Tbot opened ${sig.action} ${settings.symbol}`, sizeText);
   } catch (e) {
     log("ERROR", `Deriv refused the ${sig.action} order`, e.message);
@@ -433,6 +669,10 @@ function showLoginMsg(text, kind = "warn") {
   el.textContent = text || "";
   el.className = kind;
   el.hidden = !text;
+  if (text) {   // after a failed login the card can sit below the sticky bar: bring the message into view
+    const r = el.getBoundingClientRect(), bar = $("actionBar")?.getBoundingClientRect().top ?? innerHeight;
+    if (r.top < 0 || r.bottom > bar) el.scrollIntoView({ block: "center" });
+  }
 }
 function setLoginBusy(text) {
   $("loginBtn").disabled = !!text;

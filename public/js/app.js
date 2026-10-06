@@ -1,10 +1,11 @@
 // Tbot web bot: wires the Deriv connection, the strategies, risk limits and the page.
 import { CONFIG, SYMBOLS } from "./config.js";
-import { evaluateRules, evaluateAI, RULES_DEFAULTS, AI_DEFAULTS, rulesMinBars } from "./strategy.js";
+import { evaluateRules, evaluateAI, RULES_DEFAULTS, AI_DEFAULTS, AI_FAST, aiParams, fastModeOn, rulesMinBars } from "./strategy.js";
 import { sizeMultiplier, RiskGuard } from "./risk.js";
 import { startOAuth, finishOAuth, getAccounts, createDemoAccount, getTradingSocketUrl, DerivSocket, redirectUri,
          cleanAppId, hasScope, FULL_SCOPE } from "./deriv.js";
 import { createChart, CrosshairMode } from "../vendor/lightweight-charts.mjs";
+import { TradePlanLayer, planFromContract } from "./plan.js";
 
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -26,6 +27,8 @@ const DEFAULT_SETTINGS = {
   riskPct: 1, maxDailyLossPct: 3, maxOpen: 1, maxTradesPerDay: 20, maxConsecLosses: 3, cooldownMinutes: 15,
   multiplier: 0, signalGap: 8, notify: true, sound: true,
   aiThreshold: 0.55, aiBarrier: AI_DEFAULTS.barrierATR, aiHorizon: AI_DEFAULTS.horizonBars,
+  aiFast: false,   // fast mode: AI only, demo only (AI_FAST in strategy.js)
+  chartTf: 60,     // chart timeframe in seconds; the chart view only, the bot always reads 1-minute candles
   redirectNoSlash: false,
 };
 const store = {
@@ -34,6 +37,10 @@ const store = {
 };
 const settings = { ...DEFAULT_SETTINGS, ...store.get("tbot:settings", {}) };
 const saveSettings = () => store.set("tbot:settings", settings);
+// Fast mode applies only to the AI strategy, and never trades on a real account.
+const fastOn = () => fastModeOn(settings);
+const onReal = () => !!st.account && st.account.type !== "demo";
+const FAST_REAL = "Fast mode is demo only. It never trades on a REAL money account.";
 cfg.appId = cleanAppId(settings.appId) || CONFIG.appId;
 cfg.redirectNoSlash = !!settings.redirectNoSlash;
 const saveAuth = (auth) => { try { sessionStorage.setItem("tbot:auth", JSON.stringify(auth)); } catch { /* blocked */ } };
@@ -56,8 +63,10 @@ const st = {
 // Colours match the page's light and dark themes (css/app.css) and follow the device setting live.
 const darkQuery = matchMedia("(prefers-color-scheme: dark)");
 const PALETTE = {
-  light: { text: "#5b6778", grid: "#eef1f5", cross: "#9aa5b4", label: "#354151", up: "#0c9466", down: "#d63c3c" },
-  dark: { text: "#7f8b9d", grid: "#171d26", cross: "#4a5668", label: "#2a3340", up: "#2ad595", down: "#ff6166" },
+  light: { text: "#5b6778", grid: "#eef1f5", cross: "#9aa5b4", label: "#354151", up: "#0c9466", down: "#d63c3c",
+           tpFill: "rgba(12, 148, 102, 0.13)", tpLine: "#0c9466", slFill: "rgba(214, 60, 60, 0.12)", slLine: "#d63c3c", entry: "#354151", dim: "#9aa5b4" },
+  dark: { text: "#7f8b9d", grid: "#171d26", cross: "#4a5668", label: "#2a3340", up: "#2ad595", down: "#ff6166",
+          tpFill: "rgba(42, 213, 149, 0.16)", tpLine: "#2ad595", slFill: "rgba(255, 97, 102, 0.15)", slLine: "#ff6166", entry: "#c5cdd8", dim: "#4a5668" },
 };
 const pal = () => PALETTE[darkQuery.matches ? "dark" : "light"];
 const chartTheme = (p) => ({
@@ -80,30 +89,107 @@ const chart = createChart($("chart"), {
   timeScale: { borderVisible: false, timeVisible: true, secondsVisible: false, rightOffset: 3 },
 });
 const series = chart.addCandlestickSeries(seriesTheme(pal()));
-let markers = [], priceLines = [];
+let markers = [];
+// The trade plan (TradingView-style long/short boxes and labelled lines): js/plan.js.
+const planLabel = (p, kind) => kind === "entry" ? "Entry"
+  : kind === "sl" ? `SL${Number.isFinite(p.slMoney) ? " " + signed(-p.slMoney) : ""}`
+  : `TP${Number.isFinite(p.tpMoney) ? " " + signed(p.tpMoney) : ""}`;
+// ------------------------------------------------------- chart timeframe
+// The chart can show 5m to 1D candles from their own Deriv stream. The strategy never sees
+// them: it keeps reading its 1-minute bars (st.bars). Times on the chart (markers, the trade
+// plan) are mapped to the candle that contains them.
+const TIMEFRAMES = [[60, "1m"], [300, "5m"], [900, "15m"], [3600, "1h"], [14400, "4h"], [86400, "1D"]];
+const CHART_BARS = 500;
+const chartTf = () => (TIMEFRAMES.some(([g]) => g === +settings.chartTf) ? +settings.chartTf : 60);
+const toCandle = (epoch) => Math.floor(epoch / chartTf()) * chartTf();
+const chartFeed = { sub: null, bars: [], forming: null };
+const chartLast = () => (chartTf() === 60 ? st.forming?.epoch ?? st.bars.at(-1)?.epoch : chartFeed.forming?.epoch ?? chartFeed.bars.at(-1)?.epoch);
+const chartFirst = () => (chartTf() === 60 ? st.bars[0]?.epoch ?? st.forming?.epoch : chartFeed.bars[0]?.epoch ?? chartFeed.forming?.epoch);
+const asData = (list) => list.map((b) => ({ time: b.epoch, open: b.open, high: b.high, low: b.low, close: b.close }));
+/** Draws the markers on the chart's timeframe (kept in 1-minute times). */
+function paintMarkers() {
+  const first = chartFirst() ?? 0;
+  try { series.setMarkers(markers.map((m) => ({ ...m, time: toCandle(m.time) })).filter((m) => m.time >= first).sort((a, b) => a.time - b.time)); }
+  catch { /* display only */ }
+}
+function onChartCandles(msg) {
+  if (msg.error || chartTf() === 60) return;
+  const g = Number(msg.echo_req?.granularity ?? msg.ohlc?.granularity ?? chartTf());
+  if (g !== chartTf()) return;   // a late message from the timeframe before
+  if (msg.msg_type === "candles") {
+    const all = (msg.candles || []).map(normBar);
+    chartFeed.forming = all.pop() || null;
+    chartFeed.bars = all;
+    series.setData(asData([...all, ...(chartFeed.forming ? [chartFeed.forming] : [])]));
+    paintMarkers(); plans.redraw();
+  } else if (msg.msg_type === "ohlc") {
+    const o = msg.ohlc;
+    const bar = { epoch: Number(o.open_time), open: +o.open, high: +o.high, low: +o.low, close: +o.close };
+    if (chartFeed.forming && bar.epoch < chartFeed.forming.epoch) return;
+    if (chartFeed.forming && bar.epoch > chartFeed.forming.epoch) { chartFeed.bars.push(chartFeed.forming); if (chartFeed.bars.length > CHART_BARS * 2) chartFeed.bars.shift(); }
+    chartFeed.forming = bar;
+    series.update({ time: bar.epoch, open: bar.open, high: bar.high, low: bar.low, close: bar.close });
+  }
+}
+/** (Re)subscribes the chart's own candles when the timeframe isn't 1 minute; 1m uses the bot's feed. */
+function subscribeChart(sock = st.socket) {
+  chartFeed.sub?.unsubscribe();
+  chartFeed.sub = null; chartFeed.bars = []; chartFeed.forming = null;
+  const tf = chartTf();
+  if (tf === 60) {
+    series.setData(asData([...st.bars, ...(st.forming ? [st.forming] : [])]));
+  } else {
+    series.setData([]);
+    if (sock) chartFeed.sub = sock.subscribe({ ticks_history: settings.symbol, style: "candles", granularity: tf, count: CHART_BARS,
+                                               end: "latest", adjust_start_time: 1 }, onChartCandles);
+  }
+  paintMarkers(); plans.redraw();
+}
+function renderTimeframe() {
+  document.querySelectorAll("[data-tf]").forEach((b) => b.setAttribute("aria-pressed", String(+b.dataset.tf === chartTf())));
+  $("tfNote").hidden = chartTf() === 60;
+  $("tfName").textContent = { 60: "1-minute", 300: "5-minute", 900: "15-minute", 3600: "1-hour", 14400: "4-hour", 86400: "Daily" }[chartTf()];
+  $("chart").setAttribute("aria-label", `${TIMEFRAMES.find(([g]) => g === chartTf())[1]} candlestick chart`);
+}
+
+// While a plan shows, leave room right of the last candle so its boxes can reach the planned close.
+let roomShown = 3;
+function planRoom(layer) {
+  const room = layer.active() ? (chartTf() === 60 ? 12 : 4) : 3;
+  if (room !== roomShown) { roomShown = room; chart.timeScale().applyOptions({ rightOffset: room }); }
+}
+const plans = new TradePlanLayer({ chart, series, palette: pal, label: planLabel, lastTime: chartLast, tf: chartTf, onChange: planRoom });
+const PLAN_KEY = "tbot:ui:plan";
 darkQuery.addEventListener?.("change", () => {
   const p = pal();
   const t = chartTheme(p);
   chart.applyOptions({ ...t, layout: { ...t.layout, attributionLogo: false } });
   series.applyOptions(seriesTheme(p));
-  markers = markers.map((m) => ({ ...m, color: m.position === "belowBar" ? p.up : p.down }));
-  series.setMarkers(markers);
-  priceLines.forEach((l) => l.applyOptions({ color: l.options().title === "TP" ? p.up : p.down }));
+  markers = markers.map((m) => ({ ...m, color: m.tone === "up" ? p.up : p.down }));
+  paintMarkers();
+  plans.restyle();
 });
-function showLevels(sig, entry) {
-  priceLines.forEach((l) => series.removePriceLine(l));
+/** The plan of a new signal or trade: entry, stop loss and take profit, from the entry candle to the planned close. */
+function planOf(sig, entry, size, start, signalEpoch) {
   const up = sig.action === "BUY";
-  const p = pal();
-  priceLines = [
-    series.createPriceLine({ price: up ? entry - sig.slDist : entry + sig.slDist, color: p.down, lineStyle: 2, lineWidth: 1, title: "SL" }),
-    series.createPriceLine({ price: up ? entry + sig.tpDist : entry - sig.tpDist, color: p.up, lineStyle: 2, lineWidth: 1, title: "TP" }),
-  ];
+  return {
+    side: sig.action, entry, sl: up ? entry - sig.slDist : entry + sig.slDist, tp: up ? entry + sig.tpDist : entry - sig.tpDist,
+    slMoney: size?.ok ? size.stopLoss : NaN, tpMoney: size?.ok ? size.takeProfit : NaN,
+    start, end: sig.horizonBars ? signalEpoch + (sig.horizonBars + 1) * 60 : null, stale: false, created: Date.now(),
+  };
 }
-function addMarker(epoch, side, text) {
-  markers.push({ time: epoch, position: side === "BUY" ? "belowBar" : "aboveBar", color: side === "BUY" ? pal().up : pal().down,
-                 shape: side === "BUY" ? "arrowUp" : "arrowDown", text });
-  markers = markers.filter((m) => m.time >= (st.bars[0]?.epoch ?? 0)).slice(-100);
-  series.setMarkers(markers);
+/** Signals go dim after 5 minutes, or once the bot is stopped (like the signal card). */
+function ageSignalPlan() {
+  const p = plans.get("signal");
+  if (p && !p.stale && (Date.now() - p.created >= 5 * 60000 || !st.running)) plans.set("signal", { stale: true });
+}
+setInterval(ageSignalPlan, 15000);
+function addMarker(epoch, side, text, opts = {}) {
+  const up = opts.tone ? opts.tone === "up" : side === "BUY";
+  markers.push({ time: epoch, position: opts.position || (side === "BUY" ? "belowBar" : "aboveBar"), color: up ? pal().up : pal().down,
+                 tone: up ? "up" : "down", shape: opts.shape || (side === "BUY" ? "arrowUp" : "arrowDown"), text });
+  markers = markers.filter((m) => m.time >= (st.bars[0]?.epoch ?? 0)).sort((a, b) => a.time - b.time).slice(-100);
+  paintMarkers();
 }
 
 // ------------------------------------------------------------------ log
@@ -243,14 +329,17 @@ function renderControls() {
   $("runBtn").className = "run-btn " + (running ? "is-stop" : needLogin ? "is-login" : auto && real ? "is-real" : auto ? "is-auto" : "is-start");
   const guardMsg = st.guard?.blockReason(st.contracts.size) || "";
   const fullUp = guardMsg === "max open trades reached";   // the normal wait while a trade is open
-  const waiting = running && auto && !!guardMsg && !fullUp;
-  $("botState").textContent = !running ? "Bot is off" : !auto ? "Watching for signals" : waiting ? "Auto trading paused" : "Auto trading";
+  const fastBlocked = running && auto && fastOn() && st.trading && onReal();
+  const waiting = running && auto && (fastBlocked || (!!guardMsg && !fullUp));
+  $("botState").textContent = !running ? "Bot is off" : !auto ? "Watching for signals" : waiting ? "Auto trading paused" : fastOn() ? "Auto trading · Fast" : "Auto trading";
   $("barSub").textContent =
       !running && needLogin ? "Log in first. Signals only works without an account."
+    : !running && auto && real && fastOn() ? "Fast mode is demo only. Switch to demo to auto trade."
     : !running && auto ? `Places trades on your ${real ? "REAL money" : "demo"} account.`
     : !running ? "Alerts only. Nothing is traded."
     : !auto ? `Alerts for ${market}. Nothing is traded.`
-    : fullUp ? `A trade is open (limit ${settings.maxOpen}). Looks again when it closes.`
+    : fastBlocked ? "Fast mode is demo only. No trades on this REAL account."
+    : fullUp ? `${st.contracts.size > 1 ? `${st.contracts.size} trades are` : "A trade is"} open (limit ${limits().maxOpen}). Looks again when one closes.`
     : waiting ? waitText(guardMsg)
     : `Looking for trades on ${market}.`;
   const trades = st.guard?.state.trades || 0, max = +settings.maxTradesPerDay;
@@ -261,16 +350,48 @@ function renderControls() {
   bar.dataset.state = running ? settings.mode : "stopped";
   bar.dataset.wait = waiting ? "1" : "";
   bar.dataset.acct = !st.trading || !st.account ? "none" : real ? "real" : "demo";
-  $("barMode").textContent = `${settings.strategy === "ai" ? "AI model" : "Rules"} · ${auto ? "Auto trade" : "Signals only"}`;
+  $("barMode").textContent = `${settings.strategy === "ai" ? (fastOn() ? "AI model · Fast" : "AI model") : "Rules"} · ${auto ? "Auto trade" : "Signals only"}`;
   $("barAcct").textContent = real ? "REAL MONEY" : "Demo";
   $("barAcct").hidden = !st.trading || !st.account;
   $("modeSeg").classList.toggle("locked", running);
   const note = $("modeNote");
   if (!auto) { note.textContent = "You get an alert with entry, stop loss and take profit. Nothing is traded."; note.className = "mode-note"; }
   else if (!st.trading || !st.account) { note.textContent = "Auto trade needs your Deriv account. Log in first."; note.className = "mode-note is-warn"; }
+  else if (real && fastOn()) { note.textContent = `Fast mode is demo only, so no trades on REAL account ${st.account.id}.`; note.className = "mode-note is-real"; }
   else if (real) { note.textContent = `Trades will use REAL money on ${st.account.id}.`; note.className = "mode-note is-real"; }
   else { note.textContent = `Trades go to your demo account ${st.account.id} (practice money).`; note.className = "mode-note is-demo"; }
   if (running) note.textContent += " Stop the bot to switch mode.";
+  renderFast(auto);
+}
+
+/** The fast mode switch: shown only for the AI model, and only usable on a demo account. */
+function renderFast(auto) {
+  const ai = settings.strategy === "ai", real = st.trading && onReal();
+  $("fastRow").hidden = !ai;
+  const sw = $("fastSwitch");
+  sw.checked = !!settings.aiFast;
+  $("fastRow").dataset.on = settings.aiFast ? "1" : "";   // ui.js reads it for the risk summary
+  // On a REAL account it can be turned off but not on.
+  sw.disabled = real && !settings.aiFast;
+  $("fastRow").classList.toggle("is-locked", real);
+  $("fastRealTag").hidden = !real;
+  const note = $("fastNote");
+  if (!ai || !settings.aiFast) { note.hidden = true; return; }
+  note.hidden = false;
+  if (real) {
+    note.className = "fast-note is-real";
+    note.textContent = auto ? `${FAST_REAL} Auto trade won't place trades here. Switch to your demo account or turn fast mode off.`
+                            : `${FAST_REAL} Signals still show, but switch to your demo account to auto trade with it.`;
+    return;
+  }
+  const max = +settings.maxTradesPerDay, loss = +settings.maxDailyLossPct;
+  note.className = "fast-note";
+  note.textContent = [
+    `Uses ${Math.round(AI_FAST.threshold * 100)}% confidence, stop and target at ${AI_FAST.barrierATR}× the usual 1-minute move, closes after ${AI_FAST.horizonBars} min, up to ${AI_FAST.maxOpen} trades open.`,
+    max && loss ? `The daily limit of ${max} trades and the ${loss}% daily loss limit still stop it.`
+      : max ? `The daily limit of ${max} trades still stops it.` : loss ? `The ${loss}% daily loss limit still stops it.` : "",
+    max ? "You can raise the trade limit in Settings." : "",
+  ].filter(Boolean).join(" ");
 }
 
 /** The risk guard's reason for not trading, in plain words. */
@@ -310,7 +431,7 @@ function renderInfo(res) {
     $("infoText").textContent = top === i.pUp ? "Leans up" : top === i.pDn ? "Leans down" : "No clear move";
     $("infoPlain").textContent = top === i.pUp ? `The AI leans up: ${pct(i.pUp)}% chance of a rise.`
       : top === i.pDn ? `The AI leans down: ${pct(i.pDn)}% chance of a fall.` : "The AI expects no clear move right now.";
-    $("infoSub").textContent = `Up ${pct(i.pUp)}% · Down ${pct(i.pDn)}% · Flat ${pct(i.pNone)}% · signals at ${Math.round(+settings.aiThreshold * 100)}%`;
+    $("infoSub").textContent = `Up ${pct(i.pUp)}% · Down ${pct(i.pDn)}% · Flat ${pct(i.pNone)}% · signals at ${Math.round(aiParams(settings).threshold * 100)}%${fastOn() ? " (fast)" : ""}`;
   } else {
     $("infoText").textContent = REGIME_WORDS[i.regime] || i.regime;
     $("infoPlain").textContent = REGIME_PLAIN[i.regime] || "";
@@ -412,7 +533,7 @@ function onCandles(msg) {
     const all = (msg.candles || []).map(normBar);
     st.forming = all.pop() || null;
     st.bars = all;
-    series.setData([...st.bars, ...(st.forming ? [st.forming] : [])].map((b) => ({ time: b.epoch, ...b })));
+    if (chartTf() === 60) { series.setData(asData([...st.bars, ...(st.forming ? [st.forming] : [])])); paintMarkers(); }
     updatePrice();
     evaluate(false);
   } else if (msg.msg_type === "ohlc") {
@@ -423,11 +544,11 @@ function onCandles(msg) {
         st.bars.push(st.forming);
         if (st.bars.length > HISTORY_BARS * 1.5) st.bars.splice(0, st.bars.length - HISTORY_BARS);
         st.forming = bar;
-        series.update({ time: bar.epoch, ...bar });
+        if (chartTf() === 60) series.update({ time: bar.epoch, open: bar.open, high: bar.high, low: bar.low, close: bar.close });
         onBarClosed();
       } else st.forming = bar;
     } else if (bar.epoch === st.forming.epoch) st.forming = bar;
-    series.update({ time: st.forming.epoch, ...st.forming });
+    if (chartTf() === 60) series.update({ time: st.forming.epoch, open: st.forming.open, high: st.forming.high, low: st.forming.low, close: st.forming.close });
     updatePrice();
   }
 }
@@ -441,9 +562,7 @@ function updatePrice() {
 }
 
 function strategyParams() {
-  return settings.strategy === "ai"
-    ? { threshold: +settings.aiThreshold, margin: AI_DEFAULTS.margin, barrierATR: +settings.aiBarrier, horizonBars: +settings.aiHorizon }
-    : RULES_DEFAULTS;
+  return settings.strategy === "ai" ? aiParams(settings) : RULES_DEFAULTS;
 }
 
 function evaluate(actOnSignal) {
@@ -486,7 +605,7 @@ async function handleSignal(sig) {
   if (settings.mode === "signals") {
     st.lastSignalEpoch = lastBar.epoch;
     addMarker(lastBar.epoch, sig.action, sig.action);
-    showLevels(sig, entry);
+    plans.set("signal", planOf(sig, entry, size, lastBar.epoch, lastBar.epoch));
     log(sig.action, `${sig.action} ${settings.symbol} @ ${px(entry)}`, `SL ${px(sl)} · TP ${px(tp)} · ${sizeText} · ${sig.reason}`);
     renderSignal({ action: sig.action, entry, sl, tp, size, mult, reason: sig.reason, opened: false });
     notify(`Tbot: ${sig.action} ${settings.symbol}`, `Entry ${px(entry)} · SL ${px(sl)} · TP ${px(tp)}`);
@@ -495,6 +614,10 @@ async function handleSignal(sig) {
 
   // ---- auto trade
   if (!st.trading) { log("ERROR", "Auto trade needs a logged-in account"); return; }
+  if (fastOn() && onReal()) {   // demo only, checked again right before any order
+    if (Date.now() - (st.fastRefusedAt || 0) > 10 * 60000) { st.fastRefusedAt = Date.now(); log("ERROR", `Skipped ${sig.action}: fast mode is demo only`, FAST_REAL); }
+    return;
+  }
   const blocked = st.guard.blockReason(st.contracts.size);
   if (blocked) { log("INFO", `Skipped ${sig.action}: ${blocked}`); return; }
   if (!size?.ok) { log("INFO", `Skipped ${sig.action}`, size?.reason || "balance not known yet"); return; }
@@ -516,9 +639,11 @@ async function handleSignal(sig) {
     const buy = b.buy;
     st.guard.recordEntry();
     st.lastSignalEpoch = lastBar.epoch;
-    addMarker(lastBar.epoch, sig.action, sig.action);
-    showLevels(sig, entry);
-    trackContract(buy.contract_id, { side: sig.action, entryEpoch: lastBar.epoch, horizon: sig.horizonBars || 0, buyPrice: Number(buy.buy_price) });
+    const entryBar = st.forming?.epoch ?? lastBar.epoch + 60;   // the trade opens in the candle after the signal
+    addMarker(entryBar, sig.action, sig.action);
+    plans.remove("signal");
+    trackContract(buy.contract_id, { side: sig.action, entryEpoch: lastBar.epoch, horizon: sig.horizonBars || 0, buyPrice: Number(buy.buy_price),
+                                     marked: true, plan: planOf(sig, entry, size, entryBar, lastBar.epoch) });
     log(sig.action, `Opened ${sig.action} ${settings.symbol}`, `${sizeText} · ${sig.reason}${Number.isFinite(commission) ? ` · commission ${money(commission)}` : ""}`);
     renderSignal({ action: sig.action, entry, sl, tp, size, mult, reason: sig.reason, opened: true, commission });
     notify(`Tbot opened ${sig.action} ${settings.symbol}`, sizeText);
@@ -554,6 +679,7 @@ function trackContract(id, meta) {
   if (st.contracts.has(String(id))) return;
   const c = { side: "?", profit: 0, buyPrice: NaN, horizon: 0, entryEpoch: 0, ...meta };
   st.contracts.set(String(id), c);
+  if (c.plan) plans.set(String(id), c.plan);
   c.sub = st.socket.subscribe({ proposal_open_contract: 1, contract_id: Number(id) || id }, (msg) => {
     const poc = msg.proposal_open_contract;
     if (!poc || !Object.keys(poc).length) return;
@@ -561,9 +687,15 @@ function trackContract(id, meta) {
     c.buyPrice = Number(poc.buy_price ?? c.buyPrice);
     if (c.side === "?") c.side = String(poc.contract_type).includes("DOWN") ? "SELL" : "BUY";
     const sold = poc.is_sold === 1 || poc.is_sold === true || ["sold", "won", "lost"].includes(poc.status);
+    if (!sold) showTradePlan(String(id), c, poc);
     if (sold) {
       c.sub.unsubscribe();
       st.contracts.delete(String(id));
+      plans.close(String(id));
+      const at = st.forming?.epoch ?? st.bars.at(-1)?.epoch;
+      if (at && Number.isFinite(c.profit))
+        addMarker(at, c.side, `${c.profit >= 0 ? "+" : "−"}${num(Math.abs(c.profit))}`,
+                  { tone: c.profit >= 0 ? "up" : "down", shape: "circle", position: c.side === "BUY" ? "aboveBar" : "belowBar" });
       st.guard?.recordClose(c.profit);
       log(c.profit >= 0 ? "WIN" : "LOSS", `Closed ${c.side} ${settings.symbol}: ${c.profit >= 0 ? "+" : ""}${money(c.profit)}`,
           poc.exit_tick_display_value ? `exit ${poc.exit_tick_display_value}` : "");
@@ -575,6 +707,17 @@ function trackContract(id, meta) {
     renderAccount();
   });
   renderOpen();
+}
+
+/** Draws an open trade's plan from Deriv's own numbers (entry spot, limit orders), also for trades found after a reload. */
+function showTradePlan(id, c, poc) {
+  try {
+    const p = planFromContract(poc, plans.get(id) || c.plan || {});
+    if (!p.start && c.entryEpoch) p.start = c.entryEpoch + 60;
+    if (c.horizon && c.entryEpoch && !p.end) p.end = c.entryEpoch + (c.horizon + 1) * 60;
+    plans.set(id, p);
+    if (!c.marked && p.start && p.start >= (st.bars[0]?.epoch ?? Infinity)) { c.marked = true; addMarker(p.start, p.side, p.side); }
+  } catch { /* display only */ }
 }
 
 async function closeContract(id, why) {
@@ -629,6 +772,7 @@ function makeSocket(urlProvider) {
   });
   st.socket = sock;
   subscribeMarket(sock);
+  subscribeChart(sock);
   if (st.trading) {
     sock.subscribe({ balance: 1 }, (msg) => {
       if (!msg.balance) return;
@@ -652,6 +796,7 @@ function connectAccount(account) {
   st.currency = account.currency || "USD";
   st.balance = account.balance;
   st.contracts.clear(); renderOpen();
+  plans.clear();
   st.guard = new RiskGuard(localStorage, account.id, limits());
   if (Number.isFinite(st.balance)) st.guard.update(st.balance);   // no open trades tracked yet
   makeSocket(() => getTradingSocketUrl(cfg, st.auth, account.id));
@@ -659,7 +804,7 @@ function connectAccount(account) {
 }
 
 const limits = () => ({
-  maxDailyLossPct: +settings.maxDailyLossPct, maxOpen: +settings.maxOpen, maxTradesPerDay: +settings.maxTradesPerDay,
+  maxDailyLossPct: +settings.maxDailyLossPct, maxOpen: fastOn() ? AI_FAST.maxOpen : +settings.maxOpen, maxTradesPerDay: +settings.maxTradesPerDay,
   maxConsecLosses: +settings.maxConsecLosses, cooldownMinutes: +settings.cooldownMinutes,
 });
 
@@ -747,6 +892,7 @@ function logout() {
   st.auth = null; st.account = null; st.accounts = []; st.guard = null; st.balance = NaN;
   try { sessionStorage.removeItem("tbot:auth"); sessionStorage.removeItem("tbot:account"); } catch { /* blocked */ }
   st.contracts.clear(); renderOpen();
+  plans.clear();
   renderAccount(); renderControls();
   connectPublic();
 }
@@ -797,6 +943,11 @@ async function returnFromDeriv() {
 async function startBot() {
   if (settings.mode === "auto") {
     if (!st.trading) { log("ERROR", "Log in with Deriv first to auto trade"); return; }
+    if (fastOn() && onReal()) {
+      log("ERROR", "Auto trade not started: fast mode is demo only", "Switch to your demo account, or turn fast mode off.");
+      renderControls();
+      return;
+    }
     if (st.account.type === "real" &&
         !confirm(`Auto trade with REAL money on ${st.account.id}?\n\nThe tests showed no proven edge. Only continue if you accept losing what you risk.`)) return;
   }
@@ -805,7 +956,7 @@ async function startBot() {
   }
   try { st.wakeLock = await navigator.wakeLock?.request("screen"); } catch { /* not supported */ }
   st.running = true;
-  log("INFO", `Bot started: ${settings.strategy === "ai" ? "AI model" : "rules"}, ${settings.mode === "auto" ? "auto trade" : "signals only"}`);
+  log("INFO", `Bot started: ${settings.strategy === "ai" ? (fastOn() ? "AI model, fast mode" : "AI model") : "rules"}, ${settings.mode === "auto" ? "auto trade" : "signals only"}`);
   if (settings.strategy === "rules" && st.bars.length < rulesMinBars()) log("INFO", "Waiting for enough price history");
   renderControls();
 }
@@ -816,6 +967,7 @@ function stopBot() {
   st.wakeLock?.release?.().catch(() => {});
   st.wakeLock = null;
   log("INFO", "Bot stopped. Open trades keep their stop loss and take profit.");
+  ageSignalPlan();
   renderControls();
 }
 
@@ -863,13 +1015,39 @@ $("loginAppId").addEventListener("input", (ev) => setAppId(ev.target.value, "log
 $("settingsForm").addEventListener("submit", (e) => e.preventDefault());
 
 document.querySelectorAll("[data-strategy]").forEach((b) => b.addEventListener("click", () => {
-  settings.strategy = b.dataset.strategy; saveSettings(); renderControls(); evaluate(false);
+  settings.strategy = b.dataset.strategy; saveSettings();
+  if (st.guard) st.guard.limits = limits();   // fast mode's open-trade limit applies only to AI
+  renderControls(); evaluate(false);
 }));
+$("fastSwitch").addEventListener("change", (e) => {
+  const on = e.target.checked;
+  if (on && st.trading && onReal()) {
+    e.target.checked = false;
+    log("ERROR", "Fast mode is demo only", "Switch to your demo account to use it.");
+    renderControls();
+    return;
+  }
+  settings.aiFast = on; saveSettings();
+  if (st.guard) st.guard.limits = limits();
+  log("INFO", on ? "Fast mode on (demo only)" : "Fast mode off",
+      on ? `AI ${Math.round(AI_FAST.threshold * 100)}% confidence, closes after ${AI_FAST.horizonBars} min, up to ${AI_FAST.maxOpen} trades open`
+         : "Your own AI settings and open-trade limit apply again");
+  renderControls(); evaluate(false);
+});
 document.querySelectorAll("[data-mode]").forEach((b) => b.addEventListener("click", () => {
   if (st.running) { log("INFO", "Stop the bot before switching mode"); return; }
   settings.mode = b.dataset.mode; saveSettings(); renderControls();
 }));
 $("runBtn").addEventListener("click", () => (st.running ? stopBot() : startBot()));
+document.querySelectorAll("[data-tf]").forEach((b) => b.addEventListener("click", () => {
+  if (+b.dataset.tf === chartTf()) return;
+  settings.chartTf = +b.dataset.tf; saveSettings();
+  renderTimeframe();
+  subscribeChart();
+}));
+$("planToggle").checked = store.get(PLAN_KEY, true) !== false;
+plans.setVisible($("planToggle").checked);
+$("planToggle").addEventListener("change", (e) => { store.set(PLAN_KEY, e.target.checked); plans.setVisible(e.target.checked); });
 $("loginBtn").addEventListener("click", login);
 // Coming back with the browser's Back button restores the page as it was when it left for Deriv.
 addEventListener("pageshow", (e) => {
@@ -898,7 +1076,8 @@ $("symbolSelect").addEventListener("change", (e) => {
   settings.symbol = e.target.value; saveSettings();
   stopBot();
   st.bars = []; st.forming = null; markers = []; series.setMarkers([]);
-  priceLines.forEach((l) => series.removePriceLine(l)); priceLines = [];
+  chartFeed.sub = null;   // the old socket's stream goes with it
+  plans.clear();
   if (st.trading) connectAccount(st.account); else connectPublic();
 });
 $("openList").addEventListener("click", (e) => {
@@ -946,6 +1125,7 @@ async function boot() {
   $("symbolSelect").innerHTML = SYMBOLS.map(([v, n]) => `<option value="${v}" ${v === settings.symbol ? "selected" : ""}>${esc(n)}</option>`).join("");
   fillSettingsForm();
   renderMultipliers();
+  renderTimeframe();
   try {
     const res = await fetch("model/tbotai-model.json");
     if (res.ok) st.model = await res.json();
@@ -970,5 +1150,5 @@ async function boot() {
   else if (!$("loginBtn").disabled) connectPublic();
 }
 
-if (isLocal) window.tbot = { st, settings, handleSignal, evaluate };   // test hook
+if (isLocal) window.tbot = { st, settings, handleSignal, evaluate, plans, chartFeed, series };   // test hook
 boot();

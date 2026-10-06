@@ -46,8 +46,21 @@
       <div class="price" id="lastPrice" aria-label="Last price">–</div>
     </div>
     <div class="market-meta">
-      <span class="market-sub">1-minute chart by <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">TradingView</a></span>
+      <span class="market-sub"><span id="tfName">1-minute</span> chart by <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">TradingView</a></span>
       <span class="conn"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></span>
+    </div>
+    <div class="tf-bar" role="group" aria-label="Chart timeframe">
+      <button type="button" data-tf="60" aria-pressed="true">1m</button>
+      <button type="button" data-tf="300" aria-pressed="false">5m</button>
+      <button type="button" data-tf="900" aria-pressed="false">15m</button>
+      <button type="button" data-tf="3600" aria-pressed="false">1h</button>
+      <button type="button" data-tf="14400" aria-pressed="false">4h</button>
+      <button type="button" data-tf="86400" aria-pressed="false">1D</button>
+    </div>
+    <p class="tf-note" id="tfNote" hidden>The bot trades on 1-minute candles; this only changes the chart.</p>
+    <div class="plan-bar">
+      <label class="plan-toggle" for="planToggle"><input id="planToggle" type="checkbox" checked><span>Show trade plan</span></label>
+      <span class="plan-legend" aria-hidden="true"><i class="lg-tp"></i>Target <i class="lg-sl"></i>Stop</span>
     </div>
     <div id="chart" class="chart" aria-label="1-minute candlestick chart"></div>
   </section>
@@ -89,6 +102,16 @@
     <div class="seg" role="group" aria-labelledby="stratLabel">
       <button type="button" data-strategy="rules" aria-pressed="true"><span class="seg-t">Rules</span><span class="seg-s">Trend and range rules</span></button>
       <button type="button" data-strategy="ai" aria-pressed="false"><span class="seg-t">AI model</span><span class="seg-s">Trained on past prices</span></button>
+    </div>
+    <div class="fast-row" id="fastRow" hidden>
+      <label class="fast-switch" for="fastSwitch">
+        <span class="set-text">
+          <span class="set-name">Fast mode (demo only) <span class="acct-badge real fast-tag" id="fastRealTag" hidden>Demo only</span></span>
+          <span class="set-hint" id="fastHint">Trades every few minutes with small targets. In our tests it was a coin flip and lost money after Deriv's fee.</span>
+        </span>
+        <input class="switch" id="fastSwitch" type="checkbox" aria-describedby="fastHint fastNote">
+      </label>
+      <p class="fast-note" id="fastNote" hidden></p>
     </div>
     <div class="seg-label" id="modeLabel">What the bot does</div>
     <div class="seg seg-mode" id="modeSeg" role="group" aria-labelledby="modeLabel">

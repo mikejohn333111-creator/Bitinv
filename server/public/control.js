@@ -139,13 +139,14 @@ function stateOf(s) {
 }
 
 function detailText(s) {
-  const strat = s.strategy === "ai" ? "the AI model" : "the rules strategy";
+  const strat = s.strategy === "ai" ? (s.fast ? "the AI model in fast mode" : "the AI model") : "the rules strategy";
   if (s.needsToken) return "Deriv did not accept the token, so the bot stopped. Add a new token under Deriv connection.";
   if (!s.running) {
     if (s.mode === "auto" && !s.hasToken) return "Add your Deriv token in Settings, then press Start.";
     return s.mode === "auto" ? `Press Start to auto trade ${s.symbolName} with ${strat}.`
                              : `Press Start to watch ${s.symbolName} for signals. Nothing will be traded.`;
   }
+  if (s.fastBlocked && s.mode === "auto") return "Fast mode is demo only, so the bot places no trades on this REAL account. Switch to a demo account or turn fast mode off.";
   if (s.halted) return `The daily loss limit was hit (${s.haltReason}). The bot carries on tomorrow (UTC). Press Stop to stop it fully.`;
   let t = s.mode === "auto" ? `Auto trading ${s.symbolName} with ${strat}.` : `Watching ${s.symbolName} for signals with ${strat}. Nothing is traded.`;
   if (s.resumedAt && Date.now() - s.resumedAt < 12 * 3600e3) t += ` It carried on by itself after a server restart at ${when(s.resumedAt)}.`;
@@ -265,7 +266,7 @@ function renderSettings(s) {
   $("sumDeriv").textContent = s.needsToken ? "Token not accepted" : s.hasToken ? "Connected" : "Not connected";
   $("sumAccount").textContent = s.account ? `${s.account.type === "real" ? "REAL" : "Demo"} · ${s.account.id}` : "None";
   $("sumMode").textContent = set.mode === "auto" ? "Auto trade" : "Signals only";
-  $("sumMarket").textContent = `${s.symbolName} · ${set.strategy === "ai" ? "AI model" : "Rules"}`;
+  $("sumMarket").textContent = `${s.symbolName} · ${set.strategy === "ai" ? (s.fast ? "AI model · Fast" : "AI model") : "Rules"}`;
   $("sumRisk").textContent = `${set.riskPct}% per trade · ${set.maxDailyLossPct}% a day`;
   $("sumReal").textContent = set.allowReal ? "On" : "Off";
   $("sumVersion").textContent = s.version?.commit ? s.version.commit.slice(0, 7) : "";
@@ -323,6 +324,7 @@ function renderSettings(s) {
   }
   const aiRadio = document.querySelector('input[name="strategy"][value="ai"]');
   aiRadio.disabled = !s.modelLoaded;
+  renderFast(s);
 
   // risk
   const ms = $("multiplierSelect");
@@ -340,6 +342,28 @@ function renderSettings(s) {
   // real money
   $("realOff").hidden = set.allowReal;
   $("realOn").hidden = !set.allowReal;
+}
+
+/** Fast mode switch: shown when the saved strategy is the AI model; it can't be turned on for a real account. */
+function renderFast(s) {
+  const set = s.settings, real = !!s.account && s.account.type !== "demo";
+  $("fastBox").hidden = set.strategy !== "ai";
+  $("fastBox").classList.toggle("locked", real);
+  $("fastRealTag").hidden = !real;
+  const sw = $("fastInput");
+  if (!ui.fastSaving) sw.checked = !!set.aiFast;
+  sw.disabled = real && !set.aiFast;   // on a real account it can be turned off, not on
+  const note = $("fastNote");
+  note.hidden = !set.aiFast;
+  if (!set.aiFast) return;
+  const p = s.fastPreset || {};
+  const max = set.maxTradesPerDay, loss = set.maxDailyLossPct;
+  note.className = "fast-note" + (real ? " real" : "");
+  note.textContent = real
+    ? "Fast mode is demo only. The bot never trades with it on a real money account. Switch to a demo account or turn it off."
+    : `It uses ${Math.round(p.threshold * 100)}% confidence, stop and target at ${p.barrierATR}x the average range, closes after ${p.horizonBars} min, ` +
+      `and allows up to ${p.maxOpen} open trades. These replace your AI values and Max open trades while it's on. ` +
+      `The daily limit of ${max} trades and the ${loss}% daily loss limit still stop it. You can raise the trade limit under Risk limits.`;
 }
 
 // ------------------------------------------------------------- actions
@@ -475,6 +499,17 @@ $("modeSeg").addEventListener("change", async (ev) => {
   const mode = ev.target.value;
   const r = await saveSettings({ mode }, "modeMsg");
   if (!r.ok && ui.status) renderSettings(ui.status);
+});
+
+$("fastInput").addEventListener("change", async (ev) => {
+  const on = ev.target.checked;
+  ui.fastSaving = true;
+  try {
+    const r = await saveSettings({ aiFast: on });
+    setMsg("fastMsg", r.ok ? (on ? "Fast mode is on (demo only)." : "Fast mode is off. Your own AI values apply again.") : r.data.message || "Couldn't save that.",
+           r.ok ? "ok" : "error");
+    if (!r.ok) ev.target.checked = !on;
+  } finally { ui.fastSaving = false; }
 });
 
 for (const r of document.querySelectorAll('input[name="strategy"]'))

@@ -165,6 +165,22 @@ export function evaluateRules(bars, p = RULES_DEFAULTS) {
 // Same 17 features as mt5/ai/features.py and TbotAI.mq5, then a small neural
 // network (weights in public/model/tbotai-model.json, exported from train.py).
 export const AI_DEFAULTS = { threshold: 0.5, margin: 0.1, barrierATR: 3.0, horizonBars: 60 };
+// Fast mode (demo only): a looser AI preset that trades every few minutes with small targets.
+// It replaces only these values, and only while it is on and the strategy is AI; the user's
+// own AI settings and open-trade limit are kept and come back when it is turned off.
+// In our tests it was a coin flip and lost money after Deriv's fee. Both bots refuse to use
+// it on a real money account.
+export const AI_FAST = Object.freeze({ threshold: 0.45, margin: 0.05, barrierATR: 1, horizonBars: 10, maxOpen: 3 });
+
+/** True when fast mode applies to these settings (it only applies to the AI strategy). */
+export const fastModeOn = (s) => s?.strategy === "ai" && s?.aiFast === true;
+
+/** The AI parameters for these settings: the fast preset while fast mode is on, else the user's own. */
+export function aiParams(s) {
+  if (fastModeOn(s)) { const { threshold, margin, barrierATR, horizonBars } = AI_FAST; return { threshold, margin, barrierATR, horizonBars }; }
+  return { threshold: +s.aiThreshold, margin: AI_DEFAULTS.margin, barrierATR: +s.aiBarrier, horizonBars: +s.aiHorizon };
+}
+
 export const AI_MIN_BARS = 243;
 const LAGS = [1, 2, 3, 5, 10, 15, 30, 60];
 const clip = (v) => Math.max(-50, Math.min(50, v));

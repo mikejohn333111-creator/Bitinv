@@ -1,5 +1,8 @@
 // Page-only behaviour: bottom sheets, the header login shortcut, the account list, the signal card's
-// age, the activity filter and "show all", the Close button's "Closing…" state and the risk summary. No trading logic lives here.
+// age, the activity filter and "show all", the Close button's "Closing…" state and the risk summary
+// (including fast mode's open-trade limit). No trading logic lives here.
+import { AI_FAST } from "./strategy.js";
+
 const $ = (id) => document.getElementById(id);
 
 // ------------------------------------------------------------- sheets
@@ -162,9 +165,13 @@ function riskSummary() {
   const v = (n) => form.elements[n]?.value;
   const parts = [`${v("riskPct") || "?"}% per trade`];
   if (Number(v("maxDailyLossPct")) > 0) parts.push(`stop at −${v("maxDailyLossPct")}% a day`);
-  if (Number(v("maxOpen")) > 0) parts.push(`${v("maxOpen")} open at most`);
+  // Fast mode (AI only) allows 3 open trades; app.js shows the switch only for the AI model.
+  const fast = !$("fastRow").hidden && $("fastRow").dataset.on === "1";
+  if (fast) parts.push(`${AI_FAST.maxOpen} open at most (fast mode)`);
+  else if (Number(v("maxOpen")) > 0) parts.push(`${v("maxOpen")} open at most`);
   $("riskSummary").textContent = parts.join(" · ");
 }
 form.addEventListener("change", riskSummary);
 form.addEventListener("input", riskSummary);
+new MutationObserver(riskSummary).observe($("fastRow"), { attributes: true, attributeFilter: ["hidden", "data-on"] });
 riskSummary();

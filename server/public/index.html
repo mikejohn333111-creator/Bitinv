@@ -195,6 +195,17 @@
             <p class="msg" id="marketMsg" role="status" hidden></p>
             <button class="btn primary" type="submit">Save</button>
           </form>
+          <div class="fast" id="fastBox" hidden>
+            <label class="fast-switch" for="fastInput">
+              <span class="fast-text">
+                <span class="fast-name">Fast mode (demo only) <span class="badge real" id="fastRealTag" hidden>Demo only</span></span>
+                <span class="hint" id="fastHint">Trades every few minutes with small targets. In our tests it was a coin flip and lost money after Deriv's fee.</span>
+              </span>
+              <input class="switch" id="fastInput" type="checkbox" aria-describedby="fastHint fastNote">
+            </label>
+            <p class="fast-note" id="fastNote" hidden></p>
+            <p class="msg" id="fastMsg" role="status" hidden></p>
+          </div>
         </div>
       </details>
 

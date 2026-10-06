@@ -8,7 +8,7 @@
 // crash, reboot or update the bot resumes on its own and picks up its open trades again.
 import { readFileSync } from "node:fs";
 import { CONFIG, SYMBOLS } from "../public/js/config.js";
-import { evaluateRules, evaluateAI, RULES_DEFAULTS, AI_DEFAULTS, rulesMinBars } from "../public/js/strategy.js";
+import { evaluateRules, evaluateAI, RULES_DEFAULTS, AI_DEFAULTS, AI_FAST, aiParams, fastModeOn, rulesMinBars } from "../public/js/strategy.js";
 import { sizeMultiplier, RiskGuard } from "../public/js/risk.js";
 import { getAccounts, createDemoAccount, getTradingSocketUrl, DerivSocket, cleanAppId } from "../public/js/deriv.js";
 
@@ -27,8 +27,10 @@ export const DEFAULT_SETTINGS = {
   riskPct: 1, maxDailyLossPct: 3, maxOpen: 1, maxTradesPerDay: 20, maxConsecLosses: 3, cooldownMinutes: 15,
   multiplier: 0, signalGap: 8,
   aiThreshold: 0.55, aiBarrier: AI_DEFAULTS.barrierATR, aiHorizon: AI_DEFAULTS.horizonBars,
+  aiFast: false,                      // fast mode (AI only, demo only): see AI_FAST in public/js/strategy.js
   allowReal: false,
 };
+const FAST_REAL_MSG = "Fast mode is demo only. It never trades on a real money account.";
 
 const NUMBERS = {
   riskPct:         { min: 0.1, max: 5, label: "Risk per trade" },
@@ -65,6 +67,9 @@ export function cleanSettings(input, current = DEFAULT_SETTINGS) {
       out[k] = spec.int ? Math.round(n) : Math.round(n * 1000) / 1000;
     } else if (CHOICES[k]) {
       if (!CHOICES[k].includes(v)) { errors.push(`Unknown ${k}.`); continue; }
+      out[k] = v;
+    } else if (k === "aiFast") {
+      if (typeof v !== "boolean") { errors.push("Fast mode must be on or off."); continue; }
       out[k] = v;
     } else if (k === "allowReal") {
       if (typeof v !== "boolean") { errors.push("Allow real money must be on or off."); continue; }
@@ -268,9 +273,12 @@ export class TradingEngine {
     this.#makeSocket(() => getTradingSocketUrl(this.#derivCfg(), this.auth(), account.id));
   }
 
+  /** Fast mode is on (AI strategy only). Its preset replaces the AI values and the open-trade limit. */
+  fast() { return fastModeOn(this.settings); }
+
   limits() {
     const s = this.settings;
-    return { maxDailyLossPct: +s.maxDailyLossPct, maxOpen: +s.maxOpen, maxTradesPerDay: +s.maxTradesPerDay,
+    return { maxDailyLossPct: +s.maxDailyLossPct, maxOpen: this.fast() ? AI_FAST.maxOpen : +s.maxOpen, maxTradesPerDay: +s.maxTradesPerDay,
              maxConsecLosses: +s.maxConsecLosses, cooldownMinutes: +s.cooldownMinutes };
   }
 
@@ -436,9 +444,7 @@ export class TradingEngine {
 
   strategyParams() {
     const s = this.settings;
-    return s.strategy === "ai"
-      ? { threshold: +s.aiThreshold, margin: AI_DEFAULTS.margin, barrierATR: +s.aiBarrier, horizonBars: +s.aiHorizon }
-      : RULES_DEFAULTS;
+    return s.strategy === "ai" ? aiParams(s) : RULES_DEFAULTS;
   }
 
   evaluate(actOnSignal) {
@@ -503,6 +509,8 @@ export class TradingEngine {
 
     // ---- auto trade
     if (!this.trading) { this.logOnce("ERROR", "Auto trade needs your Deriv account. Add your token under Deriv connection."); return; }
+    // Fast mode is demo only, whatever Allow real money says.
+    if (this.fast() && this.account?.type !== "demo") { this.logOnce("ERROR", `Skipped ${sig.action}: ${FAST_REAL_MSG}`, "Turn fast mode off, or use a demo account."); return; }
     if (this.syncing) { this.log("INFO", `Skipped ${sig.action}: still checking your open trades`); return; }
     if (lastBar.epoch <= (this.state.lastTradeEpoch || 0)) return;   // already traded on this bar
     const blocked = this.guard.blockReason(this.openCount(), this.now());
@@ -670,7 +678,7 @@ export class TradingEngine {
   // ------------------------------------------------------------- run/stop
   #describeRun() {
     const s = this.settings;
-    return `${s.strategy === "ai" ? "AI model" : "rules"}, ${s.mode === "auto" ? "auto trade" : "signals only"}, ${SYMBOL_NAMES[s.symbol] || s.symbol}`;
+    return `${s.strategy === "ai" ? (this.fast() ? "AI model (fast mode)" : "AI model") : "rules"}, ${s.mode === "auto" ? "auto trade" : "signals only"}, ${SYMBOL_NAMES[s.symbol] || s.symbol}`;
   }
 
   #setRunning(on) {
@@ -688,6 +696,10 @@ export class TradingEngine {
       if (this.needsToken) throw new UserError(this.error || TOKEN_MSG[401]);
       if (!this.trading || !this.account) throw new UserError("The bot isn't connected to your Deriv account yet. Please wait a moment and try again.");
       if (this.account.type === "real" && !s.allowReal) throw new UserError("This is a real money account. Turn on Allow real money first.");
+      if (this.fast() && this.account.type !== "demo") {
+        this.log("ERROR", "Did not start: fast mode is demo only", "Turn fast mode off, or use a demo account.");
+        throw new UserError(`${FAST_REAL_MSG} Turn it off, or use a demo account.`, 403, "fast_demo_only");
+      }
     }
     this.#setRunning(true);
     this.log("INFO", `Bot started: ${this.#describeRun()}`,
@@ -707,9 +719,18 @@ export class TradingEngine {
   updateSettings(partial) {
     const prev = { ...this.settings };
     if (partial.mode && partial.mode !== prev.mode && this.running) throw new UserError("Stop the bot before switching mode.");
+    const next = { ...prev, ...partial };
+    if (fastModeOn(next) && !fastModeOn(prev) && this.account && this.account.type !== "demo") {
+      this.log("ERROR", "Fast mode was not turned on: it is demo only", `Account ${this.account.id} is a real money account.`);
+      throw new UserError(`${FAST_REAL_MSG} Switch to a demo account first.`, 403, "fast_demo_only");
+    }
     Object.assign(this.settings, partial);
     this.store.saveSettings(this.settings);
     if (this.guard) this.guard.limits = this.limits();
+    if (fastModeOn(this.settings) !== fastModeOn(prev))
+      this.log("INFO", fastModeOn(this.settings) ? "Fast mode is on (demo only)" : "Fast mode is off",
+               fastModeOn(this.settings) ? `AI ${Math.round(AI_FAST.threshold * 100)}% confidence, stop and target ${AI_FAST.barrierATR}x ATR, closes after ${AI_FAST.horizonBars} min, up to ${AI_FAST.maxOpen} trades open`
+                                         : "Your own AI settings and open-trade limit apply again");
     if (partial.allowReal === true && !prev.allowReal) this.log("INFO", "Real money trading is now allowed");
     if (partial.allowReal === false && prev.allowReal) {
       this.log("INFO", "Real money trading is now off");
@@ -887,6 +908,9 @@ export class TradingEngine {
       accounts: this.publicAccounts(),
       symbols: SYMBOLS,
       settings: { ...s },
+      fast: this.fast(),
+      fastPreset: AI_FAST,
+      fastBlocked: this.fast() && !!this.account && this.account.type !== "demo",
       limits: this.limits(),
       startedAt: this.running ? this.state.startedAt || null : null,
       resumedAt: this.running ? this.resumedAt || null : null,

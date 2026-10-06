@@ -15,6 +15,7 @@
 //   MOCK_REDIRECT=url         the registered redirect URL (default http://localhost:8787/)
 //   MOCK_PAT=token            also accept this personal access token (scope "trade account_manage"), only
 //                             together with a Deriv-App-ID header, as Deriv does (for the server bot)
+//   MOCK_LIMIT_MONEY_ONLY=1   open trades report their stop loss / take profit as money only (no price)
 //   MOCK_CONTROL=1            tests may change the clock speed while it runs: POST /mock/clock {"barMs": 6000}
 //                             (fast bars to get a signal soon, then slow ones so a trade stays open long enough to look at)
 import { createServer } from "node:http";
@@ -48,6 +49,29 @@ function makeBar(epoch) {
 }
 for (let i = 0; i < 2000; i++) bars.push(makeBar(clockEpoch + i * 60));
 let forming = makeBar(clockEpoch + 2000 * 60);
+// Other timeframes are the same random walk grouped into longer candles (the last one still forming).
+const GRANULARITIES = [60, 120, 180, 300, 600, 900, 1800, 3600, 7200, 14400, 28800, 86400];
+function candlesOf(g) {
+  if (g === 60) return [...bars, forming];
+  const out = [];
+  for (const b of [...bars, forming]) {
+    const start = Math.floor(b.epoch / g) * g, last = out[out.length - 1];
+    if (last && last.epoch === start) { last.high = Math.max(last.high, b.high); last.low = Math.min(last.low, b.low); last.close = b.close; }
+    else out.push({ epoch: start, open: b.open, high: b.high, low: b.low, close: b.close });
+  }
+  return out;
+}
+function formingOf(g) {
+  if (g === 60) return forming;
+  const start = Math.floor(forming.epoch / g) * g;
+  let c = null;
+  for (let i = bars.length - 1; i >= 0 && bars[i].epoch >= start; i--) {
+    const b = bars[i];
+    c = c ? { epoch: start, open: b.open, high: Math.max(c.high, b.high), low: Math.min(c.low, b.low), close: c.close } : { ...b, epoch: start };
+  }
+  const f = forming;
+  return c ? { ...c, high: Math.max(c.high, f.high), low: Math.min(c.low, f.low), close: f.close } : { ...f, epoch: start };
+}
 
 // ----------------------------------------------------------------- state
 const codes = new Map();           // code -> {challenge, clientId, redirectUri, scope}
@@ -198,15 +222,17 @@ function err(ws, req, code, message) { send(ws, { msg_type: Object.keys(req)[0],
 function handle(ws, req) {
   const r = { req_id: req.req_id, echo_req: req };
   if (req.ping) return send(ws, { ...r, msg_type: "ping", ping: "pong" });
-  if (req.forget) return send(ws, { ...r, msg_type: "forget", forget: 1 });
+  if (req.forget) { const had = ws.subs.delete(req.forget); return send(ws, { ...r, msg_type: "forget", forget: had ? 1 : 0 }); }
   if (req.ticks_history) {
     if (req.symbol) return err(ws, req, "InputValidationFailed", "unknown field symbol");
-    let list = [...bars, forming];
+    const g = Number(req.granularity || 60);
+    if (!GRANULARITIES.includes(g)) return err(ws, req, "InputValidationFailed", "granularity");
+    let list = candlesOf(g);
     if (req.end && req.end !== "latest") list = list.filter((b) => b.epoch <= Number(req.end));
     list = list.slice(-(req.count || 1000));
     const subId = req.subscribe ? "sub" + randomBytes(4).toString("hex") : undefined;
     send(ws, { ...r, msg_type: "candles", candles: list, ...(subId && { subscription: { id: subId } }) });
-    if (subId) ws.subs.set(subId, { kind: "ohlc", req_id: req.req_id });
+    if (subId) ws.subs.set(subId, { kind: "ohlc", req_id: req.req_id, g });
     return;
   }
   if (req.contracts_for) return send(ws, { ...r, msg_type: "contracts_for", contracts_for: { available: [
@@ -233,7 +259,7 @@ function handle(ws, req) {
     if (!p || p.id !== req.buy) return err(ws, req, "InvalidContractProposal", "proposal expired");
     if (p.amount > acc.balance) return err(ws, req, "InsufficientBalance", "not enough balance");
     const c = { id: nextContract++, acc, type: p.contract_type, symbol: p.underlying_symbol, stake: p.amount, mult: p.multiplier,
-                entry: forming.close, sl: p.limit_order?.stop_loss, tp: p.limit_order?.take_profit,
+                entry: forming.close, entryTime: forming.epoch + 30, sl: p.limit_order?.stop_loss, tp: p.limit_order?.take_profit,
                 commission: +(p.amount * p.multiplier * 0.00005).toFixed(2), sold: false, profit: 0 };
     contracts.set(c.id, c);
     acc.balance = +(acc.balance - c.stake).toFixed(2);
@@ -256,9 +282,21 @@ function handle(ws, req) {
   err(ws, req, "UnrecognisedRequest", "unrecognised request");
 }
 
+// Like Deriv: the entry spot and the limit orders as money (order_amount) and price (value).
+// MOCK_LIMIT_MONEY_ONLY=1 leaves the price out, so the page has to work it out from the money.
+function limitOrder(c, kind) {
+  const amount = c[kind];
+  if (!amount) return undefined;
+  const dist = (amount / (c.stake * c.mult)) * c.entry, up = c.type === "MULTUP";
+  const price = kind === "tp" ? (up ? c.entry + dist : c.entry - dist) : (up ? c.entry - dist : c.entry + dist);
+  return { display_name: kind === "tp" ? "Take profit" : "Stop loss", order_amount: kind === "tp" ? amount : -amount, order_date: c.entryTime,
+           ...(!process.env.MOCK_LIMIT_MONEY_ONLY && { value: price.toFixed(2) }) };
+}
 function poc(c) {
   return { contract_id: c.id, contract_type: c.type, buy_price: c.stake, profit: c.profit, is_sold: c.sold ? 1 : 0,
-           status: c.sold ? "sold" : "open", current_spot: forming.close, ...(c.sold && { exit_tick_display_value: String(c.exit) }) };
+           status: c.sold ? "sold" : "open", current_spot: forming.close, entry_spot: c.entry, entry_tick_time: c.entryTime, date_start: c.entryTime,
+           multiplier: c.mult, underlying_symbol: c.symbol, limit_order: { stop_loss: limitOrder(c, "sl"), take_profit: limitOrder(c, "tp") },
+           ...(c.sold && { exit_tick_display_value: String(c.exit) }) };
 }
 function pnl(c) {
   const move = (forming.close - c.entry) / c.entry * (c.type === "MULTUP" ? 1 : -1);
@@ -291,9 +329,12 @@ function clockTick() {
     if ((c.sl && c.profit <= -c.sl) || (c.tp && c.profit >= c.tp) || c.profit <= -c.stake) settle(c);
   }
   for (const ws of sockets) for (const [id, s] of ws.subs) {
-    if (s.kind === "ohlc") send(ws, { msg_type: "ohlc", req_id: s.req_id, subscription: { id },
-      ohlc: { open_time: forming.epoch, epoch: forming.epoch + 59, open: String(forming.open), high: String(forming.high),
-              low: String(forming.low), close: String(forming.close), granularity: 60, symbol: "R_75" } });
+    if (s.kind === "ohlc") {
+      const g = s.g || 60, f = formingOf(g);
+      send(ws, { msg_type: "ohlc", req_id: s.req_id, subscription: { id },
+        ohlc: { open_time: f.epoch, epoch: forming.epoch + 59, open: String(f.open), high: String(f.high),
+                low: String(f.low), close: String(f.close), granularity: g, symbol: "R_75" } });
+    }
     if (s.kind === "poc") { send(ws, { msg_type: "proposal_open_contract", req_id: s.req_id, proposal_open_contract: poc(s.contract), subscription: { id } });
       if (s.contract.sold) ws.subs.delete(id); }
   }

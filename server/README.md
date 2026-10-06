@@ -121,7 +121,7 @@ All under `/api/`, JSON in and out. Every call needs the session cookie except l
 | `GET /api/log?after=<seq>` | Activity log entries newer than `seq` (up to 200), plus `last`. |
 | `POST /api/start` | Starts the bot. 409 with a message if it can't (no token, real account not allowed, not connected yet). |
 | `POST /api/stop` | Stops the bot. Open trades keep their stop loss and take profit. |
-| `POST /api/settings` `{...}` | Changes some settings. Numbers are clamped to safe ranges. `allowReal: true` also needs `confirmReal: "REAL"`. Switching `mode` needs the bot stopped. A new `symbol` stops the bot. |
+| `POST /api/settings` `{...}` | Changes some settings. Numbers are clamped to safe ranges. `allowReal: true` also needs `confirmReal: "REAL"`. Switching `mode` needs the bot stopped. A new `symbol` stops the bot. `aiFast: true` turns on fast mode (AI only, demo only: refused on a real account). |
 | `POST /api/deriv` `{appId, token}` | Checks them by listing the accounts at Deriv, then saves them and connects (demo account first). Returns the accounts, never the token. |
 | `POST /api/deriv/forget` | Stops the bot and deletes the saved token. |
 | `GET /api/accounts[?refresh=1]` | The accounts on the token (refresh asks Deriv again). |

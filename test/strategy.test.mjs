@@ -3,7 +3,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { aiFeatures, mlpPredict, evaluateAI, evaluateRules, rulesMinBars, aggregate,
-         emaSeries, rsiSeries, adxSeries, RULES_DEFAULTS } from "../public/js/strategy.js";
+         emaSeries, rsiSeries, adxSeries, RULES_DEFAULTS, AI_FAST, AI_DEFAULTS, aiParams, fastModeOn } from "../public/js/strategy.js";
 
 const fx = JSON.parse(readFileSync(new URL("./fixture-ai.json", import.meta.url)));
 const model = JSON.parse(readFileSync(new URL("../public/model/tbotai-model.json", import.meta.url)));
@@ -54,4 +54,19 @@ test("rules strategy runs on real data and produces sane stops", () => {
     }
   }
   assert.ok(signals > 0, "at least one signal on 2,000 real bars");
+});
+
+test("AI_FAST is a frozen preset with the fast values, used only for the AI strategy", () => {
+  assert.deepEqual({ ...AI_FAST }, { threshold: 0.45, margin: 0.05, barrierATR: 1, horizonBars: 10, maxOpen: 3 });
+  assert.ok(Object.isFrozen(AI_FAST));
+  const own = { strategy: "ai", aiFast: false, aiThreshold: 0.6, aiBarrier: 2, aiHorizon: 30 };
+  assert.deepEqual(aiParams(own), { threshold: 0.6, margin: AI_DEFAULTS.margin, barrierATR: 2, horizonBars: 30 });
+  assert.deepEqual(aiParams({ ...own, aiFast: true }), { threshold: 0.45, margin: 0.05, barrierATR: 1, horizonBars: 10 });
+  assert.equal(fastModeOn({ ...own, aiFast: true }), true);
+  assert.equal(fastModeOn({ ...own, aiFast: true, strategy: "rules" }), false);
+  assert.equal(fastModeOn({ ...own, aiFast: "true" }), false, "only a real true turns it on");
+  const r = evaluateAI(fx.bars.slice(0, 464), model, aiParams({ ...own, aiFast: true }));
+  assert.equal(r.action, "SELL");
+  assert.equal(r.horizonBars, 10);
+  assert.ok(Math.abs(r.slDist - r.atr) < 1e-12 && r.tpDist === r.slDist);
 });

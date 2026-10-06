@@ -7,7 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { TradingEngine, cleanSettings, UserError } from "../server/engine.mjs";
 import { FileStore, LOG_MAX_LINES } from "../server/store.mjs";
-import { evaluateAI } from "../public/js/strategy.js";
+import { evaluateAI, AI_FAST } from "../public/js/strategy.js";
 
 const fx = JSON.parse(readFileSync(new URL("./fixture-ai.json", import.meta.url)));
 const model = JSON.parse(readFileSync(new URL("../public/model/tbotai-model.json", import.meta.url)));
@@ -724,4 +724,89 @@ test("removing the token while Deriv is still answering does not mark it rejecte
     assert.equal(st.feed, "public");
     assert.equal(engine.state.tokenRejected, false);
   } finally { globalThis.fetch = realFetch; ctx.cleanup(); }
+});
+
+// ------------------------------------------------------------- fast mode
+// With the fast preset the fixture gives a SELL on every bar from 463 to 478.
+const FAST_SIG = 463;
+
+test("fast mode uses the AI_FAST preset and allows up to 3 open trades, then keeps the user's own settings when off", async () => {
+  const ctx = await ready(setup({ settings: { aiFast: true, maxOpen: 1, aiThreshold: 0.6, aiBarrier: 3, aiHorizon: 60 } }));
+  const { engine, sock } = ctx;
+  try {
+    assert.deepEqual(engine.strategyParams(), { threshold: 0.45, margin: 0.05, barrierATR: 1, horizonBars: 10 });
+    assert.equal(engine.limits().maxOpen, 3);
+    assert.equal(engine.guard.limits.maxOpen, 3, "the risk guard uses the fast limit");
+    assert.equal(engine.status().fast, true);
+    engine.start();
+    history(sock, FAST_SIG);
+    for (let i = FAST_SIG + 1; i <= FAST_SIG + 4; i++) { openBar(sock, i); await flush(); }   // SELL on 463, 464, 465, 466
+    const props = sentOf(sock, "proposal");
+    assert.equal(props.length, 3, "three trades, then the open-trade limit");
+    assert.ok(logged(engine, /Skipped SELL: max open trades reached/).length >= 1);
+    const st = engine.status();
+    assert.equal(st.open.length, 3);
+    assert.ok(st.open.every((t) => t.horizon === 10), "fast trades close after 10 min");
+    // Stop and target are 1x ATR: the same distance as the AI gives with the preset.
+    const res = evaluateAI(fx.bars.slice(0, FAST_SIG + 1), model, engine.strategyParams());
+    assert.equal(res.action, "SELL");
+    assert.ok(Math.abs(res.slDist - AI_FAST.barrierATR * res.atr) < 1e-12 && res.tpDist === res.slDist);
+    assert.ok(Math.abs(props[0].limit_order.take_profit - props[0].limit_order.stop_loss) < 0.02, "target equals stop at 1x ATR");
+    // Off again: the user's own values are back, and the guard limit too.
+    engine.updateSettings({ aiFast: false });
+    assert.deepEqual(engine.strategyParams(), { threshold: 0.6, margin: 0.1, barrierATR: 3, horizonBars: 60 });
+    assert.equal(engine.guard.limits.maxOpen, 1);
+    assert.equal(engine.settings.maxOpen, 1, "the saved limit was never changed");
+    // Fast mode does not apply to the rules strategy.
+    engine.updateSettings({ aiFast: true, strategy: "rules" });
+    assert.equal(engine.fast(), false);
+    assert.equal(engine.limits().maxOpen, 1);
+  } finally { ctx.cleanup(); }
+});
+
+test("fast mode never trades on a real account, even with Allow real money on", async () => {
+  const ctx = await ready(setup({ settings: { aiFast: true, allowReal: true }, state: { accountId: "ROT1" } }));
+  const { engine, sock } = ctx;
+  try {
+    assert.equal(engine.status().account.type, "real");
+    assert.equal(engine.status().fastBlocked, true);
+    assert.throws(() => engine.start(), (e) => e instanceof UserError && e.code === "fast_demo_only");
+    assert.equal(engine.running, false);
+    assert.equal(logged(engine, /^Did not start: fast mode is demo only/).length, 1);
+    // Running already (e.g. resumed after a restart): every signal is refused, with a log line.
+    engine.running = true;
+    history(sock, FAST_SIG);
+    openBar(sock, FAST_SIG + 1);
+    openBar(sock, FAST_SIG + 2);
+    await flush();
+    assert.equal(sentOf(sock, "proposal").length, 0, "no order on the real account");
+    assert.equal(logged(engine, /Skipped SELL: Fast mode is demo only/).length, 1, "logged once, not every bar");
+    engine.running = false;
+    // Turning it on while a real account is in use is refused too.
+    engine.updateSettings({ aiFast: false });
+    assert.throws(() => engine.updateSettings({ aiFast: true }), (e) => e.code === "fast_demo_only");
+    assert.equal(engine.settings.aiFast, false);
+    // On the demo account it trades.
+    engine.selectAccount("DOT1");
+    await flush();
+    engine.updateSettings({ aiFast: true });
+    engine.start();
+    history(ctx.sock, FAST_SIG);
+    openBar(ctx.sock, FAST_SIG + 1);
+    await flush();
+    assert.equal(sentOf(ctx.sock, "proposal").length, 1);
+  } finally { ctx.cleanup(); }
+});
+
+test("fast mode setting is validated and kept across restarts", async () => {
+  assert.deepEqual(cleanSettings({ aiFast: true }).settings, { aiFast: true });
+  assert.equal(cleanSettings({ aiFast: "yes" }).errors.length, 1);
+  const ctx = await ready(setup({ settings: { aiFast: true } }));
+  try {
+    assert.equal(ctx.engine.settings.aiFast, true);
+    ctx.engine.shutdown();
+    const again = makeEngine(ctx.dir);
+    assert.equal(again.engine.settings.aiFast, true);
+    again.engine.shutdown();
+  } finally { ctx.cleanup(); }
 });

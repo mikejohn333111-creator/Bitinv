@@ -239,3 +239,24 @@ fieldset { border: 0; padding: 0; margin: 12px 0; min-width: 0; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }
+
+/* ------------------------------------------------------- fast mode switch */
+.fast { margin-top: 16px; padding: 12px 14px; border: 1px solid var(--line); border-radius: 12px; background: var(--card-2); }
+.fast.locked { background: var(--down-soft); border-color: color-mix(in srgb, var(--down) 45%, transparent); }
+.fast-switch { display: flex; align-items: center; justify-content: space-between; gap: 14px; cursor: pointer; }
+.fast-text { display: flex; flex-direction: column; min-width: 0; }
+.fast-name { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-weight: 650; color: var(--text); }
+.fast-name .badge { font-size: 10.5px; padding: 3px 7px; }
+.fast-note { font-size: 14px; color: var(--text); margin: 10px 0 0; padding-top: 10px; border-top: 1px solid var(--line); }
+.fast-note.real { color: var(--down); font-weight: 650; }
+.switch {
+  appearance: none; -webkit-appearance: none; flex: none; width: 50px; height: 30px; margin: 0; border-radius: 15px; cursor: pointer;
+  background: color-mix(in srgb, var(--muted) 45%, transparent); position: relative; transition: background-color .18s;
+}
+.switch::before { content: ""; position: absolute; top: 3px; left: 3px; width: 24px; height: 24px; border-radius: 50%; background: #fff;
+                  box-shadow: 0 1px 3px rgb(0 0 0 / .3); transition: transform .18s; }
+.switch:checked { background: var(--accent); }
+.switch:checked::before { transform: translateX(20px); }
+.switch:disabled { opacity: .45; cursor: not-allowed; }
+.switch:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+@media (prefers-reduced-motion: reduce) { .switch, .switch::before { transition: none; } }

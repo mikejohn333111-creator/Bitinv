@@ -294,6 +294,14 @@ test("requests that change something need POST, JSON, the same origin and a smal
     assert.equal(s.data.settings.riskPct, 5);
     assert.equal(s.data.settings.maxDailyLossPct, 0.5);
     assert.equal((await c.post("/api/settings", { mode: "yolo" })).status, 400);
+    assert.equal((await c.post("/api/settings", { aiFast: "on" })).status, 400, "fast mode must be true or false");
+    const fast = await c.post("/api/settings", { strategy: "ai", aiFast: true });
+    assert.equal(fast.status, 200);
+    assert.equal(fast.data.settings.aiFast, true);
+    assert.equal(fast.data.status.fast, true);
+    assert.equal(fast.data.status.limits.maxOpen, 3, "fast mode allows 3 open trades");
+    assert.equal(fast.data.settings.maxOpen, 1, "the saved limit is kept");
+    assert.equal((await c.post("/api/settings", { aiFast: false })).data.status.limits.maxOpen, 1);
     const real = await c.post("/api/settings", { allowReal: true });
     assert.equal(real.status, 400);
     assert.match(real.data.message, /type REAL/);

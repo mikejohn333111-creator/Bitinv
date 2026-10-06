@@ -101,9 +101,16 @@ ICT on M15 shows the problem clearly. On 2022 to 2023 all 18 R-target settings w
 
 The ICT strategy is safe to keep for watching signals (it explains each one in plain words), but there is no evidence it should trade real money on any of these markets.
 
-## Live bots: entries on a touch (not in these numbers)
+## Live ICT bot: entries on a touch (not in these numbers)
 
-The tables above enter at the close of the candle that comes back into the gap (ICT) or touches the fast EMA (Rules). The live bots also keep a "Waiting for price" plan once a setup has formed, and enter on the first tick inside the zone, with the same stop loss and take profit prices as the plan, for up to 30 candles after the gap formed (the backtest allows 15 after the structure shift). For Rules, a trend without a pullback gives a plan at the fast EMA band, and the touch entry skips the rule's "closes back above the EMA" check. These entry paths are not backtested here, so the results above do not prove anything about them either way.
+The ICT tables above enter at the close of the candle that comes back into the gap. The live ICT bot also keeps a "Waiting for price" plan once a setup has formed, and enters on the first tick inside the zone, with the same stop loss and take profit prices as the plan.
+
+The two also give a setup different amounts of time:
+
+- Backtest: the entry candle must close back in the gap within 15 candles of the structure shift.
+- Live plan: it stays up for 30 candles counted from the candle that formed the gap, so price has up to twice as long to come back.
+
+Neither the touch entry nor the longer life is backtested here, so the results above do not prove anything about them either way. Rules has no such plan: live and in the backtest it enters only at the close of a candle that passes all its checks.
 
 ## Reproduce
 

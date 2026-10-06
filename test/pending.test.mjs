@@ -54,24 +54,19 @@ test("ICT: the sell mirror waits too, and a broken setup does not", () => {
   assert.equal(evaluateICT(upTo(13, [[101.8, 101.9, 96.0, 96.2]])).pending, undefined);
 });
 
-test("Rules: a trend without a pullback gives a waiting plan at the fast EMA band, with the rule's ATR distances", () => {
-  // an uptrend that swings, so RSI stays below 70 and some candles stay above the fast EMA band
+test("Rules: no waiting plan; Rules only enters on a closed candle that passes its checks", () => {
+  // an uptrend that swings, with candles above the fast EMA band (where a touch plan used to be offered)
   const rows = [];
   let p = 1000;
   for (let i = 0; i < 1300; i++) { const o = p; p += Math.sin(i / 3) * 1.5 + 0.35; rows.push([o, Math.max(o, p) + 0.2, Math.min(o, p) - 0.05, p]); }
   const bars = mk(rows);
-  let found = null;
-  for (let n = rulesMinBars() + 10; n <= bars.length && !found; n += 7) {
+  let checked = 0;
+  for (let n = rulesMinBars() + 10; n <= bars.length; n += 7) {
     const r = evaluateRules(bars.slice(0, n));
-    if (r.pending) found = r;
+    assert.equal(r.pending, undefined, `no plan at ${n}`);
+    checked++;
   }
-  assert.ok(found, "a waiting plan in a steady trend");
-  const q = found.pending, atr = found.atr;
-  assert.equal(q.side, "BUY");
-  assert.ok(Math.abs(q.zone[1] - q.zone[0] - RULES_DEFAULTS.pullbackATR * atr) < 1e-9);
-  assert.ok(Math.abs(q.zone[1] - q.sl - RULES_DEFAULTS.trendSL * atr) < 1e-9);
-  assert.ok(Math.abs(q.tp - q.zone[1] - RULES_DEFAULTS.trendTP * atr) < 1e-9);
-  assert.equal(q.sticky, false, "follows the indicators");
+  assert.ok(checked > 50);
 });
 
 // ------------------------------------------------------------ the plan
@@ -124,7 +119,7 @@ test("pending plan: cancelled when it expires, when price breaks the sweep extre
   assert.equal(pp.cancel("stopped", "again"), null);
 });
 
-test("pending plan: a Rules plan follows the indicators, and goes when they no longer agree", () => {
+test("pending plan: a non-sticky plan follows the indicators, and goes when they no longer agree", () => {
   const pp = new PendingPlan();
   const mkRes = (lo) => ({ pending: { id: "rules:BUY", side: "BUY", zone: [lo, lo + 1], sl: lo - 4, tp: lo + 9, expiresAt: T0 + 9999, invalidateAt: lo - 4, sticky: false, reason: "r" } });
   assert.equal(pp.offer(mkRes(100), { strategy: "rules" }).type, "new");

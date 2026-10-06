@@ -186,24 +186,6 @@ export function evaluateRules(bars, p = RULES_DEFAULTS) {
     if (buy || sell)
       return { ...res, action: buy ? "BUY" : "SELL", slDist: p.trendSL * atr, tpDist: p.trendTP * atr,
                reason: `trend pullback ${buy ? "buy" : "sell"} (ADX ${adx[i].toFixed(0)})` };
-    // No pullback yet, but the trend is there: wait for price to come back to the fast EMA.
-    // The zone is the band the pullback rule accepts; stop and target keep the rule's ATR
-    // distances, measured from the zone edge price reaches first.
-    const band = p.pullbackATR * atr;
-    const waitBuy = htfUp && fast > slow && pdi[i] > mdi[i] && b1.close > fast && b1.low > fast + band &&
-      rsi[i] > p.rsiTrendMin && rsi[i] < p.rsiTrendMax;
-    const waitSell = htfDown && fast < slow && mdi[i] > pdi[i] && b1.close < fast && b1.high < fast - band &&
-      rsi[i] < 100 - p.rsiTrendMin && rsi[i] > 100 - p.rsiTrendMax;
-    if (waitBuy || waitSell) {
-      const zone = waitBuy ? [fast, fast + band] : [fast - band, fast];
-      const ref = waitBuy ? zone[1] : zone[0], dir = waitBuy ? 1 : -1;
-      const sl = ref - dir * p.trendSL * atr;
-      res.pending = {
-        id: `rules:${waitBuy ? "BUY" : "SELL"}`, side: waitBuy ? "BUY" : "SELL", zone, sl, tp: ref + dir * p.trendTP * atr, since: b1.epoch,
-        expiresAt: b1.epoch + barSeconds(bars) * (1 + (p.pendingBars ?? PENDING_BARS)), invalidateAt: sl, sticky: false,
-        reason: `Trend ${waitBuy ? "up" : "down"} (ADX ${adx[i].toFixed(0)}). Waiting for a pullback to the 21 EMA`,
-      };
-    }
   }
   if (p.useRange && regime === "RANGE") {
     const buy = c2 < bb2.lower && b1.close > bb1.lower && rsi[i - 1] < p.rsiOversold && rsi[i] > rsi[i - 1] &&

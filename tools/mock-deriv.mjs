@@ -13,6 +13,10 @@
 //   MOCK_TOKEN_TTL=60         access token lifetime in seconds; MOCK_REFRESH=1 also issues refresh tokens
 //   MOCK_NO_PROXY=1           /api/token is missing, as if the site had no server functions
 //   MOCK_REDIRECT=url         the registered redirect URL (default http://localhost:8787/)
+//   MOCK_PAT=token            also accept this personal access token (scope "trade account_manage"), only
+//                             together with a Deriv-App-ID header, as Deriv does (for the server bot)
+//   MOCK_CONTROL=1            tests may change the clock speed while it runs: POST /mock/clock {"barMs": 6000}
+//                             (fast bars to get a signal soon, then slow ones so a trade stays open long enough to look at)
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
@@ -82,6 +86,14 @@ const server = createServer(async (req, res) => {
   const body = await new Promise((r) => { let d = ""; req.on("data", (c) => (d += c)); req.on("end", () => r(d)); });
   const json = (code, obj) => res.writeHead(code, { "Content-Type": "application/json" }).end(JSON.stringify(obj));
 
+  if (process.env.MOCK_CONTROL && url.pathname === "/mock/clock" && req.method === "POST") {
+    let b = {};
+    try { b = JSON.parse(body); } catch { /* checked below */ }
+    const ms = Number(b.barMs);
+    if (!(ms >= 60 && ms <= 600000)) return json(400, { error: "barMs must be between 60 and 600000" });
+    setClock(ms);
+    return json(200, { barMs: ms });
+  }
   if (url.pathname === "/oauth2/auth") {
     const p = url.searchParams;
     const page = (code, text) => res.writeHead(code, { "Content-Type": "text/html" }).end(`<h1>Deriv login error</h1><p>${text}</p>`);
@@ -123,7 +135,12 @@ const server = createServer(async (req, res) => {
     return json(200, issueToken(entry.scope, entry.clientId));
   }
   if (url.pathname.startsWith("/trading/v1/options/accounts")) {
-    const tok = tokens.get((req.headers.authorization || "").replace(/^Bearer /, ""));
+    const bearer = (req.headers.authorization || "").replace(/^Bearer /, "");
+    let tok = tokens.get(bearer);
+    if (!tok && process.env.MOCK_PAT && bearer === process.env.MOCK_PAT) {
+      if (!req.headers["deriv-app-id"]) return json(401, apiError(401, "Unauthorized", "Deriv-App-ID header is required for PAT tokens"));
+      tok = { scope: "trade account_manage", exp: Infinity };
+    }
     if (!tok || tok.exp < Date.now()) return json(401, apiError(401, "InvalidToken", "Invalid or expired token"));
     const scopes = tok.scope.split(" ");
     const m = url.pathname.match(/accounts\/([^/]+)\/otp$/);
@@ -261,7 +278,7 @@ function pushBalance(acc) {
 // ------------------------------------------------------------------ clock
 // Ticks every BAR_MS/6: the forming bar moves; every 6th tick a new bar starts.
 let tick = 0;
-setInterval(() => {
+function clockTick() {
   tick++;
   if (tick % 6 === 0) { bars.push(forming); if (bars.length > 6000) bars.shift(); forming = makeBar(forming.epoch + 60); }
   else {
@@ -280,6 +297,8 @@ setInterval(() => {
     if (s.kind === "poc") { send(ws, { msg_type: "proposal_open_contract", req_id: s.req_id, proposal_open_contract: poc(s.contract), subscription: { id } });
       if (s.contract.sold) ws.subs.delete(id); }
   }
-}, BAR_MS / 6);
+}
+let clock = setInterval(clockTick, BAR_MS / 6);
+function setClock(barMs) { clearInterval(clock); clock = setInterval(clockTick, barMs / 6); }
 
 server.listen(PORT, () => console.log(`mock Deriv on http://localhost:${PORT}`));

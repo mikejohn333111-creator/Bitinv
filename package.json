@@ -3,10 +3,12 @@
   "version": "1.0.0",
   "private": true,
   "type": "module",
-  "description": "Tbot: a Deriv Multipliers trading bot that runs in the browser, plus MT5 Expert Advisors.",
+  "description": "Tbot: a Deriv Multipliers trading bot that runs in the browser or 24/7 on a server, plus MT5 Expert Advisors.",
   "scripts": {
     "test": "node --test test/*.test.mjs",
+    "server": "node server/main.mjs",
     "mock": "node tools/mock-deriv.mjs",
+    "e2e:server": "node tools/e2e-server.mjs",
     "backtest": "node tools/backtest.mjs"
   },
   "devDependencies": {

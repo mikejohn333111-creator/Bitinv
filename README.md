@@ -1,10 +1,11 @@
 # Tbot
 
-A Deriv trading bot in three parts:
+A Deriv trading bot in four parts:
 
 | Part | Where | What it does |
 |---|---|---|
 | **Web bot** | `public/` (this site on Vercel) | Runs in your browser, trades Deriv **Multipliers** on the 1-minute chart through the official Deriv API. Starts in signals only mode on your demo account. |
+| **Server bot** | `server/` | The same trading engine running 24/7 on a Linux server, with a password-protected control page. It keeps trading after you close the page, until you press Stop. Starts on your demo account. See `server/README.md`. |
 | **MT5 bots** | `mt5/` | `TbotAdaptive.mq5` (rules) and `mt5/ai/TbotAI.mq5` (AI model) Expert Advisors for Deriv MT5. See `mt5/README.md`. |
 | **MT5 dashboard** | `/mt5/` page + `api/` | Optional page that shows what the MT5 bots are doing. See `mt5/README.md`. |
 

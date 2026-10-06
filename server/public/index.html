@@ -1,0 +1,278 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f3f5f8" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b1016" media="(prefers-color-scheme: dark)">
+<meta name="robots" content="noindex, nofollow">
+<title>Tbot Server</title>
+<link rel="icon" href="icon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="control.css">
+<script type="module" src="control.js"></script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand"><img src="icon.svg" alt="" width="28" height="28"><span>Tbot</span><span class="brand-sub">server</span></div>
+  <div class="conn" id="conn" hidden><span class="dot" id="connDot"></span><span id="connText">Connecting</span></div>
+</header>
+
+<main id="main">
+  <div id="announce" class="sr-only" aria-live="polite" aria-atomic="true"></div>
+
+  <!-- loading -->
+  <section id="screenLoading" class="screen center-screen">
+    <div class="spinner" aria-hidden="true"></div>
+    <p class="muted">Loading</p>
+  </section>
+
+  <!-- no password yet -->
+  <section id="screenNoPassword" class="screen" hidden>
+    <div class="card intro">
+      <h1>Almost ready</h1>
+      <p>No password is set yet. Run the setup script again to set one.</p>
+      <p class="muted small">For your safety, the password can't be created from this page.</p>
+    </div>
+  </section>
+
+  <!-- offline -->
+  <section id="screenOffline" class="screen" hidden>
+    <div class="card intro">
+      <h1>Can't reach the bot</h1>
+      <p>This page can't reach the bot server right now. It may be restarting. This page tries again by itself.</p>
+      <button class="btn" id="retryBtn" type="button">Try again now</button>
+    </div>
+  </section>
+
+  <!-- login -->
+  <section id="screenLogin" class="screen" hidden>
+    <form class="card intro" id="loginForm" novalidate>
+      <h1>Log in</h1>
+      <p class="muted">Enter the password you chose when you set up the bot.</p>
+      <label class="field"><span>Password</span>
+        <input id="loginPassword" name="password" type="password" autocomplete="current-password" required maxlength="256" autocapitalize="off" spellcheck="false">
+      </label>
+      <p class="msg error" id="loginMsg" role="alert" hidden></p>
+      <button class="btn primary wide" id="loginBtn" type="submit">Log in</button>
+    </form>
+  </section>
+
+  <!-- the control page -->
+  <section id="screenMain" class="screen" hidden>
+    <div class="notice danger" id="realBanner" hidden>
+      <strong>Real money account.</strong> Every trade uses real money. Losses are real.
+    </div>
+    <div class="notice warn" id="notice" role="status" hidden>
+      <p id="noticeText"></p>
+      <button class="btn small" id="noticeBtn" type="button" hidden>Open Deriv connection</button>
+    </div>
+
+    <section class="card hero" aria-labelledby="stateLabel">
+      <div class="hero-top">
+        <span class="state" id="statePill"><span class="state-dot" aria-hidden="true"></span><span id="stateLabel">Stopped</span></span>
+        <span class="badge" id="acctBadge">No account</span>
+      </div>
+      <div class="hero-balance">
+        <span class="label">Balance</span>
+        <span class="balance" id="balance">–</span>
+        <span class="hero-sub" id="inTrades" hidden></span>
+      </div>
+      <dl class="stats">
+        <div><dt>Today</dt><dd id="dayPL">–</dd></div>
+        <div><dt>Trades today</dt><dd id="tradesToday">–</dd></div>
+        <div><dt>Open trades</dt><dd id="openCount">0</dd></div>
+      </dl>
+      <p class="hero-detail" id="stateDetail"></p>
+    </section>
+
+    <div class="run">
+      <button class="btn run-btn start" id="runBtn" type="button">Start the bot</button>
+      <p class="honesty">
+        <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><circle cx="10" cy="10" r="8.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 9v5M10 6.2v.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
+        <span>No bot can guarantee profits. In our tests these strategies roughly broke even before costs and lost money after Deriv's commission. Please stay on a demo account.</span>
+      </p>
+    </div>
+
+    <section class="card" aria-labelledby="openTitle">
+      <div class="card-head"><h2 id="openTitle">Open trades</h2><span class="muted small" id="multInfo"></span></div>
+      <ul class="trades" id="openList"></ul>
+      <p class="empty" id="openEmpty">No open trades.</p>
+      <button class="btn danger-outline wide" id="closeAllBtn" type="button" hidden>Close all trades</button>
+    </section>
+
+    <section class="card" aria-labelledby="signalTitle">
+      <div class="card-head"><h2 id="signalTitle">Latest signal</h2><span class="muted small" id="priceText"></span></div>
+      <div id="signalBox"><p class="empty">No signal yet.</p></div>
+      <div class="sees">
+        <h3>What the strategy sees</h3>
+        <p id="seesText" class="sees-text">–</p>
+        <p class="muted small" id="seesTime"></p>
+      </div>
+      <p class="muted small" id="costText" hidden></p>
+    </section>
+
+    <section class="card" aria-labelledby="logTitle">
+      <div class="card-head"><h2 id="logTitle">Activity</h2></div>
+      <ol class="log" id="logList"></ol>
+      <p class="empty" id="logEmpty">Nothing yet.</p>
+    </section>
+
+    <h2 class="section-title" id="settingsTitle">Settings</h2>
+    <div class="settings" aria-labelledby="settingsTitle">
+
+      <details id="secDeriv" class="set">
+        <summary><span class="set-name">Deriv connection</span><span class="set-value" id="sumDeriv"></span></summary>
+        <div class="set-body">
+          <form id="derivForm" novalidate>
+            <label class="field"><span>App ID</span>
+              <input name="appId" id="appIdInput" type="text" inputmode="text" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="64" required>
+            </label>
+            <label class="field"><span>Personal access token</span>
+              <input name="token" id="tokenInput" type="password" autocomplete="off" autocapitalize="off" spellcheck="false" maxlength="512" aria-describedby="tokenHelp">
+              <small id="tokenHelp" class="hint">Kept only on this server, in a private file. It is never shown again.</small>
+            </label>
+            <p class="msg" id="derivMsg" role="status" hidden></p>
+            <div class="row">
+              <button class="btn primary" id="derivSave" type="submit">Save and connect</button>
+              <button class="btn ghost danger-text" id="derivForget" type="button" hidden>Remove token</button>
+            </div>
+          </form>
+          <div class="howto">
+            <h3>How to get a token</h3>
+            <ol>
+              <li>Open the Deriv developer dashboard at <b>developers.deriv.com</b> and log in with your Deriv account.</li>
+              <li>If you have no app yet, register one. Copy its <b>App ID</b>.</li>
+              <li>Create a <b>Personal Access Token</b> and tick the <b>Trade</b> permission. Copy the token.</li>
+              <li>Paste the App ID and the token above, then tap <b>Save and connect</b>.</li>
+            </ol>
+            <p class="muted small">The names on Deriv's site may be a little different. Look for "token" or "API token".</p>
+          </div>
+        </div>
+      </details>
+
+      <details id="secAccount" class="set">
+        <summary><span class="set-name">Account</span><span class="set-value" id="sumAccount"></span></summary>
+        <div class="set-body">
+          <fieldset class="choices" id="accountList"><legend class="sr-only">Deriv account</legend></fieldset>
+          <p class="empty" id="accountEmpty">Add your Deriv token first.</p>
+          <p class="msg" id="accountMsg" role="status" hidden></p>
+          <button class="btn ghost" id="accountRefresh" type="button">Refresh the list</button>
+        </div>
+      </details>
+
+      <details id="secMode" class="set">
+        <summary><span class="set-name">Trading mode</span><span class="set-value" id="sumMode"></span></summary>
+        <div class="set-body">
+          <fieldset class="seg" id="modeSeg">
+            <legend class="sr-only">Trading mode</legend>
+            <label><input type="radio" name="mode" value="auto"><span>Auto trade</span></label>
+            <label><input type="radio" name="mode" value="signals"><span>Signals only</span></label>
+          </fieldset>
+          <p class="muted small"><b>Auto trade</b> opens and closes trades by itself. <b>Signals only</b> just writes each setup in Activity and trades nothing. Stop the bot before you switch.</p>
+          <p class="msg" id="modeMsg" role="status" hidden></p>
+        </div>
+      </details>
+
+      <details id="secMarket" class="set">
+        <summary><span class="set-name">Market and strategy</span><span class="set-value" id="sumMarket"></span></summary>
+        <div class="set-body">
+          <form id="marketForm" novalidate>
+            <label class="field"><span>Market</span><select name="symbol" id="symbolSelect"></select></label>
+            <p class="hint">Changing the market stops the bot. Press Start again after.</p>
+            <div class="field">
+              <span id="strategyLabel">Strategy</span>
+              <fieldset class="seg" id="strategySeg" aria-labelledby="strategyLabel">
+                <label><input type="radio" name="strategy" value="rules"><span>Rules</span></label>
+                <label><input type="radio" name="strategy" value="ai"><span>AI model</span></label>
+              </fieldset>
+            </div>
+            <div id="aiFields" hidden>
+              <label class="field"><span>AI confidence needed (%)</span><input name="aiThreshold" type="number" inputmode="decimal" min="34" max="95" step="1"></label>
+              <label class="field"><span>Stop distance (times the average range)</span><input name="aiBarrier" type="number" inputmode="decimal" min="0.5" max="10" step="0.5"></label>
+              <label class="field"><span>Close a trade after (minutes)</span><input name="aiHorizon" type="number" inputmode="numeric" min="5" max="240" step="1"></label>
+            </div>
+            <p class="msg" id="marketMsg" role="status" hidden></p>
+            <button class="btn primary" type="submit">Save</button>
+          </form>
+        </div>
+      </details>
+
+      <details id="secRisk" class="set">
+        <summary><span class="set-name">Risk limits</span><span class="set-value" id="sumRisk"></span></summary>
+        <div class="set-body">
+          <form id="riskForm" novalidate>
+            <div class="grid2">
+              <label class="field"><span>Risk per trade (% of balance)</span><input name="riskPct" type="number" inputmode="decimal" min="0.1" max="5" step="0.1"></label>
+              <label class="field"><span>Daily loss limit (%)</span><input name="maxDailyLossPct" type="number" inputmode="decimal" min="0.5" max="20" step="0.5"></label>
+              <label class="field"><span>Max open trades</span><input name="maxOpen" type="number" inputmode="numeric" min="1" max="5" step="1"></label>
+              <label class="field"><span>Max trades per day</span><input name="maxTradesPerDay" type="number" inputmode="numeric" min="1" max="500" step="1"></label>
+              <label class="field"><span>Pause after losses in a row (0 = never)</span><input name="maxConsecLosses" type="number" inputmode="numeric" min="0" max="20" step="1"></label>
+              <label class="field"><span>Pause length (minutes)</span><input name="cooldownMinutes" type="number" inputmode="numeric" min="0" max="1440" step="1"></label>
+              <label class="field"><span>Multiplier</span><select name="multiplier" id="multiplierSelect"></select></label>
+              <label class="field"><span>Minutes between signals (signals only)</span><input name="signalGap" type="number" inputmode="numeric" min="0" max="240" step="1"></label>
+            </div>
+            <p class="hint">When the daily loss limit is hit, the bot closes its trades and waits until the next day (UTC).</p>
+            <p class="msg" id="riskMsg" role="status" hidden></p>
+            <button class="btn primary" type="submit">Save limits</button>
+          </form>
+        </div>
+      </details>
+
+      <details id="secReal" class="set">
+        <summary><span class="set-name">Allow real money</span><span class="set-value" id="sumReal"></span></summary>
+        <div class="set-body">
+          <div id="realOff">
+            <p>Real money is <b>off</b>. The bot only uses your demo account.</p>
+            <form id="realForm" novalidate>
+              <label class="field"><span>To allow real money, type REAL</span>
+                <input id="realConfirm" type="text" autocomplete="off" autocapitalize="characters" spellcheck="false" maxlength="10">
+              </label>
+              <button class="btn danger" id="realOnBtn" type="submit">Allow real money</button>
+            </form>
+            <p class="muted small">Only do this if you accept losing the money you put in. No strategy here has a proven edge.</p>
+          </div>
+          <div id="realOn" hidden>
+            <p class="msg error">Real money is <b>allowed</b>. You can pick a real account under Account.</p>
+            <button class="btn" id="realOffBtn" type="button">Turn real money off</button>
+          </div>
+          <p class="msg" id="realMsg" role="status" hidden></p>
+        </div>
+      </details>
+
+      <details id="secPassword" class="set">
+        <summary><span class="set-name">Password</span><span class="set-value">Change</span></summary>
+        <div class="set-body">
+          <form id="passwordForm" novalidate>
+            <input type="text" name="username" autocomplete="username" value="tbot" hidden>
+            <label class="field"><span>Current password</span><input name="current" type="password" autocomplete="current-password" maxlength="256"></label>
+            <label class="field"><span>New password (at least 10 characters)</span><input name="next" type="password" autocomplete="new-password" minlength="10" maxlength="256"></label>
+            <label class="field"><span>New password again</span><input name="again" type="password" autocomplete="new-password" minlength="10" maxlength="256"></label>
+            <p class="msg" id="passwordMsg" role="status" hidden></p>
+            <button class="btn primary" type="submit">Change password</button>
+          </form>
+        </div>
+      </details>
+
+      <details id="secUpdate" class="set">
+        <summary><span class="set-name">Update the bot</span><span class="set-value" id="sumVersion"></span></summary>
+        <div class="set-body">
+          <p id="versionText" class="muted">Version unknown.</p>
+          <p class="msg" id="updateMsg" role="status" hidden></p>
+          <div class="row">
+            <button class="btn" id="updateCheck" type="button">Check for updates</button>
+            <button class="btn primary" id="updateNow" type="button" hidden>Update now</button>
+          </div>
+          <p class="muted small">The bot restarts after an update and carries on by itself. Open trades keep their stop loss and take profit.</p>
+        </div>
+      </details>
+    </div>
+
+    <button class="btn ghost wide logout" id="logoutBtn" type="button">Log out</button>
+    <p class="footer muted small">Tbot runs on your server and keeps going after you close this page, until you press Stop.</p>
+  </section>
+</main>
+
+<div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+</body>
+</html>

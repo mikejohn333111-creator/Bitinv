@@ -3,3 +3,6 @@ node_modules/
 *.log
 __pycache__/
 .DS_Store
+
+# server bot data (password hash, token, state)
+.tbot-data/

@@ -17,7 +17,18 @@
 //                             together with a Deriv-App-ID header, as Deriv does (for the server bot)
 //   MOCK_LIMIT_MONEY_ONLY=1   open trades report their stop loss / take profit as money only (no price)
 //   MOCK_CONTROL=1            tests may change the clock speed while it runs: POST /mock/clock {"barMs": 6000}
-//                             (fast bars to get a signal soon, then slow ones so a trade stays open long enough to look at)
+//                             (fast bars to get a signal soon, then slow ones so a trade stays open long enough to look at),
+//                             open or close a market: POST /mock/market {"symbol": "frxEURUSD", "open": false},
+//                             and play a fixed ICT buy setup: POST /mock/script {"name": "ict-buy"} (the next candles
+//                             form a sweep, a break in structure and a fair value gap, then hold above the gap), then
+//                             POST /mock/script {"touch": true} (the next candle's ticks come back into the gap)
+//   MOCK_HISTORY=30000        1-minute candles of history at start (enough for 1-hour candles too)
+//   MOCK_CLOSED=frxXAUUSD     markets that start closed (comma separated; "" for none)
+//   MOCK_NO_ACTIVE_SYMBOLS=1  active_symbols fails, as if Deriv refused it (the bots keep their built-in list)
+//
+// active_symbols lists the synthetic indices, a few forex pairs, gold (closed by default), Bitcoin
+// and one stock index without Multipliers, with the field names of Deriv's Options API
+// (underlying_symbol). All markets share one random walk, scaled to each market's price level.
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
 import { createHash, randomBytes } from "node:crypto";
@@ -40,16 +51,73 @@ const types = { ".html": "text/html", ".js": "text/javascript", ".mjs": "text/ja
 const sigmaBar = 0.75 / Math.sqrt(365 * 1440);
 let gauss = () => { let u = 0, v = 0; while (!u) u = Math.random(); v = Math.random(); return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v); };
 const bars = [];
-let price = 400000, clockEpoch = Math.floor(Date.now() / 60000) * 60 - 2000 * 60;
+const HISTORY = Math.max(2000, Number(process.env.MOCK_HISTORY || 30000));
+const KEEP = HISTORY + 6000;
+let price = 400000, clockEpoch = Math.floor(Date.now() / 60000) * 60 - HISTORY * 60;
 function makeBar(epoch) {
   const o = price;
   let h = o, l = o;
   for (let k = 0; k < 30; k++) { price *= Math.exp((sigmaBar / Math.sqrt(30)) * gauss()); h = Math.max(h, price); l = Math.min(l, price); }
   return { epoch, open: +o.toFixed(2), high: +h.toFixed(2), low: +l.toFixed(2), close: +price.toFixed(2) };
 }
-for (let i = 0; i < 2000; i++) bars.push(makeBar(clockEpoch + i * 60));
-let forming = makeBar(clockEpoch + 2000 * 60);
+for (let i = 0; i < HISTORY; i++) bars.push(makeBar(clockEpoch + i * 60));
+let forming = makeBar(clockEpoch + HISTORY * 60);
+
+// ---------------------------------------------------------------- markets
+// [symbol, name, market, market_display_name, submarket, price level, decimals, has Multipliers]
+const MARKET_LIST = [
+  ["R_10", "Volatility 10 Index", "synthetic_index", "Derived", "random_index", 0, 2, true],
+  ["R_25", "Volatility 25 Index", "synthetic_index", "Derived", "random_index", 0, 2, true],
+  ["R_50", "Volatility 50 Index", "synthetic_index", "Derived", "random_index", 0, 2, true],
+  ["R_75", "Volatility 75 Index", "synthetic_index", "Derived", "random_index", 0, 2, true],
+  ["R_100", "Volatility 100 Index", "synthetic_index", "Derived", "random_index", 0, 2, true],
+  ["1HZ10V", "Volatility 10 (1s) Index", "synthetic_index", "Derived", "random_index", 0, 2, true],
+  ["1HZ100V", "Volatility 100 (1s) Index", "synthetic_index", "Derived", "random_index", 0, 2, true],
+  ["frxEURUSD", "EUR/USD", "forex", "Forex", "major_pairs", 1.08, 5, true],
+  ["frxGBPUSD", "GBP/USD", "forex", "Forex", "major_pairs", 1.27, 5, true],
+  ["frxXAUUSD", "Gold/USD", "commodities", "Commodities", "metals", 2400, 2, true],
+  ["cryBTCUSD", "BTC/USD", "cryptocurrency", "Cryptocurrencies", "non_stable_coin", 60000, 2, true],
+  ["OTC_DJI", "Wall Street 30", "indices", "Stock Indices", "americas_OTC", 39000, 2, false],
+];
+const closedMarkets = new Set((process.env.MOCK_CLOSED ?? "frxXAUUSD").split(",").map((x) => x.trim()).filter(Boolean));
+const marketOf = (sym) => MARKET_LIST.find((m) => m[0] === sym);
+/** Each market's prices: the shared walk scaled to its own level. */
+const scaleOf = (sym) => { const m = marketOf(sym); return m && m[5] ? m[5] / 400000 : 1; };
+const decOf = (sym) => marketOf(sym)?.[6] ?? 2;
+const px = (v, sym) => +(v * scaleOf(sym)).toFixed(decOf(sym));
+const scaleBar = (b, sym) => (scaleOf(sym) === 1 ? b : { ...b, open: px(b.open, sym), high: px(b.high, sym), low: px(b.low, sym), close: px(b.close, sym) });
+const isOpen = (sym) => !closedMarkets.has(sym);
+
+// ---------------------------------------------------------------- scripts
+// A fixed ICT buy setup in "units" around the price when it starts (the same bars as
+// test/ict.test.mjs): flat candles, a swing low, a sweep below it, a strong candle that
+// breaks the swing high and leaves a fair value gap, then candles that hold above the gap.
+const ICT_FLAT = [100, 100.5, 99.5, 100];
+const ICT_SETUP = [
+  [100, 100.5, 99, 99.2], [99.2, 99.4, 98, 98.2], [98.2, 98.5, 97, 97.8], [97.8, 99, 97.6, 98.8], [98.8, 100, 98.5, 99.8],
+  [99.8, 101, 99.5, 100.2], [100.2, 100.4, 99, 99.2], [99.2, 99.5, 98, 98.2], [98.2, 98.4, 96.5, 97.5], [97.5, 99, 97.3, 98.8],
+  [98.8, 101.8, 98.7, 101.6], [101.6, 102.5, 101.2, 102.2], [102.2, 102.4, 101.6, 101.8],
+];
+const ICT_HOLD = [101.8, 102.0, 101.6, 101.8];
+const ICT_TOUCH = { bar: [101.8, 101.9, 100.8, 101.0], path: [101.7, 101.5, 101.1, 101.0, 101.0] };
+const script = { queue: [], hold: false, base: 0, unit: 0 };
+const unitPrice = (v) => +(script.base + (v - 100) * script.unit).toFixed(2);
+const unitBar = (epoch, [o, h, l, c]) => ({ epoch, open: unitPrice(o), high: unitPrice(h), low: unitPrice(l), close: unitPrice(c) });
+function startScript(name) {
+  if (name !== "ict-buy") return false;
+  script.base = forming.close; script.unit = +(forming.close * 0.001).toFixed(2);   // about one candle's usual range
+  script.queue = [...Array(20).fill(ICT_FLAT), ...ICT_SETUP].map((bar) => ({ bar }));
+  script.hold = true;
+  return true;
+}
+/** The next candle when a script runs: {bar, path?}, or null for the normal random walk. */
+function scriptNext() {
+  if (script.queue.length) return script.queue.shift();
+  if (script.hold) return { bar: ICT_HOLD };
+  return null;
+}
 // Other timeframes are the same random walk grouped into longer candles (the last one still forming).
+// (candlesOf and formingOf are in the R_75 price level; scaleBar turns them into another market's.)
 const GRANULARITIES = [60, 120, 180, 300, 600, 900, 1800, 3600, 7200, 14400, 28800, 86400];
 function candlesOf(g) {
   if (g === 60) return [...bars, forming];
@@ -117,6 +185,26 @@ const server = createServer(async (req, res) => {
     if (!(ms >= 60 && ms <= 600000)) return json(400, { error: "barMs must be between 60 and 600000" });
     setClock(ms);
     return json(200, { barMs: ms });
+  }
+  if (process.env.MOCK_CONTROL && url.pathname === "/mock/market" && req.method === "POST") {
+    let b = {};
+    try { b = JSON.parse(body); } catch { /* checked below */ }
+    if (!marketOf(b.symbol) || typeof b.open !== "boolean") return json(400, { error: "symbol and open (true/false) needed" });
+    if (b.open) closedMarkets.delete(b.symbol); else closedMarkets.add(b.symbol);
+    return json(200, { symbol: b.symbol, open: b.open });
+  }
+  if (process.env.MOCK_CONTROL && url.pathname === "/mock/script" && req.method === "POST") {
+    let b = {};
+    try { b = JSON.parse(body); } catch { /* checked below */ }
+    if (b.touch) {
+      if (!script.hold) return json(409, { error: "no script is holding" });
+      script.hold = false;
+      script.queue.push({ bar: ICT_TOUCH.bar, path: ICT_TOUCH.path });
+      return json(200, { touch: true, zone: [unitPrice(99), unitPrice(101.2)] });
+    }
+    if (b.stop) { script.queue = []; script.hold = false; return json(200, { stopped: true }); }
+    if (!startScript(b.name)) return json(400, { error: "unknown script" });
+    return json(200, { name: b.name, base: script.base, unit: script.unit, zone: [unitPrice(99), unitPrice(101.2)], sweepLow: unitPrice(96.5) });
   }
   if (url.pathname === "/oauth2/auth") {
     const p = url.searchParams;
@@ -225,19 +313,39 @@ function handle(ws, req) {
   if (req.forget) { const had = ws.subs.delete(req.forget); return send(ws, { ...r, msg_type: "forget", forget: had ? 1 : 0 }); }
   if (req.ticks_history) {
     if (req.symbol) return err(ws, req, "InputValidationFailed", "unknown field symbol");
+    const sym = String(req.ticks_history);
+    if (!marketOf(sym)) return err(ws, req, "InvalidSymbol", "Symbol is invalid.");
     const g = Number(req.granularity || 60);
     if (!GRANULARITIES.includes(g)) return err(ws, req, "InputValidationFailed", "granularity");
+    if (req.count > 5000) return err(ws, req, "InputValidationFailed", "count");
     let list = candlesOf(g);
     if (req.end && req.end !== "latest") list = list.filter((b) => b.epoch <= Number(req.end));
-    list = list.slice(-(req.count || 1000));
+    list = list.slice(-(req.count || 1000)).map((b) => scaleBar(b, sym));
     const subId = req.subscribe ? "sub" + randomBytes(4).toString("hex") : undefined;
     send(ws, { ...r, msg_type: "candles", candles: list, ...(subId && { subscription: { id: subId } }) });
-    if (subId) ws.subs.set(subId, { kind: "ohlc", req_id: req.req_id, g });
+    if (subId) ws.subs.set(subId, { kind: "ohlc", req_id: req.req_id, g, symbol: sym });
     return;
   }
-  if (req.contracts_for) return send(ws, { ...r, msg_type: "contracts_for", contracts_for: { available: [
-    { contract_type: "MULTUP", contract_category: "multiplier", multiplier_range: [50, 100, 200, 300, 500], min_stake: 1, max_stake: 2000 },
-    { contract_type: "MULTDOWN", contract_category: "multiplier", multiplier_range: [50, 100, 200, 300, 500], min_stake: 1, max_stake: 2000 }] } });
+  if (req.active_symbols) {
+    if (process.env.MOCK_NO_ACTIVE_SYMBOLS) return err(ws, req, "UnrecognisedRequest", "unrecognised request");
+    if (!["brief", "full"].includes(req.active_symbols)) return err(ws, req, "InputValidationFailed", "active_symbols");
+    const mult = Array.isArray(req.contract_type) && req.contract_type.some((t) => /^MULT/.test(t));
+    const list = MARKET_LIST.filter((m) => !mult || m[7]).map(([sym, name, market, marketName, sub], k) => ({
+      underlying_symbol: sym, display_name: name, display_order: k, market, market_display_name: marketName, submarket: sub,
+      submarket_display_name: sub, subgroup: "none", subgroup_display_name: "None", symbol_type: market === "forex" ? "forex" : "",
+      exchange_is_open: isOpen(sym) ? 1 : 0, is_trading_suspended: 0, pip: 10 ** -decOf(sym),
+    }));
+    return send(ws, { ...r, msg_type: "active_symbols", active_symbols: list });
+  }
+  if (req.contracts_for) {
+    const m = marketOf(String(req.contracts_for));
+    if (!m) return err(ws, req, "InvalidSymbol", "Symbol is invalid.");
+    if (!m[7]) return send(ws, { ...r, msg_type: "contracts_for", contracts_for: { available: [
+      { contract_type: "CALL", contract_category: "callput" }, { contract_type: "PUT", contract_category: "callput" }] } });
+    return send(ws, { ...r, msg_type: "contracts_for", contracts_for: { available: [
+      { contract_type: "MULTUP", contract_category: "multiplier", multiplier_range: [50, 100, 200, 300, 500], min_stake: 1, max_stake: 2000 },
+      { contract_type: "MULTDOWN", contract_category: "multiplier", multiplier_range: [50, 100, 200, 300, 500], min_stake: 1, max_stake: 2000 }] } });
+  }
   if (!ws.account) return err(ws, req, "AuthorizationRequired", "Please log in.");
   const acc = ws.account;
   if (req.balance) {
@@ -250,16 +358,18 @@ function handle(ws, req) {
   if (req.proposal) {
     for (const k of ["amount", "contract_type", "currency", "underlying_symbol", "multiplier"]) if (req[k] === undefined) return err(ws, req, "InputValidationFailed", `missing ${k}`);
     if (req.limit_order?.stop_loss > req.amount) return err(ws, req, "InvalidStopLoss", "Stop loss cannot be more than the stake.");
+    if (!marketOf(req.underlying_symbol)?.[7]) return err(ws, req, "ContractBuyValidationError", "Trading is not offered for this asset.");
+    if (!isOpen(req.underlying_symbol)) return err(ws, req, "MarketIsClosed", "This market is presently closed.");
     const id = "prop" + randomBytes(4).toString("hex");
     ws.lastProposal = { id, ...req };
-    return send(ws, { ...r, msg_type: "proposal", proposal: { id, ask_price: req.amount, commission: +(req.amount * req.multiplier * 0.00005).toFixed(2), spot: forming.close } });
+    return send(ws, { ...r, msg_type: "proposal", proposal: { id, ask_price: req.amount, commission: +(req.amount * req.multiplier * 0.00005).toFixed(2), spot: px(forming.close, req.underlying_symbol) } });
   }
   if (req.buy) {
     const p = ws.lastProposal;
     if (!p || p.id !== req.buy) return err(ws, req, "InvalidContractProposal", "proposal expired");
     if (p.amount > acc.balance) return err(ws, req, "InsufficientBalance", "not enough balance");
     const c = { id: nextContract++, acc, type: p.contract_type, symbol: p.underlying_symbol, stake: p.amount, mult: p.multiplier,
-                entry: forming.close, entryTime: forming.epoch + 30, sl: p.limit_order?.stop_loss, tp: p.limit_order?.take_profit,
+                entry: px(forming.close, p.underlying_symbol), entryTime: forming.epoch + 30, sl: p.limit_order?.stop_loss, tp: p.limit_order?.take_profit,
                 commission: +(p.amount * p.multiplier * 0.00005).toFixed(2), sold: false, profit: 0 };
     contracts.set(c.id, c);
     acc.balance = +(acc.balance - c.stake).toFixed(2);
@@ -294,16 +404,16 @@ function limitOrder(c, kind) {
 }
 function poc(c) {
   return { contract_id: c.id, contract_type: c.type, buy_price: c.stake, profit: c.profit, is_sold: c.sold ? 1 : 0,
-           status: c.sold ? "sold" : "open", current_spot: forming.close, entry_spot: c.entry, entry_tick_time: c.entryTime, date_start: c.entryTime,
+           status: c.sold ? "sold" : "open", current_spot: px(forming.close, c.symbol), entry_spot: c.entry, entry_tick_time: c.entryTime, date_start: c.entryTime,
            multiplier: c.mult, underlying_symbol: c.symbol, limit_order: { stop_loss: limitOrder(c, "sl"), take_profit: limitOrder(c, "tp") },
            ...(c.sold && { exit_tick_display_value: String(c.exit) }) };
 }
 function pnl(c) {
-  const move = (forming.close - c.entry) / c.entry * (c.type === "MULTUP" ? 1 : -1);
+  const move = (px(forming.close, c.symbol) - c.entry) / c.entry * (c.type === "MULTUP" ? 1 : -1);
   return +(c.stake * c.mult * move - c.commission).toFixed(2);
 }
 function settle(c) {
-  c.profit = Math.max(pnl(c), -c.stake); c.sold = true; c.exit = forming.close;
+  c.profit = Math.max(pnl(c), -c.stake); c.sold = true; c.exit = px(forming.close, c.symbol);
   c.acc.balance = +(c.acc.balance + c.stake + c.profit).toFixed(2);
   pushBalance(c.acc);
 }
@@ -315,11 +425,27 @@ function pushBalance(acc) {
 
 // ------------------------------------------------------------------ clock
 // Ticks every BAR_MS/6: the forming bar moves; every 6th tick a new bar starts.
-let tick = 0;
+let tick = 0, path = null;
 function clockTick() {
   tick++;
-  if (tick % 6 === 0) { bars.push(forming); if (bars.length > 6000) bars.shift(); forming = makeBar(forming.epoch + 60); }
-  else {
+  if (tick % 6 === 0) {
+    if (path?.final) forming = { ...forming, ...path.final };   // a scripted candle ends exactly as written
+    bars.push(forming); if (bars.length > KEEP) bars.shift();
+    path = null;
+    const next = scriptNext();
+    if (!next) forming = makeBar(forming.epoch + 60);
+    else {
+      const b = unitBar(forming.epoch + 60, next.bar);
+      price = b.close;
+      if (next.path) {   // ticks move the candle along the path, starting at its open
+        path = { steps: next.path.map(unitPrice), final: { open: b.open, high: b.high, low: b.low, close: b.close } };
+        forming = { epoch: b.epoch, open: b.open, high: b.open, low: b.open, close: b.open };
+      } else forming = b;
+    }
+  } else if (path) {
+    const p = path.steps.shift() ?? forming.close;
+    forming = { ...forming, close: p, high: Math.max(forming.high, p), low: Math.min(forming.low, p) };
+  } else if (!script.hold && !script.queue.length) {
     price *= Math.exp((sigmaBar / Math.sqrt(6)) * gauss());
     forming = { ...forming, close: +price.toFixed(2), high: Math.max(forming.high, +price.toFixed(2)), low: Math.min(forming.low, +price.toFixed(2)) };
   }
@@ -329,11 +455,11 @@ function clockTick() {
     if ((c.sl && c.profit <= -c.sl) || (c.tp && c.profit >= c.tp) || c.profit <= -c.stake) settle(c);
   }
   for (const ws of sockets) for (const [id, s] of ws.subs) {
-    if (s.kind === "ohlc") {
-      const g = s.g || 60, f = formingOf(g);
+    if (s.kind === "ohlc" && isOpen(s.symbol)) {   // a closed market sends no prices
+      const g = s.g || 60, f = scaleBar(formingOf(g), s.symbol);
       send(ws, { msg_type: "ohlc", req_id: s.req_id, subscription: { id },
         ohlc: { open_time: f.epoch, epoch: forming.epoch + 59, open: String(f.open), high: String(f.high),
-                low: String(f.low), close: String(f.close), granularity: g, symbol: "R_75" } });
+                low: String(f.low), close: String(f.close), granularity: g, symbol: s.symbol } });
     }
     if (s.kind === "poc") { send(ws, { msg_type: "proposal_open_contract", req_id: s.req_id, proposal_open_contract: poc(s.contract), subscription: { id } });
       if (s.contract.sold) ws.subs.delete(id); }

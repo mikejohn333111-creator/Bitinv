@@ -29,7 +29,11 @@ Use the demo account. Treat real money as money you can afford to lose.
 ## Using the web bot
 
 1. Open the site. Live prices and the chart work straight away, no login needed.
-2. Pick a market, then **Rules** or **AI model**, and press **Start signals**. When the bot finds a setup it marks it on the chart, adds it to Activity, and sends a notification (allow notifications when asked). It shows the entry, stop loss, take profit and the stake that risks your chosen % of balance.
+2. Pick a market, then **Rules**, **AI model** or **ICT**, and press **Start signals**. When the bot finds a setup it marks it on the chart, adds it to Activity, and sends a notification (allow notifications when asked). It shows the entry, stop loss, take profit and the stake that risks your chosen % of balance.
+   - The market list comes from Deriv (synthetic indices, forex, commodities, crypto: every market with Multipliers). A market outside its trading hours shows "Market closed" and the bot trades nothing there.
+   - **Bot trades on** sets the candles the strategy reads: 1m (default), 15m or 1h. The chart's own timeframe is separate. On real markets 1h is suggested, because the cost is a smaller share of each trade. The AI model was trained on 1-minute data, so on 15m and 1h it is untested.
+   - When ICT (or Rules in a trend) finds a setup but price hasn't come back to the entry zone yet, the chart shows a dashed **Waiting for price** zone with the stop loss and take profit. The bot enters (or alerts you) on the first price inside the zone, with exactly those levels, and drops the plan after 30 candles or if price breaks the level the setup was built on.
+   - ICT auto trading is demo only (signals work on any account). In our tests it did not make money after fees (`docs/strategy-results.md`).
 3. To let it trade: log in with Deriv (below), check the account picker shows **Demo**, switch to **Auto trade** and press **Start auto trading**. Every trade has a stop loss and take profit set at Deriv, so they stay protected even if you close the page.
 4. **The bot only runs while the page is open.** It asks your phone to keep the screen on, but closing the tab, locking the phone, or switching apps for long will pause it.
 

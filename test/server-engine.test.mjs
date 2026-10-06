@@ -810,3 +810,249 @@ test("fast mode setting is validated and kept across restarts", async () => {
     again.engine.shutdown();
   } finally { ctx.cleanup(); }
 });
+
+// ------------------------------------------------- ICT, waiting plans, timeframe, markets
+// The ICT setup of test/ict.test.mjs at a price level the Multiplier sizing accepts:
+// price = 10000 + (unit - 100) x 10. The gap is 9990 to 10012; the sweep's low is 9965.
+import { ictMinBars, historyCount } from "../public/js/strategy.js";
+import { sizeMultiplier } from "../public/js/risk.js";
+const U = (v) => 10000 + (v - 100) * 10;
+const ICT_ROWS = [
+  ...Array.from({ length: ictMinBars() + 20 }, () => [100, 100.5, 99.5, 100]),
+  [100, 100.5, 99, 99.2], [99.2, 99.4, 98, 98.2], [98.2, 98.5, 97, 97.8], [97.8, 99, 97.6, 98.8], [98.8, 100, 98.5, 99.8],
+  [99.8, 101, 99.5, 100.2], [100.2, 100.4, 99, 99.2], [99.2, 99.5, 98, 98.2], [98.2, 98.4, 96.5, 97.5], [97.5, 99, 97.3, 98.8],
+  [98.8, 101.8, 98.7, 101.6], [101.6, 102.5, 101.2, 102.2],
+];
+const ICT_T0 = Date.UTC(2026, 9, 2, 6) / 1000;
+const ictBar = (k, [o, h, l, c] = [101.8, 102.0, 101.6, 101.8], sec = 60) =>
+  ({ epoch: ICT_T0 + k * sec, open: U(o), high: U(h), low: U(l), close: U(c) });
+const ICT_LAST = ICT_ROWS.length - 1;     // the candle that completes the gap
+/** History up to the gap's candle (still forming), then a new candle closes it: the plan is made. */
+function ictSetup(sock) {
+  sock.push(isHistory, { msg_type: "candles", candles: ICT_ROWS.map((r, k) => ictBar(k, r)) });
+  tick(sock, ictBar(ICT_LAST + 1));
+}
+const tick = (sock, b) => sock.push(isHistory, { msg_type: "ohlc", ohlc: { open_time: b.epoch, open: String(b.open), high: String(b.high), low: String(b.low), close: String(b.close) } });
+/** A tick at `price` inside candle k (which may already be forming). */
+const tickAt = (sock, k, price) => tick(sock, { ...ictBar(k), close: price, low: Math.min(U(101.6), price) });
+
+test("ICT: a waiting plan is made at the candle close and entered on the tick that reaches the zone, with the drawn stop and target", async () => {
+  const ctx = await ready(setup({ settings: { strategy: "ict", mode: "auto" } }));
+  const { engine, sock } = ctx;
+  try {
+    engine.start();
+    ictSetup(sock);
+    await flush();
+    const plan = engine.status().pending;
+    assert.ok(plan, "a waiting plan");
+    assert.equal(plan.side, "BUY");
+    assert.deepEqual(plan.zone, [U(99), U(101.2)]);
+    assert.equal(plan.invalidateAt, U(96.5));
+    assert.match(plan.text, /^Buy if price comes back to 9990\.0+ to 10012\.0+\. Stop loss .*, take profit .*\. Cancelled at \d\d:\d\d UTC or if price goes below 9965/);
+    assert.equal(logged(engine, /^Waiting for price: BUY R_75/).length, 1);
+    assert.equal(sentOf(sock, "proposal").length, 0, "nothing traded yet");
+    tickAt(sock, ICT_LAST + 1, U(101.5));     // still above the zone
+    await flush();
+    assert.equal(sentOf(sock, "proposal").length, 0);
+    tickAt(sock, ICT_LAST + 1, U(101.05));    // inside: enter now, not at the candle close
+    await flush();
+    const [p] = sentOf(sock, "proposal");
+    assert.ok(p, "proposal on the touch");
+    assert.equal(p.contract_type, "MULTUP");
+    const entry = U(101.05);
+    const size = sizeMultiplier({ balance: 10000, riskPct: 1, entry, slDist: entry - plan.sl, tpDist: plan.tp - entry, multiplier: 50, minStake: 1, maxStake: 2000 });
+    assert.deepEqual(p.limit_order, { stop_loss: size.stopLoss, take_profit: size.takeProfit }, "the money of the drawn stop loss and take profit");
+    assert.equal(sentOf(sock, "buy").length, 1);
+    assert.equal(engine.status().pending, null, "the plan became the trade");
+    assert.equal(engine.status().open[0].horizon, 30);
+    assert.equal(engine.lastSignal.fromPending, true);
+    assert.ok(Math.abs(engine.lastSignal.sl - plan.sl) < 1e-9 && Math.abs(engine.lastSignal.tp - plan.tp) < 1e-9, "same levels as the plan");
+    // The touch candle closes: the closed-candle ICT signal of the same setup is not traded again.
+    tick(sock, ictBar(ICT_LAST + 2));
+    tick(sock, ictBar(ICT_LAST + 3));
+    await flush();
+    assert.equal(sentOf(sock, "proposal").length, 1, "one trade for one setup");
+  } finally { ctx.cleanup(); }
+});
+
+test("ICT: a waiting plan is cancelled when it expires, when price breaks the sweep's low, and when the bot stops", async () => {
+  const ctx = await ready(setup({ settings: { strategy: "ict", mode: "auto" } }));
+  const { engine, sock } = ctx;
+  try {
+    engine.start();
+    ictSetup(sock);
+    await flush();
+    const plan = engine.status().pending;
+    // 30 candles after the gap's candle, still above the zone: expired
+    let k = ICT_LAST + 2;
+    for (; ictBar(k).epoch < plan.expiresAt; k++) { tick(sock, ictBar(k)); await flush(); assert.ok(engine.status().pending, `still waiting at candle ${k}`); }
+    tick(sock, ictBar(k));
+    await flush();
+    assert.equal(engine.status().pending, null);
+    assert.equal(logged(engine, /^Cancelled the waiting BUY plan/).length, 1);
+    assert.match(engine.logs.at(-1).detail, /did not come back in time/);
+    assert.equal(sentOf(sock, "proposal").length, 0);
+  } finally { ctx.cleanup(); }
+
+  const again = await ready(setup({ settings: { strategy: "ict", mode: "auto" } }));
+  try {
+    again.engine.start();
+    ictSetup(again.sock);
+    await flush();
+    tickAt(again.sock, ICT_LAST + 1, U(96.4));   // below the sweep's low (9965) without a tick in the zone
+    await flush();
+    assert.equal(again.engine.status().pending, null);
+    assert.match(logged(again.engine, /^Cancelled the waiting BUY plan/)[0].detail, /below the low the setup was built on/);
+    assert.equal(sentOf(again.sock, "proposal").length, 0);
+    // a new plan, then Stop
+    again.engine.stop();
+    again.engine.start();
+    ictSetup(again.sock);
+    await flush();
+    assert.ok(again.engine.status().pending === null, "a used setup is not offered again");
+  } finally { again.cleanup(); }
+
+  const third = await ready(setup({ settings: { strategy: "ict", mode: "signals" } }));
+  try {
+    third.engine.start();
+    ictSetup(third.sock);
+    await flush();
+    assert.ok(third.engine.status().pending);
+    third.engine.stop();
+    assert.equal(third.engine.status().pending, null);
+    assert.match(logged(third.engine, /^Cancelled the waiting BUY plan/)[0].detail, /The bot was stopped/);
+  } finally { third.cleanup(); }
+});
+
+test("ICT in signals mode: the touch sends the signal at the price then, nothing is traded", async () => {
+  const ctx = await ready(setup({ settings: { strategy: "ict", mode: "signals" } }));
+  const { engine, sock } = ctx;
+  try {
+    engine.start();
+    ictSetup(sock);
+    await flush();
+    const plan = engine.status().pending;
+    tickAt(sock, ICT_LAST + 1, U(100.5));
+    await flush();
+    assert.equal(sentOf(sock, "proposal").length, 0);
+    assert.equal(logged(engine, /^BUY R_75 @ 10005/).length, 1);
+    assert.equal(engine.lastSignal.traded, false);
+    assert.ok(Math.abs(engine.lastSignal.sl - plan.sl) < 1e-9);
+  } finally { ctx.cleanup(); }
+});
+
+test("ICT is demo only for auto trade: refused on a real account, signals still work there", async () => {
+  const ctx = await ready(setup({ settings: { strategy: "ict", mode: "auto", allowReal: true }, state: { accountId: "ROT1" } }));
+  const { engine, sock } = ctx;
+  try {
+    assert.equal(engine.status().account.type, "real");
+    assert.equal(engine.status().ictBlocked, true);
+    assert.throws(() => engine.start(), (e) => e instanceof UserError && e.code === "ict_demo_only" && e.status === 403);
+    assert.equal(engine.running, false);
+    assert.equal(logged(engine, /^Did not start: ICT is demo only for auto trade/).length, 1);
+    // Running already (resumed after a restart): the touch is refused, with one log line.
+    engine.running = true;
+    ictSetup(sock);
+    await flush();
+    tickAt(sock, ICT_LAST + 1, U(101.0));
+    await flush();
+    assert.equal(sentOf(sock, "proposal").length, 0, "no order on the real account");
+    assert.equal(logged(engine, /^Skipped BUY: ICT is demo only for auto trade/).length, 1);
+    engine.running = false;
+    // Switching to ICT while auto trading a real account is refused.
+    engine.updateSettings({ strategy: "rules" });
+    engine.start();
+    assert.throws(() => engine.updateSettings({ strategy: "ict" }), (e) => e.code === "ict_demo_only");
+    engine.stop();
+    // Signals only works on the real account.
+    engine.updateSettings({ mode: "signals", strategy: "ict" });
+    engine.start();
+    assert.equal(engine.running, true);
+    assert.equal(engine.status().ictBlocked, false);
+  } finally { ctx.cleanup(); }
+});
+
+test("strategy timeframe: 1-hour candles are subscribed with enough history, and time limits count hours", async () => {
+  assert.deepEqual(cleanSettings({ botTf: 3600 }).settings, { botTf: 3600 });
+  assert.deepEqual(cleanSettings({ botTf: "900" }).settings, { botTf: 900 });
+  assert.equal(cleanSettings({ botTf: 300 }).errors.length, 1);
+  const ctx = await ready(setup({ settings: { strategy: "ict", mode: "auto", botTf: 3600 } }));
+  const { engine, sock } = ctx;
+  try {
+    const hist = sock.streams.find((s) => isHistory(s.req)).req;
+    assert.equal(hist.granularity, 3600);
+    assert.equal(hist.count, historyCount("ict", 3600));
+    assert.equal(engine.status().botTf, 3600);
+    engine.start();
+    sock.push(isHistory, { msg_type: "candles", candles: ICT_ROWS.map((r, k) => ictBar(k, r, 3600)) });
+    tick(sock, ictBar(ICT_LAST + 1, undefined, 3600));
+    await flush();
+    const plan = engine.status().pending;
+    assert.ok(plan);
+    assert.equal(plan.expiresAt, ictBar(ICT_LAST, undefined, 3600).epoch + 31 * 3600, "30 one-hour candles");
+    tick(sock, { ...ictBar(ICT_LAST + 1, undefined, 3600), close: U(101.0) });
+    await flush();
+    assert.equal(sentOf(sock, "buy").length, 1);
+    assert.equal(engine.state.openMeta["9000"].barSec, 3600);
+    // the 30-candle time limit is 30 hours
+    let k = ICT_LAST + 2;
+    for (; k < ICT_LAST + 31; k++) { tick(sock, ictBar(k, undefined, 3600)); await flush(); }
+    assert.equal(sentOf(sock, "sell").length, 0, "not closed after 29 hours");
+    tick(sock, ictBar(k, undefined, 3600)); tick(sock, ictBar(k + 1, undefined, 3600));
+    await flush();
+    assert.equal(sentOf(sock, "sell").length, 1);
+    assert.equal(logged(engine, /Closing trade \(30 hours time limit\)/).length, 1);
+    // changing the timeframe stops the bot and asks for the new candles
+    engine.updateSettings({ botTf: 900 });
+    assert.equal(engine.running, false);
+    const h15 = ctx.sock.streams.find((s) => isHistory(s.req)).req;
+    assert.equal(h15.granularity, 900);
+    assert.equal(logged(engine, /The bot now trades on 15-minute candles/).length, 1);
+  } finally { ctx.cleanup(); }
+});
+
+const ACTIVE_SYMBOLS = [
+  { underlying_symbol: "R_75", display_name: "Volatility 75 Index", market: "synthetic_index", market_display_name: "Derived", submarket: "random_index", exchange_is_open: 1, is_trading_suspended: 0 },
+  { underlying_symbol: "frxEURUSD", display_name: "EUR/USD", market: "forex", market_display_name: "Forex", submarket: "major_pairs", exchange_is_open: 1, is_trading_suspended: 0 },
+  { underlying_symbol: "frxXAUUSD", display_name: "Gold/USD", market: "commodities", market_display_name: "Commodities", submarket: "metals", exchange_is_open: 0, is_trading_suspended: 0 },
+];
+
+test("markets: Deriv's list (Multipliers only) feeds the picker, unknown markets are refused, a closed market trades nothing", async () => {
+  let asked = [];
+  const ctx = await ready(setup({ settings: { strategy: "ict", mode: "auto" }, over: { active_symbols: (req) => { asked.push(req); return { active_symbols: ACTIVE_SYMBOLS }; } } }));
+  const { engine } = ctx;
+  try {
+    assert.deepEqual({ ...asked[0], contract_type: [...asked[0].contract_type] }, { active_symbols: "brief", contract_type: ["MULTUP", "MULTDOWN"] });
+    const st = engine.status();
+    assert.deepEqual(st.marketGroups.map((g) => g.name), ["Synthetic indices", "Forex", "Commodities"]);
+    assert.deepEqual(st.marketGroups[2].items, [{ symbol: "frxXAUUSD", name: "Gold/USD", open: false }]);
+    assert.equal(st.marketOpen, true);
+    assert.equal(cleanSettings({ symbol: "frxEURUSD" }, engine.settings, engine.knownSymbols()).errors.length, 0);
+    assert.equal(cleanSettings({ symbol: "R_10" }, engine.settings, engine.knownSymbols()).errors.length, 1, "not in Deriv's list now");
+    engine.updateSettings({ symbol: "frxXAUUSD" });
+    await flush();
+    assert.equal(engine.status().marketOpen, false);
+    assert.equal(engine.status().synthetic, false);
+    assert.equal(engine.status().symbolName, "Gold/USD");
+    assert.match(logged(engine, /^Market changed to Gold\/USD/)[0].detail, /closed now/);
+    engine.start();
+    assert.equal(logged(engine, /^Gold\/USD is closed now/).length, 1);
+    ictSetup(ctx.sock);
+    await flush();
+    tickAt(ctx.sock, ICT_LAST + 1, U(101.0));
+    await flush();
+    assert.equal(sentOf(ctx.sock, "proposal").length, 0, "no order while closed");
+    assert.equal(logged(engine, /^Skipped BUY: Gold\/USD is closed now/).length, 1);
+  } finally { ctx.cleanup(); }
+});
+
+test("markets: when Deriv refuses the Multipliers filter, the plain list is used without non-Multiplier groups", async () => {
+  const ctx = await ready(setup({ over: { active_symbols: (req) => {
+    if (req.contract_type) throw new Error("Input validation failed: contract_type");
+    return { active_symbols: [...ACTIVE_SYMBOLS, { underlying_symbol: "OTC_DJI", display_name: "Wall Street 30", market: "indices", exchange_is_open: 1 }] };
+  } } }));
+  try {
+    const names = ctx.engine.status().symbols.map(([v]) => v);
+    assert.deepEqual(names, ["R_75", "frxEURUSD", "frxXAUUSD"]);
+  } finally { ctx.cleanup(); }
+});

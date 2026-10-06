@@ -78,8 +78,11 @@ export function bollingerAt(close, n, dev, i) {
   return { mid: m, upper: m + dev * sd, lower: m - dev * sd };
 }
 
-/** Groups M1 bars into higher-timeframe bars; drops the last group if it is incomplete. */
-export function aggregate(bars, minutes) {
+/**
+ * Groups bars of barMinutes (default M1) into higher-timeframe bars; drops the last group if
+ * it is incomplete. Bars are stamped with their start time, as Deriv sends them.
+ */
+export function aggregate(bars, minutes, barMinutes = 1) {
   const sec = minutes * 60, out = [];
   for (const b of bars) {
     const start = Math.floor(b.epoch / sec) * sec;
@@ -90,7 +93,7 @@ export function aggregate(bars, minutes) {
     } else out.push({ epoch: start, open: b.open, high: b.high, low: b.low, close: b.close, lastEpoch: b.epoch });
   }
   const last = out[out.length - 1];
-  if (last && last.lastEpoch < last.epoch + sec - 60) out.pop();
+  if (last && last.lastEpoch < last.epoch + sec - Math.max(60, barMinutes * 60)) out.pop();
   return out;
 }
 
@@ -104,6 +107,39 @@ export const RULES_DEFAULTS = {
   useRange: true, bbPeriod: 20, bbDev: 2.0, rsiOversold: 30, rangeSL: 1.2, rangeTP: 1.5,
   atrPeriod: 14, maxATRSpike: 2.5,
 };
+
+/** How long a "Waiting for price" plan stays valid, in bars of the strategy's timeframe. */
+export const PENDING_BARS = 30;
+/** Seconds per bar, read from the bars themselves (the last two closed bars). */
+export function barSeconds(bars) {
+  const n = bars?.length || 0;
+  const d = n >= 2 ? bars[n - 1].epoch - bars[n - 2].epoch : 0;
+  return d > 0 ? d : 60;
+}
+
+// ------------------------------------------------------- strategy timeframe
+// "Bot trades on": the candles the strategy reads. The chart's own timeframe is separate.
+export const BOT_TIMEFRAMES = [60, 900, 3600];
+export const botTfOf = (s) => (BOT_TIMEFRAMES.includes(+s?.botTf) ? +s.botTf : 60);
+/** Rules settings for a bot timeframe: the higher timeframe follows TbotAdaptive (M1 -> M15, M15 -> H1, H1 -> H4). */
+export function rulesParamsFor(granularity = 60) {
+  const m = Math.max(1, Math.round(granularity / 60));
+  return { ...RULES_DEFAULTS, barMinutes: m, htfMinutes: m <= 1 ? 15 : m * 4 };
+}
+/** Closed bars a strategy needs before it can decide anything, on this timeframe. */
+export function minBarsFor(strategy, granularity = 60) {
+  if (strategy === "ai") return AI_MIN_BARS;
+  if (strategy === "ict") return ictMinBars();
+  return rulesMinBars(rulesParamsFor(granularity));
+}
+/**
+ * How many candles to ask Deriv for: the strategy's minimum with room to spare, at least
+ * 1200 on the 1-minute chart (the chart shows them), and never more than Deriv's 5000.
+ */
+export function historyCount(strategy, granularity = 60) {
+  const need = Math.ceil(minBarsFor(strategy, granularity) * 1.5) + 50;
+  return Math.min(5000, Math.max(need, granularity <= 60 ? 1200 : 300));
+}
 
 // p.barMinutes (default 1) lets the backtester feed M15 or H1 bars instead of M1.
 export function rulesMinBars(p = RULES_DEFAULTS) {
@@ -123,7 +159,7 @@ export function evaluateRules(bars, p = RULES_DEFAULTS) {
   const rsi = rsiSeries(close, p.rsiPeriod);
   const bb1 = bollingerAt(close, p.bbPeriod, p.bbDev, i), bb2 = bollingerAt(close, p.bbPeriod, p.bbDev, i - 1);
 
-  const htf = aggregate(bars, p.htfMinutes);
+  const htf = aggregate(bars, p.htfMinutes, p.barMinutes || 1);
   const htfClose = htf.map((b) => b.close);
   const htfEma = emaSeries(htfClose, p.htfEMA);
   const h = htf.length - 1;
@@ -150,6 +186,24 @@ export function evaluateRules(bars, p = RULES_DEFAULTS) {
     if (buy || sell)
       return { ...res, action: buy ? "BUY" : "SELL", slDist: p.trendSL * atr, tpDist: p.trendTP * atr,
                reason: `trend pullback ${buy ? "buy" : "sell"} (ADX ${adx[i].toFixed(0)})` };
+    // No pullback yet, but the trend is there: wait for price to come back to the fast EMA.
+    // The zone is the band the pullback rule accepts; stop and target keep the rule's ATR
+    // distances, measured from the zone edge price reaches first.
+    const band = p.pullbackATR * atr;
+    const waitBuy = htfUp && fast > slow && pdi[i] > mdi[i] && b1.close > fast && b1.low > fast + band &&
+      rsi[i] > p.rsiTrendMin && rsi[i] < p.rsiTrendMax;
+    const waitSell = htfDown && fast < slow && mdi[i] > pdi[i] && b1.close < fast && b1.high < fast - band &&
+      rsi[i] < 100 - p.rsiTrendMin && rsi[i] > 100 - p.rsiTrendMax;
+    if (waitBuy || waitSell) {
+      const zone = waitBuy ? [fast, fast + band] : [fast - band, fast];
+      const ref = waitBuy ? zone[1] : zone[0], dir = waitBuy ? 1 : -1;
+      const sl = ref - dir * p.trendSL * atr;
+      res.pending = {
+        id: `rules:${waitBuy ? "BUY" : "SELL"}`, side: waitBuy ? "BUY" : "SELL", zone, sl, tp: ref + dir * p.trendTP * atr, since: b1.epoch,
+        expiresAt: b1.epoch + barSeconds(bars) * (1 + (p.pendingBars ?? PENDING_BARS)), invalidateAt: sl, sticky: false,
+        reason: `Trend ${waitBuy ? "up" : "down"} (ADX ${adx[i].toFixed(0)}). Waiting for a pullback to the 21 EMA`,
+      };
+    }
   }
   if (p.useRange && regime === "RANGE") {
     const buy = c2 < bb2.lower && b1.close > bb1.lower && rsi[i - 1] < p.rsiOversold && rsi[i] > rsi[i - 1] &&
@@ -287,8 +341,12 @@ export function ictMinBars(p = ICT_DEFAULTS) {
 
 const flipBar = (b) => ({ epoch: b.epoch, open: -b.open, high: -b.low, low: -b.high, close: -b.close });
 
-/** Looks for a bullish setup that enters on the last bar. Returns null or the setup. */
-function ictBullish(bars, tr, p) {
+/**
+ * Looks for a bullish setup. Returns null, a setup that enters on the last bar
+ * ({kind: "entry"}), or one that has formed and waits for price to come back to the gap
+ * ({kind: "pending"}).
+ */
+function ictBullish(bars, tr, p, newest = bars.length - 3) {
   const i = bars.length - 1, L = p.swingLen;
   const H = (j) => bars[j].high, Lo = (j) => bars[j].low;
   const isHigh = (j) => { if (j - L < 0 || j + L > i) return false;
@@ -298,8 +356,10 @@ function ictBullish(bars, tr, p) {
   const atrI = atrAt(tr, p.atrPeriod, i);
   if (!(atrI > 0)) return null;
 
-  // d = structure-shift (displacement) bar; the gap needs bar d+1 closed, entry at i >= d+2
-  for (let d = i - 2; d >= Math.max(p.atrPeriod, i - p.entryWindow); d--) {
+  // d = structure-shift (displacement) bar; the gap needs bar d+1 closed, entry at i >= d+2.
+  // Entries scan from d = i - 2 (as backtested). Waiting setups also look at d = i - 1,
+  // where the gap has only just formed on the last bar.
+  for (let d = newest; d >= Math.max(p.atrPeriod, i - p.entryWindow); d--) {
     const bd = bars[d], atrD = atrAt(tr, p.atrPeriod, d - 1);
     if (!(atrD > 0) || bd.close - bd.open < p.dispATR * atrD) continue;
     // sweep bar s in [d - sweepWindow, d - 1], most recent first
@@ -333,12 +393,17 @@ function ictBullish(bars, tr, p) {
       }
       if (!gap) continue;
       // first revisit must be the last bar; stop must not have been hit since
-      let ok = i >= gap.c + 2;
+      // (the most recent structure shift decides: a used or broken setup means no trade)
+      let ok = true;
       for (let j = gap.c + 2; ok && j < i; j++) if (Lo(j) <= gap.top) ok = false;
       for (let j = d + 1; ok && j <= i; j++) if (Lo(j) <= sweepLow) ok = false;
+      if (!ok) return null;
       const b = bars[i];
-      if (!ok || !(Lo(i) <= gap.top && b.close > gap.bot)) return null;  // most recent shift decides
-      const entry = b.close;
+      const touched = i >= gap.c + 2 && Lo(i) <= gap.top;
+      if (touched && !(b.close > gap.bot)) return null;
+      // Waiting: price is still above the gap. The plan enters at the gap's top, the price
+      // reaches first, so stop and target are worked out from there.
+      const entry = touched ? b.close : gap.top;
       const slDist = entry - sweepLow + p.stopBufferATR * atrI;
       if (slDist < p.minStopATR * atrI) return null;
       let tpDist = p.rMultiple * slDist, targetNote = `${p.rMultiple}R`;
@@ -347,7 +412,8 @@ function ictBullish(bars, tr, p) {
         for (let j = i - L; j >= Math.max(L, i - p.liqLookback); j--) if (isHigh(j) && H(j) > entry) best = Math.min(best, H(j));
         if (Number.isFinite(best)) { tpDist = best - entry; targetNote = "the nearest swing high"; }
       }
-      return { level, mss, sweepLow, gap, entry, slDist, tpDist, targetNote, sweepAgo: i - s, atr: atrI };
+      return { kind: touched ? "entry" : "pending", level, mss, sweepLow, gap, entry, slDist, tpDist, targetNote,
+               sweepAgo: i - s, atr: atrI, d, gapBar: gap.c + 1 };
     }
   }
   return null;
@@ -364,20 +430,40 @@ export function evaluateICT(bars, p = ICT_DEFAULTS) {
     if (!p.killZones.some(([a, b]) => h >= a && h < b)) { res.info.note = "outside kill zone"; return res; }
   }
   const fmt = (v) => { const a = Math.abs(v); return v.toFixed(a >= 1000 ? 2 : a >= 10 ? 3 : 5); };
-  const bull = ictBullish(bars, tr, p);
-  if (bull) {
-    return { ...res, action: "BUY", slDist: bull.slDist, tpDist: bull.tpDist, horizonBars: p.horizonBars,
+  const sec = barSeconds(bars);
+  // A setup that has formed but waits for price: a plan the bot can enter on a later tick.
+  const waiting = (q, side) => {
+    const s = side === "BUY" ? 1 : -1, v = (x) => s * x;   // mirror prices back for sells
+    const sl = v(q.entry - q.slDist), tp = v(q.entry + q.tpDist);
+    const zone = side === "BUY" ? [q.gap.bot, q.gap.top] : [-q.gap.top, -q.gap.bot];
+    return { ...res, setupId: `ict:${side}:${bars[q.d].epoch}`,
+      info: { ...res.info, sweptLevel: v(q.level), structureLevel: v(q.mss), gapLow: zone[0], gapHigh: zone[1] },
+      pending: { id: `ict:${side}:${bars[q.d].epoch}`, side, zone, sl, tp, sticky: true, since: bars[q.gap.c - 1].epoch,
+        expiresAt: bars[q.gapBar].epoch + sec * (1 + (p.pendingBars ?? PENDING_BARS)), invalidateAt: v(q.sweepLow),
+        horizonBars: p.horizonBars,
+        reason: `Swept the ${side === "BUY" ? "low" : "high"} at ${fmt(v(q.level))} and broke structure ${side === "BUY" ? "up above" : "down below"} ` +
+                `${fmt(v(q.mss))}. Waiting for price to come back to the fair value gap (${fmt(zone[0])} to ${fmt(zone[1])}); ` +
+                `target ${side === "BUY" ? q.targetNote : q.targetNote.replace("swing high", "swing low")}` } };
+  };
+  const flipped = bars.map(flipBar);   // true ranges are identical on flipped bars
+  const bull = ictBullish(bars, tr, p), last = bars.length - 1;
+  const bear = bull?.kind === "entry" ? null : ictBullish(flipped, tr, p);
+  if (bull?.kind === "entry") {
+    return { ...res, action: "BUY", slDist: bull.slDist, tpDist: bull.tpDist, horizonBars: p.horizonBars, setupId: `ict:BUY:${bars[bull.d].epoch}`,
       info: { ...res.info, sweptLevel: bull.level, structureLevel: bull.mss, gapLow: bull.gap.bot, gapHigh: bull.gap.top },
       reason: `Swept the low at ${fmt(bull.level)}, broke structure up above ${fmt(bull.mss)}, ` +
               `entering the fair value gap (${fmt(bull.gap.bot)} to ${fmt(bull.gap.top)}); target ${bull.targetNote}` };
   }
-  const bear = ictBullish(bars.map(flipBar), tr, p);   // true ranges are identical on flipped bars
-  if (bear) {
-    return { ...res, action: "SELL", slDist: bear.slDist, tpDist: bear.tpDist, horizonBars: p.horizonBars,
+  if (bear?.kind === "entry") {
+    return { ...res, action: "SELL", slDist: bear.slDist, tpDist: bear.tpDist, horizonBars: p.horizonBars, setupId: `ict:SELL:${bars[bear.d].epoch}`,
       info: { ...res.info, sweptLevel: -bear.level, structureLevel: -bear.mss, gapLow: -bear.gap.top, gapHigh: -bear.gap.bot },
       reason: `Swept the high at ${fmt(-bear.level)}, broke structure down below ${fmt(-bear.mss)}, ` +
               `entering the fair value gap (${fmt(-bear.gap.top)} to ${fmt(-bear.gap.bot)}); target ` +
               bear.targetNote.replace("swing high", "swing low") };
   }
+  const bullWait = ictBullish(bars, tr, p, last - 1);
+  if (bullWait?.kind === "pending") return waiting(bullWait, "BUY");
+  const bearWait = ictBullish(flipped, tr, p, last - 1);
+  if (bearWait?.kind === "pending") return waiting(bearWait, "SELL");
   return res;
 }

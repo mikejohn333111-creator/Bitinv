@@ -263,7 +263,7 @@ async function startServer() {
     "POST /api/start": { fn: () => { engine.start(); return engine.status(); } },
     "POST /api/stop": { fn: () => { engine.stop(); return engine.status(); } },
     "POST /api/settings": { fn: ({ body }) => {
-      const { settings, errors } = cleanSettings(body, engine.settings);
+      const { settings, errors } = cleanSettings(body, engine.settings, engine.knownSymbols());
       if (errors.length) throw new UserError(errors.join(" "), 400, "bad_settings");
       engine.updateSettings(settings);
       return { settings: engine.settings, status: engine.status() };

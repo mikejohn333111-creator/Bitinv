@@ -14,7 +14,7 @@ No bot can guarantee profits. In our tests the strategies roughly broke even bef
 
 ## What it does
 
-- Uses the same strategy, sizing and risk-limit code as the browser (`public/js/strategy.js`, `risk.js`, `deriv.js`), and trades the same way: one check per closed 1-minute candle, a `proposal` then a `buy` with `underlying_symbol` and `limit_order`, open trades followed with `proposal_open_contract`, the daily loss limit checked on equity, and the AI model's time limit.
+- Uses the same strategy, sizing and risk-limit code as the browser (`public/js/strategy.js`, `risk.js`, `deriv.js`), and trades the same way: one check per closed candle (1m, 15m or 1h, "Bot trades on"), entries from a "Waiting for price" plan on the first tick inside its zone, a `proposal` then a `buy` with `underlying_symbol` and `limit_order`, open trades followed with `proposal_open_contract`, the daily loss limit checked on equity, and the AI model's time limit.
 - Logs in to Deriv with a **Personal Access Token** (PAT) and your App ID. Each WebSocket connection gets a fresh one-time address, also after every reconnect.
 - Saves settings, state and the activity log in a data folder, so a restart resumes trading and picks up open trades from Deriv's portfolio.
 - If Deriv rejects the token, it stops trading and asks for a new token on the page. Network problems only cause reconnects.
@@ -117,7 +117,7 @@ All under `/api/`, JSON in and out. Every call needs the session cookie except l
 | `GET /healthz` | `200 ok`, no login needed. |
 | `POST /api/login` `{password}` | Sets the session cookie. 401 wrong password, 429 too many tries. |
 | `POST /api/logout` | Ends this session. |
-| `GET /api/status` | Everything the page shows: `running`, `mode`, `strategy`, `symbol`, `connection`, `account {id,type,currency}`, `balance`, `equity`, `dayPL` (%), `tradesToday`, `halted`, `haltReason`, `cooldownUntil`, `blockReason`, `lastPrice`, `lastEval` (what the strategy sees), `lastSignal` (kept across restarts), `resumedAt` (when it carried on by itself after a restart), `lastCost`, `open` trades (`id, side, symbol, stake, profit, opened, horizon`), `accounts`, `needsToken`, `hasToken`, `tokenHint` (last 4 characters), `appId`, `error`, `settings`, `limits`, `multipliers`, `version`. |
+| `GET /api/status` | Everything the page shows: `running`, `mode`, `strategy`, `symbol`, `connection`, `account {id,type,currency}`, `balance`, `equity`, `dayPL` (%), `tradesToday`, `halted`, `haltReason`, `cooldownUntil`, `blockReason`, `lastPrice`, `lastEval` (what the strategy sees), `lastSignal` (kept across restarts), `resumedAt` (when it carried on by itself after a restart), `lastCost`, `open` trades (`id, side, symbol, stake, profit, opened, horizon`), `botTf` (seconds per candle the strategy reads), `pending` (the waiting plan: `side, zone, sl, tp, expiresAt, invalidateAt, reason, text`, or null), `marketOpen`, `synthetic`, `noMultipliers`, `marketGroups` (Deriv's Multiplier markets by group, with `open`), `ictBlocked`, `accounts`, `needsToken`, `hasToken`, `tokenHint` (last 4 characters), `appId`, `error`, `settings`, `limits`, `multipliers`, `version`. |
 | `GET /api/log?after=<seq>` | Activity log entries newer than `seq` (up to 200), plus `last`. |
 | `POST /api/start` | Starts the bot. 409 with a message if it can't (no token, real account not allowed, not connected yet). |
 | `POST /api/stop` | Stops the bot. Open trades keep their stop loss and take profit. |

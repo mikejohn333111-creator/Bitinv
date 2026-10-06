@@ -115,6 +115,12 @@ fieldset { border: 0; padding: 0; margin: 12px 0; min-width: 0; }
 .seg input:checked + span { background: var(--card); color: var(--text); box-shadow: 0 1px 3px rgb(0 0 0 / 0.14); }
 .seg input:focus-visible + span { outline: 3px solid var(--focus); outline-offset: 1px; }
 .seg input:disabled + span { opacity: 0.5; }
+.seg-3 { grid-template-columns: repeat(3, 1fr); }
+.warn-text { color: var(--warn); font-weight: 650; }
+.pending { margin: 12px 0 0; padding: 12px 14px; border: 1.5px dashed var(--line); border-radius: 12px; background: var(--card-2); }
+.pending h3 { display: flex; align-items: center; gap: 8px; margin: 0 0 6px; font-size: 15px; }
+.pending p { margin: 0; font-size: 14px; }
+.pending p + p { margin-top: 4px; }
 
 .choices { display: flex; flex-direction: column; gap: 8px; }
 .choice { display: flex; align-items: center; gap: 12px; padding: 12px 14px; min-height: 56px; border: 1px solid var(--line);

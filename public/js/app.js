@@ -1,6 +1,10 @@
 // Tbot web bot: wires the Deriv connection, the strategies, risk limits and the page.
-import { CONFIG, SYMBOLS } from "./config.js";
-import { evaluateRules, evaluateAI, RULES_DEFAULTS, AI_DEFAULTS, AI_FAST, aiParams, fastModeOn, rulesMinBars } from "./strategy.js";
+import { CONFIG } from "./config.js";
+import { evaluateRules, evaluateAI, evaluateICT, ICT_DEFAULTS, AI_DEFAULTS, AI_FAST, aiParams, fastModeOn,
+         BOT_TIMEFRAMES, botTfOf, rulesParamsFor, historyCount, minBarsFor } from "./strategy.js";
+import { PendingPlan, describePending, firstTouch } from "./pending.js";
+import { MARKETS_REQUEST, PLAIN_REQUEST, parseMarkets, marketsOrFallback, groupMarkets, findMarket, marketName,
+         isSynthetic, isClosed } from "./markets.js";
 import { sizeMultiplier, RiskGuard } from "./risk.js";
 import { startOAuth, finishOAuth, getAccounts, createDemoAccount, getTradingSocketUrl, DerivSocket, redirectUri,
          cleanAppId, hasScope, FULL_SCOPE } from "./deriv.js";
@@ -28,7 +32,8 @@ const DEFAULT_SETTINGS = {
   multiplier: 0, signalGap: 8, notify: true, sound: true,
   aiThreshold: 0.55, aiBarrier: AI_DEFAULTS.barrierATR, aiHorizon: AI_DEFAULTS.horizonBars,
   aiFast: false,   // fast mode: AI only, demo only (AI_FAST in strategy.js)
-  chartTf: 60,     // chart timeframe in seconds; the chart view only, the bot always reads 1-minute candles
+  chartTf: 60,     // chart timeframe in seconds; the chart view only
+  botTf: 60,       // "Bot trades on": the candles the strategy reads (60, 900 or 3600 seconds)
   redirectNoSlash: false,
 };
 const store = {
@@ -41,6 +46,15 @@ const saveSettings = () => store.set("tbot:settings", settings);
 const fastOn = () => fastModeOn(settings);
 const onReal = () => !!st.account && st.account.type !== "demo";
 const FAST_REAL = "Fast mode is demo only. It never trades on a REAL money account.";
+const ICT_REAL = "ICT is demo only for auto trade. It never trades on a REAL money account.";
+// ICT auto trading is demo only too (signals still work on any account).
+const ictOn = () => settings.strategy === "ict";
+const ictBlocked = () => ictOn() && settings.mode === "auto" && st.trading && onReal();
+const botTf = () => botTfOf(settings);
+const TF_WORD = { 60: "1-minute", 300: "5-minute", 900: "15-minute", 3600: "1-hour", 14400: "4-hour", 86400: "Daily" };
+const TF_SHORT = { 60: "1m", 900: "15m", 3600: "1h" };
+/** A time limit in plain words: "60 min", "30 hours". */
+const spanText = (bars, sec = 60) => { const m = Math.round((bars * sec) / 60); return m < 120 || m % 60 ? `${m} min` : `${m / 60} hours`; };
 cfg.appId = cleanAppId(settings.appId) || CONFIG.appId;
 cfg.redirectNoSlash = !!settings.redirectNoSlash;
 const saveAuth = (auth) => { try { sessionStorage.setItem("tbot:auth", JSON.stringify(auth)); } catch { /* blocked */ } };
@@ -57,6 +71,10 @@ const st = {
   running: false, model: null, guard: null,
   contracts: new Map(),          // contract_id -> {side, entryEpoch, horizon, profit, buyPrice, sub}
   lastSignalEpoch: 0, lastCost: null, wakeLock: null, busy: false,
+  markets: [], marketsAt: 0,     // Deriv's list of Multiplier markets (empty: the built-in list)
+  noMultipliers: false,          // contracts_for says this market has no Multipliers
+  pending: new PendingPlan(),    // the one "Waiting for price" plan
+  pendingEnteredBar: 0, refusedAt: {},
 };
 
 // ---------------------------------------------------------------- chart
@@ -95,16 +113,18 @@ const planLabel = (p, kind) => kind === "entry" ? "Entry"
   : kind === "sl" ? `SL${Number.isFinite(p.slMoney) ? " " + signed(-p.slMoney) : ""}`
   : `TP${Number.isFinite(p.tpMoney) ? " " + signed(p.tpMoney) : ""}`;
 // ------------------------------------------------------- chart timeframe
-// The chart can show 5m to 1D candles from their own Deriv stream. The strategy never sees
-// them: it keeps reading its 1-minute bars (st.bars). Times on the chart (markers, the trade
-// plan) are mapped to the candle that contains them.
+// The chart can show 1m to 1D candles. When the chart's timeframe is the bot's own ("Bot trades
+// on"), it shows the bot's candles (st.bars); otherwise it has its own Deriv stream, which the
+// strategy never sees. Times on the chart (markers, the trade plan) are mapped to the candle
+// that contains them.
 const TIMEFRAMES = [[60, "1m"], [300, "5m"], [900, "15m"], [3600, "1h"], [14400, "4h"], [86400, "1D"]];
 const CHART_BARS = 500;
 const chartTf = () => (TIMEFRAMES.some(([g]) => g === +settings.chartTf) ? +settings.chartTf : 60);
 const toCandle = (epoch) => Math.floor(epoch / chartTf()) * chartTf();
 const chartFeed = { sub: null, bars: [], forming: null };
-const chartLast = () => (chartTf() === 60 ? st.forming?.epoch ?? st.bars.at(-1)?.epoch : chartFeed.forming?.epoch ?? chartFeed.bars.at(-1)?.epoch);
-const chartFirst = () => (chartTf() === 60 ? st.bars[0]?.epoch ?? st.forming?.epoch : chartFeed.bars[0]?.epoch ?? chartFeed.forming?.epoch);
+const chartIsBot = () => chartTf() === botTf();   // the chart shows the bot's own candles
+const chartLast = () => (chartIsBot() ? st.forming?.epoch ?? st.bars.at(-1)?.epoch : chartFeed.forming?.epoch ?? chartFeed.bars.at(-1)?.epoch);
+const chartFirst = () => (chartIsBot() ? st.bars[0]?.epoch ?? st.forming?.epoch : chartFeed.bars[0]?.epoch ?? chartFeed.forming?.epoch);
 const asData = (list) => list.map((b) => ({ time: b.epoch, open: b.open, high: b.high, low: b.low, close: b.close }));
 /** Draws the markers on the chart's timeframe (kept in 1-minute times). */
 function paintMarkers() {
@@ -113,7 +133,7 @@ function paintMarkers() {
   catch { /* display only */ }
 }
 function onChartCandles(msg) {
-  if (msg.error || chartTf() === 60) return;
+  if (msg.error || chartIsBot()) return;
   const g = Number(msg.echo_req?.granularity ?? msg.ohlc?.granularity ?? chartTf());
   if (g !== chartTf()) return;   // a late message from the timeframe before
   if (msg.msg_type === "candles") {
@@ -131,12 +151,12 @@ function onChartCandles(msg) {
     series.update({ time: bar.epoch, open: bar.open, high: bar.high, low: bar.low, close: bar.close });
   }
 }
-/** (Re)subscribes the chart's own candles when the timeframe isn't 1 minute; 1m uses the bot's feed. */
+/** (Re)subscribes the chart's own candles when its timeframe isn't the bot's; otherwise it uses the bot's feed. */
 function subscribeChart(sock = st.socket) {
   chartFeed.sub?.unsubscribe();
   chartFeed.sub = null; chartFeed.bars = []; chartFeed.forming = null;
   const tf = chartTf();
-  if (tf === 60) {
+  if (chartIsBot()) {
     series.setData(asData([...st.bars, ...(st.forming ? [st.forming] : [])]));
   } else {
     series.setData([]);
@@ -147,15 +167,16 @@ function subscribeChart(sock = st.socket) {
 }
 function renderTimeframe() {
   document.querySelectorAll("[data-tf]").forEach((b) => b.setAttribute("aria-pressed", String(+b.dataset.tf === chartTf())));
-  $("tfNote").hidden = chartTf() === 60;
-  $("tfName").textContent = { 60: "1-minute", 300: "5-minute", 900: "15-minute", 3600: "1-hour", 14400: "4-hour", 86400: "Daily" }[chartTf()];
+  $("tfNote").hidden = chartIsBot();
+  $("tfNote").textContent = `The bot trades on ${TF_WORD[botTf()]} candles; this only changes the chart.`;
+  $("tfName").textContent = TF_WORD[chartTf()];
   $("chart").setAttribute("aria-label", `${TIMEFRAMES.find(([g]) => g === chartTf())[1]} candlestick chart`);
 }
 
 // While a plan shows, leave room right of the last candle so its boxes can reach the planned close.
 let roomShown = 3;
 function planRoom(layer) {
-  const room = layer.active() ? (chartTf() === 60 ? 12 : 4) : 3;
+  const room = layer.active() ? (chartTf() <= 60 ? 12 : 4) : 3;
   if (room !== roomShown) { roomShown = room; chart.timeScale().applyOptions({ rightOffset: room }); }
 }
 const plans = new TradePlanLayer({ chart, series, palette: pal, label: planLabel, lastTime: chartLast, tf: chartTf, onChange: planRoom });
@@ -170,12 +191,12 @@ darkQuery.addEventListener?.("change", () => {
   plans.restyle();
 });
 /** The plan of a new signal or trade: entry, stop loss and take profit, from the entry candle to the planned close. */
-function planOf(sig, entry, size, start, signalEpoch) {
+function planOf(sig, entry, size, start, signalEpoch, barSec = botTf()) {
   const up = sig.action === "BUY";
   return {
     side: sig.action, entry, sl: up ? entry - sig.slDist : entry + sig.slDist, tp: up ? entry + sig.tpDist : entry - sig.tpDist,
     slMoney: size?.ok ? size.stopLoss : NaN, tpMoney: size?.ok ? size.takeProfit : NaN,
-    start, end: sig.horizonBars ? signalEpoch + (sig.horizonBars + 1) * 60 : null, stale: false, created: Date.now(),
+    start, end: sig.horizonBars ? signalEpoch + (sig.horizonBars + 1) * barSec : null, stale: false, created: Date.now(),
   };
 }
 /** Signals go dim after 5 minutes, or once the bot is stopped (like the signal card). */
@@ -201,7 +222,7 @@ const ICON = {
 };
 const icon = (k, size = 18) => `<svg viewBox="0 0 24 24" width="${size}" height="${size}" stroke-width="2.4" aria-hidden="true">${ICON[k] || ICON.INFO}</svg>`;
 const TAG_WORD = { BUY: "Buy", SELL: "Sell", WIN: "Win", LOSS: "Loss", ERROR: "Problem", INFO: "Info" };
-const symbolName = (code) => SYMBOLS.find(([v]) => v === code)?.[1] || code;
+const symbolName = (code) => marketName(st.markets, code);
 // Display only: the feed shows "Volatility 75 Index" where the message has the code "R_75".
 const friendly = (text) => (settings.symbol ? String(text ?? "").split(settings.symbol).join(symbolName(settings.symbol)) : String(text ?? ""));
 // Wins and losses closed while this page was open, per account and UTC day (display only).
@@ -330,27 +351,33 @@ function renderControls() {
   const guardMsg = st.guard?.blockReason(st.contracts.size) || "";
   const fullUp = guardMsg === "max open trades reached";   // the normal wait while a trade is open
   const fastBlocked = running && auto && fastOn() && st.trading && onReal();
-  const waiting = running && auto && (fastBlocked || (!!guardMsg && !fullUp));
+  const ictStop = running && ictBlocked();
+  const closed = isClosed(st.markets, settings.symbol);
+  const waiting = running && auto && (fastBlocked || ictStop || closed || (!!guardMsg && !fullUp));
   $("botState").textContent = !running ? "Bot is off" : !auto ? "Watching for signals" : waiting ? "Auto trading paused" : fastOn() ? "Auto trading · Fast" : "Auto trading";
   $("barSub").textContent =
       !running && needLogin ? "Log in first. Signals only works without an account."
     : !running && auto && real && fastOn() ? "Fast mode is demo only. Switch to demo to auto trade."
+    : !running && auto && real && ictOn() ? "ICT is demo only for auto trade. Switch to demo, or use Signals only."
     : !running && auto ? `Places trades on your ${real ? "REAL money" : "demo"} account.`
     : !running ? "Alerts only. Nothing is traded."
+    : closed ? `${market} is closed now. The bot waits until it opens.`
+    : st.pending.plan ? `Waiting for price on ${market}. ${auto ? "Enters" : "Alerts you"} when it reaches the zone.`
     : !auto ? `Alerts for ${market}. Nothing is traded.`
     : fastBlocked ? "Fast mode is demo only. No trades on this REAL account."
+    : ictStop ? "ICT is demo only. No trades on this REAL account."
     : fullUp ? `${st.contracts.size > 1 ? `${st.contracts.size} trades are` : "A trade is"} open (limit ${limits().maxOpen}). Looks again when one closes.`
     : waiting ? waitText(guardMsg)
     : `Looking for trades on ${market}.`;
   const trades = st.guard?.state.trades || 0, max = +settings.maxTradesPerDay;
   $("tradesToday").textContent = st.guard ? (max ? `${trades} of ${max}` : String(trades)) : "–";
-  $("infoLabel").textContent = settings.strategy === "ai" ? "AI forecast" : "Market now";
+  $("infoLabel").textContent = settings.strategy === "ai" ? "AI forecast" : ictOn() ? "ICT setup" : "Market now";
   // display only: the sticky bar, the mode lock while running, and what the chosen mode will do
   const bar = $("actionBar");
   bar.dataset.state = running ? settings.mode : "stopped";
   bar.dataset.wait = waiting ? "1" : "";
   bar.dataset.acct = !st.trading || !st.account ? "none" : real ? "real" : "demo";
-  $("barMode").textContent = `${settings.strategy === "ai" ? (fastOn() ? "AI model · Fast" : "AI model") : "Rules"} · ${auto ? "Auto trade" : "Signals only"}`;
+  $("barMode").textContent = `${settings.strategy === "ai" ? (fastOn() ? "AI model · Fast" : "AI model") : ictOn() ? "ICT" : "Rules"}${botTf() !== 60 ? ` · ${TF_SHORT[botTf()]}` : ""} · ${auto ? "Auto trade" : "Signals only"}`;
   $("barAcct").textContent = real ? "REAL MONEY" : "Demo";
   $("barAcct").hidden = !st.trading || !st.account;
   $("modeSeg").classList.toggle("locked", running);
@@ -358,10 +385,60 @@ function renderControls() {
   if (!auto) { note.textContent = "You get an alert with entry, stop loss and take profit. Nothing is traded."; note.className = "mode-note"; }
   else if (!st.trading || !st.account) { note.textContent = "Auto trade needs your Deriv account. Log in first."; note.className = "mode-note is-warn"; }
   else if (real && fastOn()) { note.textContent = `Fast mode is demo only, so no trades on REAL account ${st.account.id}.`; note.className = "mode-note is-real"; }
+  else if (real && ictOn()) { note.textContent = `ICT is demo only for auto trade, so no trades on REAL account ${st.account.id}.`; note.className = "mode-note is-real"; }
   else if (real) { note.textContent = `Trades will use REAL money on ${st.account.id}.`; note.className = "mode-note is-real"; }
   else { note.textContent = `Trades go to your demo account ${st.account.id} (practice money).`; note.className = "mode-note is-demo"; }
   if (running) note.textContent += " Stop the bot to switch mode.";
   renderFast(auto);
+  renderIct(auto);
+  renderBotTf();
+  renderMarketState();
+  renderPending();
+}
+
+/** ICT: the one-line honest hint, and "Demo only" on a REAL account (signals still work there). */
+function renderIct(auto) {
+  const real = st.trading && onReal();
+  $("ictRealTag").hidden = !real;
+  $("ictHint").hidden = !ictOn();
+  const note = $("ictNote");
+  note.hidden = !(ictOn() && real);
+  if (!note.hidden) note.textContent = auto ? `${ICT_REAL} Auto trade won't place trades here. Switch to your demo account or use Signals only.`
+                                            : `${ICT_REAL} Signals still show here.`;
+}
+
+/** "Bot trades on": the strategy's own candles, with honest notes for the AI and real markets. */
+function renderBotTf() {
+  document.querySelectorAll("[data-bottf]").forEach((b) => b.setAttribute("aria-pressed", String(+b.dataset.bottf === botTf())));
+  $("botTfSeg").classList.toggle("locked", st.running);
+  const notes = [];
+  if (settings.strategy === "ai" && botTf() !== 60) notes.push("The AI model was trained on 1-minute data. On 15m and 1h it is untested.");
+  const real = !isSynthetic(st.markets, settings.symbol);
+  $("tfSuggest").hidden = !(real && botTf() !== 3600);
+  $("botTfNote").textContent = notes.join(" ");
+  $("botTfNote").hidden = !notes.length;
+}
+
+/** "Market closed" under the market picker, and no Multipliers on this market. */
+function renderMarketState() {
+  const closed = isClosed(st.markets, settings.symbol);
+  const el = $("marketClosed");
+  el.hidden = !closed && !st.noMultipliers;
+  el.textContent = st.noMultipliers ? "No Multipliers on this market. The bot trades nothing here."
+    : findMarket(st.markets, settings.symbol)?.suspended ? "Trading is paused on this market. The bot doesn't trade until it opens."
+    : "Market closed. The bot doesn't trade until it opens.";
+}
+
+/** The waiting plan as text, under the strategy readout. */
+function renderPending() {
+  const plan = st.pending.plan, box = $("pendingBox");
+  box.hidden = !plan;
+  if (!plan) return;
+  const when = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  $("pendingText").textContent = describePending(plan, px, when);
+  $("pendingWhy").textContent = plan.reason;
+  $("pendingSide").textContent = plan.side === "BUY" ? "Buy" : "Sell";
+  $("pendingSide").className = `side-badge ${plan.side === "BUY" ? "buy" : "sell"}`;
 }
 
 /** The fast mode switch: shown only for the AI model, and only usable on a demo account. */
@@ -426,6 +503,13 @@ function renderInfo(res) {
     $("infoSub").textContent = "";
     return;
   }
+  if (ictOn()) {
+    $("infoText").textContent = res.pending ? "Setup found" : res.action ? "Entry now" : "No setup";
+    $("infoPlain").textContent = res.pending ? "Waiting for price to come back to the fair value gap."
+      : res.action ? "Price came back to the fair value gap." : "Waiting for a liquidity sweep and a break in structure.";
+    $("infoSub").textContent = Number.isFinite(i.atr) ? `Usual ${TF_SHORT[botTf()]} move (ATR) ${num(i.atr, i.atr >= 10 ? 2 : 5)}` : "";
+    return;
+  }
   if (settings.strategy === "ai") {
     const pct = (v) => (v * 100).toFixed(0), top = Math.max(i.pUp, i.pDn, i.pNone);
     $("infoText").textContent = top === i.pUp ? "Leans up" : top === i.pDn ? "Leans down" : "No clear move";
@@ -482,7 +566,7 @@ function renderOpen() {
     pl.querySelector("b").textContent = signed(c.profit);
     pl.querySelector("span").textContent = Number.isFinite(c.profit) && c.buyPrice > 0
       ? `${c.profit > 0 ? "+" : c.profit < 0 ? "−" : ""}${Math.abs((c.profit / c.buyPrice) * 100).toFixed(2)}%` : "";
-    card.querySelector(".live").textContent = c.horizon ? `Closes by itself after ${c.horizon} min` : "Stop loss and take profit are set";
+    card.querySelector(".live").textContent = c.horizon ? `Closes by itself after ${spanText(c.horizon, c.barSec || 60)}` : "Stop loss and take profit are set";
   }
 }
 
@@ -509,7 +593,7 @@ function renderSignal(d) {
         <div><span class="k">Stop loss</span><b>${px(d.sl)}</b>${size?.ok ? `<span class="m neg">−${money(size.stopLoss)}</span>` : ""}</div>
         <div><span class="k">Take profit</span><b>${px(d.tp)}</b>${size?.ok ? `<span class="m pos">+${money(size.takeProfit)}</span>` : ""}</div>
       </div>
-      <p class="levels-note">Approximate prices from the last 1-minute close${d.opened ? ". Deriv's actual fill can differ a little" : ""}.</p>
+      <p class="levels-note">${d.fromPending ? "Approximate prices from when price reached the zone" : `Approximate prices from the last ${TF_WORD[botTf()]} close`}${d.opened ? ". Deriv's actual fill can differ a little" : ""}.</p>
       <dl class="sig-rows">
         <dt>Stake</dt><dd>${esc(stake)}</dd>
         <dt>Deriv fee</dt><dd>${esc(cost)}</dd>
@@ -533,23 +617,27 @@ function onCandles(msg) {
     const all = (msg.candles || []).map(normBar);
     st.forming = all.pop() || null;
     st.bars = all;
-    if (chartTf() === 60) { series.setData(asData([...st.bars, ...(st.forming ? [st.forming] : [])])); paintMarkers(); }
+    if (chartIsBot()) { series.setData(asData([...st.bars, ...(st.forming ? [st.forming] : [])])); paintMarkers(); }
     updatePrice();
     evaluate(false);
   } else if (msg.msg_type === "ohlc") {
     const o = msg.ohlc;
+    if (o.granularity !== undefined && Number(o.granularity) !== botTf()) return;   // a late message from the timeframe before
     const bar = { epoch: Number(o.open_time), open: +o.open, high: +o.high, low: +o.low, close: +o.close };
+    const keep = Math.max(HISTORY_BARS, historyCount(settings.strategy, botTf()));
     if (!st.forming || bar.epoch > st.forming.epoch) {
       if (st.forming) {
         st.bars.push(st.forming);
-        if (st.bars.length > HISTORY_BARS * 1.5) st.bars.splice(0, st.bars.length - HISTORY_BARS);
+        if (st.bars.length > keep * 1.5) st.bars.splice(0, st.bars.length - keep);
         st.forming = bar;
-        if (chartTf() === 60) series.update({ time: bar.epoch, open: bar.open, high: bar.high, low: bar.low, close: bar.close });
+        if (chartIsBot()) series.update({ time: bar.epoch, open: bar.open, high: bar.high, low: bar.low, close: bar.close });
         onBarClosed();
       } else st.forming = bar;
     } else if (bar.epoch === st.forming.epoch) st.forming = bar;
-    if (chartTf() === 60) series.update({ time: st.forming.epoch, open: st.forming.open, high: st.forming.high, low: st.forming.low, close: st.forming.close });
+    else return;
+    if (chartIsBot()) series.update({ time: st.forming.epoch, open: st.forming.open, high: st.forming.high, low: st.forming.low, close: st.forming.close });
     updatePrice();
+    checkPending();
   }
 }
 
@@ -562,15 +650,66 @@ function updatePrice() {
 }
 
 function strategyParams() {
-  return settings.strategy === "ai" ? aiParams(settings) : RULES_DEFAULTS;
+  return settings.strategy === "ai" ? aiParams(settings) : ictOn() ? ICT_DEFAULTS : rulesParamsFor(botTf());
 }
 
 function evaluate(actOnSignal) {
   if (!st.bars.length) return null;
-  const res = settings.strategy === "ai" ? evaluateAI(st.bars, st.model, strategyParams()) : evaluateRules(st.bars, strategyParams());
+  const res = settings.strategy === "ai" ? evaluateAI(st.bars, st.model, strategyParams())
+            : ictOn() ? evaluateICT(st.bars, strategyParams()) : evaluateRules(st.bars, strategyParams());
   renderInfo(res);
-  if (actOnSignal && res.action) handleSignal(res).catch((e) => log("ERROR", "Signal handling failed", e.message));
+  if (!actOnSignal) return res;
+  // A closed-candle signal for a setup the bot already entered (or dropped) on a touch is not used twice.
+  if (res.action && !st.pending.used(res.setupId) && st.bars.at(-1).epoch !== st.pendingEnteredBar)
+    handleSignal(res).catch((e) => log("ERROR", "Signal handling failed", e.message));
+  const ev = st.pending.offer(res, { strategy: settings.strategy, symbol: settings.symbol, barSec: botTf(), horizonBars: res.horizonBars || 0 });
+  if (ev) pendingEvent(ev);
   return res;
+}
+
+// ------------------------------------------------------- waiting plans
+/** A new price: the waiting plan may be entered or cancelled now, not only when a candle closes. */
+function checkPending() {
+  if (!st.pending.plan || !st.running || !st.forming) return;
+  const ev = st.pending.price(st.forming.close, st.forming.epoch);
+  if (ev) pendingEvent(ev);
+}
+
+/** The waiting plan on the chart: the zone, and the stop and target with money for the current balance. */
+function pendingDrawing(plan) {
+  const ref = firstTouch(plan), up = plan.side === "BUY";
+  const size = Number.isFinite(st.balance)
+    ? sizeMultiplier({ balance: st.balance, riskPct: +settings.riskPct, entry: ref, slDist: up ? ref - plan.sl : plan.sl - ref,
+                       tpDist: up ? plan.tp - ref : ref - plan.tp, multiplier: chooseMultiplier(), minStake: st.minStake, maxStake: st.maxStake })
+    : null;
+  return { kind: "pending", side: plan.side, zone: plan.zone, sl: plan.sl, tp: plan.tp,
+           slMoney: size?.ok ? size.stopLoss : NaN, tpMoney: size?.ok ? size.takeProfit : NaN,
+           start: plan.since ?? st.forming?.epoch ?? plan.expiresAt, end: plan.expiresAt, stale: false, created: Date.now() };
+}
+
+function pendingEvent(ev) {
+  const p = ev.plan, when = (t) => new Date(t * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (ev.type === "new" || ev.type === "update") {
+    if (ev.replaced) log("INFO", `Dropped the waiting ${ev.replaced.side} plan`, "A newer setup replaced it.");
+    const old = plans.get("pending");
+    plans.set("pending", { ...pendingDrawing(p), ...(old && ev.type === "update" && { start: old.start }) });
+    if (ev.type === "new") log("INFO", `Waiting for price: ${p.side} ${settings.symbol}`, `${describePending(p, px, when)} ${p.reason}`);
+  } else if (ev.type === "cancel") {
+    plans.remove("pending");
+    log("INFO", `Cancelled the waiting ${p.side} plan`, `${ev.text.charAt(0).toUpperCase()}${ev.text.slice(1)}.`);
+  } else if (ev.type === "enter") {
+    plans.remove("pending");
+    st.pendingEnteredBar = st.forming.epoch;
+    handleSignal(ev.signal, { entry: ev.signal.entry, barEpoch: st.forming.epoch, fromPending: true })
+      .catch((e) => log("ERROR", "Signal handling failed", e.message));
+  }
+  renderControls();
+}
+
+/** Drops the waiting plan (stop, market, strategy or timeframe change), with a log line. */
+function cancelPending(text) {
+  const ev = st.pending.cancel("stopped", text);
+  if (ev) pendingEvent(ev);
 }
 
 function onBarClosed() {
@@ -586,11 +725,16 @@ function chooseMultiplier() {
   return st.multipliers.includes(m) ? m : st.multipliers[0];
 }
 
-async function handleSignal(sig) {
-  const lastBar = st.bars.at(-1);
-  const entry = lastBar.close;
-  const gapMin = settings.mode === "signals" ? Math.max(+settings.signalGap, sig.horizonBars || 0) : 0;
-  if (gapMin && lastBar.epoch - st.lastSignalEpoch < gapMin * 60) return;
+/**
+ * A signal from a closed candle, or (opts.fromPending) a waiting plan price just reached:
+ * then opts.entry is the price now and opts.barEpoch the candle it happened in.
+ */
+async function handleSignal(sig, opts = {}) {
+  const lastBar = st.bars.at(-1), barSec = botTf();
+  const entry = opts.entry ?? lastBar.close, barEpoch = opts.barEpoch ?? lastBar.epoch;
+  const signalEpoch = opts.fromPending ? barEpoch - barSec : lastBar.epoch;   // time limits count candles from here
+  const gapSec = settings.mode === "signals" && !opts.fromPending ? Math.max(+settings.signalGap * 60, (sig.horizonBars || 0) * barSec) : 0;
+  if (gapSec && barEpoch - st.lastSignalEpoch < gapSec) return;
 
   const mult = chooseMultiplier();
   const size = Number.isFinite(st.balance)
@@ -603,21 +747,24 @@ async function handleSignal(sig) {
                  : size ? size.reason : "log in to see the stake for your balance";
 
   if (settings.mode === "signals") {
-    st.lastSignalEpoch = lastBar.epoch;
-    addMarker(lastBar.epoch, sig.action, sig.action);
-    plans.set("signal", planOf(sig, entry, size, lastBar.epoch, lastBar.epoch));
+    st.lastSignalEpoch = barEpoch;
+    addMarker(barEpoch, sig.action, sig.action);
+    plans.set("signal", planOf(sig, entry, size, barEpoch, signalEpoch));
     log(sig.action, `${sig.action} ${settings.symbol} @ ${px(entry)}`, `SL ${px(sl)} · TP ${px(tp)} · ${sizeText} · ${sig.reason}`);
-    renderSignal({ action: sig.action, entry, sl, tp, size, mult, reason: sig.reason, opened: false });
+    renderSignal({ action: sig.action, entry, sl, tp, size, mult, reason: sig.reason, opened: false, fromPending: !!opts.fromPending });
     notify(`Tbot: ${sig.action} ${settings.symbol}`, `Entry ${px(entry)} · SL ${px(sl)} · TP ${px(tp)}`);
     return;
   }
 
   // ---- auto trade
   if (!st.trading) { log("ERROR", "Auto trade needs a logged-in account"); return; }
-  if (fastOn() && onReal()) {   // demo only, checked again right before any order
-    if (Date.now() - (st.fastRefusedAt || 0) > 10 * 60000) { st.fastRefusedAt = Date.now(); log("ERROR", `Skipped ${sig.action}: fast mode is demo only`, FAST_REAL); }
-    return;
-  }
+  const refuse = (key, title, detail) => {   // logged at most once per 10 minutes
+    if (Date.now() - (st.refusedAt[key] || 0) > 10 * 60000) { st.refusedAt[key] = Date.now(); log("ERROR", title, detail); }
+  };
+  if (fastOn() && onReal()) { refuse("fast", `Skipped ${sig.action}: fast mode is demo only`, FAST_REAL); return; }   // demo only, checked again right before any order
+  if (ictOn() && onReal()) { refuse("ict", `Skipped ${sig.action}: ICT is demo only for auto trade`, ICT_REAL); return; }
+  if (isClosed(st.markets, settings.symbol)) { refuse("closed", `Skipped ${sig.action}: ${symbolName(settings.symbol)} is closed now`); return; }
+  if (st.noMultipliers) { refuse("nomult", `Skipped ${sig.action}: ${symbolName(settings.symbol)} has no Multipliers`); return; }
   const blocked = st.guard.blockReason(st.contracts.size);
   if (blocked) { log("INFO", `Skipped ${sig.action}: ${blocked}`); return; }
   if (!size?.ok) { log("INFO", `Skipped ${sig.action}`, size?.reason || "balance not known yet"); return; }
@@ -638,14 +785,14 @@ async function handleSignal(sig) {
     const b = await st.socket.send({ buy: prop.id, price: Number(prop.ask_price ?? size.stake) });
     const buy = b.buy;
     st.guard.recordEntry();
-    st.lastSignalEpoch = lastBar.epoch;
-    const entryBar = st.forming?.epoch ?? lastBar.epoch + 60;   // the trade opens in the candle after the signal
+    st.lastSignalEpoch = barEpoch;
+    const entryBar = st.forming?.epoch ?? signalEpoch + barSec;   // the trade opens in the candle after the signal
     addMarker(entryBar, sig.action, sig.action);
     plans.remove("signal");
-    trackContract(buy.contract_id, { side: sig.action, entryEpoch: lastBar.epoch, horizon: sig.horizonBars || 0, buyPrice: Number(buy.buy_price),
-                                     marked: true, plan: planOf(sig, entry, size, entryBar, lastBar.epoch) });
+    trackContract(buy.contract_id, { side: sig.action, entryEpoch: signalEpoch, horizon: sig.horizonBars || 0, buyPrice: Number(buy.buy_price),
+                                     barSec, marked: true, plan: planOf(sig, entry, size, entryBar, signalEpoch, barSec) });
     log(sig.action, `Opened ${sig.action} ${settings.symbol}`, `${sizeText} · ${sig.reason}${Number.isFinite(commission) ? ` · commission ${money(commission)}` : ""}`);
-    renderSignal({ action: sig.action, entry, sl, tp, size, mult, reason: sig.reason, opened: true, commission });
+    renderSignal({ action: sig.action, entry, sl, tp, size, mult, reason: sig.reason, opened: true, commission, fromPending: !!opts.fromPending });
     notify(`Tbot opened ${sig.action} ${settings.symbol}`, sizeText);
   } catch (e) {
     log("ERROR", `Deriv refused the ${sig.action} order`, e.message);
@@ -713,8 +860,9 @@ function trackContract(id, meta) {
 function showTradePlan(id, c, poc) {
   try {
     const p = planFromContract(poc, plans.get(id) || c.plan || {});
-    if (!p.start && c.entryEpoch) p.start = c.entryEpoch + 60;
-    if (c.horizon && c.entryEpoch && !p.end) p.end = c.entryEpoch + (c.horizon + 1) * 60;
+    const sec = c.barSec || 60;
+    if (!p.start && c.entryEpoch) p.start = c.entryEpoch + sec;
+    if (c.horizon && c.entryEpoch && !p.end) p.end = c.entryEpoch + (c.horizon + 1) * sec;
     plans.set(id, p);
     if (!c.marked && p.start && p.start >= (st.bars[0]?.epoch ?? Infinity)) { c.marked = true; addMarker(p.start, p.side, p.side); }
   } catch { /* display only */ }
@@ -730,15 +878,64 @@ async function closeContract(id, why) {
 function timeExits() {
   const last = st.bars.at(-1);
   if (!last) return;
-  for (const [id, c] of st.contracts)
-    if (c.horizon && last.epoch - c.entryEpoch >= c.horizon * 60 && !c.closing) { c.closing = true; closeContract(id, `${c.horizon} min time limit`); }
+  for (const [id, c] of st.contracts) {
+    const sec = c.barSec || 60;   // time limits count candles of the timeframe the trade was opened on
+    if (c.horizon && last.epoch - c.entryEpoch >= c.horizon * sec && !c.closing) { c.closing = true; closeContract(id, `${spanText(c.horizon, sec)} time limit`); }
+  }
 }
 
 function closeAll(why) { for (const id of st.contracts.keys()) closeContract(id, why); }
 
 // ------------------------------------------------------------ connection
 function subscribeMarket(sock) {
-  sock.subscribe({ ticks_history: settings.symbol, style: "candles", granularity: 60, count: HISTORY_BARS, end: "latest", adjust_start_time: 1 }, onCandles);
+  sock.subscribe({ ticks_history: settings.symbol, style: "candles", granularity: botTf(), count: historyCount(settings.strategy, botTf()),
+                   end: "latest", adjust_start_time: 1 }, onCandles);
+}
+
+// ---------------------------------------------------------------- markets
+/**
+ * Deriv's list of markets with Multipliers, and whether each is open now. Asked on the bot's
+ * socket; if that refuses, once on the public socket. Without an answer the built-in
+ * synthetic indices stay.
+ */
+async function loadMarkets(sock = st.socket) {
+  st.marketsAt = Date.now();
+  const ask = async (s) => {
+    for (const [req, filtered] of [[MARKETS_REQUEST, true], [PLAIN_REQUEST, false]]) {
+      try {
+        const r = await s.send({ ...req, ...(req.contract_type && { contract_type: [...req.contract_type] }) });
+        if (Array.isArray(r.active_symbols)) return parseMarkets(r.active_symbols, { filtered });
+      } catch { /* try without the filter */ }
+    }
+    return null;
+  };
+  let list = sock ? await ask(sock) : null;
+  if (!list && st.trading) {
+    const pub = new DerivSocket(async () => cfg.publicWs, { onStatus: () => {}, onError: () => {} });
+    try {
+      await pub.connect();
+      for (let i = 0; i < 50 && pub.ws?.readyState !== WebSocket.OPEN; i++) await new Promise((r) => setTimeout(r, 100));
+      list = await ask(pub);
+    } finally { pub.close(); }
+  }
+  if (!list?.length) return;
+  const was = isClosed(st.markets, settings.symbol);
+  st.markets = list;
+  renderMarkets();
+  const now = isClosed(st.markets, settings.symbol);
+  if (now && !was) log("INFO", `${symbolName(settings.symbol)} is closed now`, "The bot trades nothing until it opens again.");
+  else if (!now && was) log("INFO", `${symbolName(settings.symbol)} is open again`);
+  renderControls();
+}
+setInterval(() => { if (st.socket && Date.now() - st.marketsAt > 5 * 60000) loadMarkets(); }, 60000);
+
+/** The market picker, grouped (Synthetic indices, Forex, Commodities, Crypto...), closed markets marked. */
+function renderMarkets() {
+  const groups = groupMarkets(marketsOrFallback(st.markets, settings.symbol));
+  const opt = (m) => `<option value="${esc(m.symbol)}" ${m.symbol === settings.symbol ? "selected" : ""}>${esc(m.name)}${m.open && !m.suspended ? "" : " (closed)"}</option>`;
+  $("symbolSelect").innerHTML = groups.length === 1 && groups[0].market === "synthetic_index" && !st.markets.length
+    ? groups[0].items.map(opt).join("")
+    : groups.map((g) => `<optgroup label="${esc(g.name)}">${g.items.map(opt).join("")}</optgroup>`).join("");
 }
 
 async function onOnline() {
@@ -747,11 +944,13 @@ async function onOnline() {
     const r = await st.socket.send({ contracts_for: settings.symbol });
     const items = r.contracts_for?.available || [];
     const mult = items.find((a) => /MULT/.test(a.contract_type) || a.contract_category === "multiplier");
+    st.noMultipliers = items.length > 0 && !mult;   // only a real list without Multipliers counts
     if (mult?.multiplier_range?.length) st.multipliers = mult.multiplier_range.map(Number).sort((a, b) => a - b);
     if (mult?.min_stake) st.minStake = Number(mult.min_stake);
     if (mult?.max_stake) st.maxStake = Number(mult.max_stake);
     renderMultipliers();
   } catch (e) { /* defaults stay; the proposal will report any limit */ }
+  loadMarkets().catch(() => {});
   if (st.trading) {
     try {
       const pf = await st.socket.send({ portfolio: 1 });
@@ -948,6 +1147,11 @@ async function startBot() {
       renderControls();
       return;
     }
+    if (ictOn() && onReal()) {
+      log("ERROR", "Auto trade not started: ICT is demo only", "Switch to your demo account, or use Signals only.");
+      renderControls();
+      return;
+    }
     if (st.account.type === "real" &&
         !confirm(`Auto trade with REAL money on ${st.account.id}?\n\nThe tests showed no proven edge. Only continue if you accept losing what you risk.`)) return;
   }
@@ -956,13 +1160,16 @@ async function startBot() {
   }
   try { st.wakeLock = await navigator.wakeLock?.request("screen"); } catch { /* not supported */ }
   st.running = true;
-  log("INFO", `Bot started: ${settings.strategy === "ai" ? (fastOn() ? "AI model, fast mode" : "AI model") : "rules"}, ${settings.mode === "auto" ? "auto trade" : "signals only"}`);
-  if (settings.strategy === "rules" && st.bars.length < rulesMinBars()) log("INFO", "Waiting for enough price history");
+  const strat = settings.strategy === "ai" ? (fastOn() ? "AI model, fast mode" : "AI model") : ictOn() ? "ICT" : "rules";
+  log("INFO", `Bot started: ${strat}, ${settings.mode === "auto" ? "auto trade" : "signals only"}, ${TF_WORD[botTf()]} candles`);
+  if (st.bars.length < minBarsFor(settings.strategy, botTf())) log("INFO", "Waiting for enough price history");
+  if (isClosed(st.markets, settings.symbol)) log("INFO", `${symbolName(settings.symbol)} is closed now`, "The bot trades nothing until it opens again.");
   renderControls();
 }
 
 function stopBot() {
   if (!st.running) return;
+  cancelPending("the bot was stopped");
   st.running = false;
   st.wakeLock?.release?.().catch(() => {});
   st.wakeLock = null;
@@ -1015,10 +1222,40 @@ $("loginAppId").addEventListener("input", (ev) => setAppId(ev.target.value, "log
 $("settingsForm").addEventListener("submit", (e) => e.preventDefault());
 
 document.querySelectorAll("[data-strategy]").forEach((b) => b.addEventListener("click", () => {
-  settings.strategy = b.dataset.strategy; saveSettings();
+  const next = b.dataset.strategy;
+  if (next === settings.strategy) return;
+  if (next === "ict" && st.running && settings.mode === "auto" && st.trading && onReal()) {
+    log("ERROR", "ICT is demo only for auto trade", "Stop the bot, or switch to your demo account first.");
+    return;
+  }
+  const before = historyCount(settings.strategy, botTf());
+  settings.strategy = next; saveSettings();
+  cancelPending("the strategy changed");
   if (st.guard) st.guard.limits = limits();   // fast mode's open-trade limit applies only to AI
+  // Some strategies need more candles: ask again for a longer history if needed.
+  if (historyCount(next, botTf()) > before && st.bars.length < minBarsFor(next, botTf())) resubscribe();
   renderControls(); evaluate(false);
 }));
+/** Asks again for the bot's candles (new market or timeframe): history, chart and open trades restart. */
+function resubscribe() {
+  st.bars = []; st.forming = null; markers = []; series.setMarkers([]);
+  chartFeed.sub = null;   // the old socket's stream goes with it
+  plans.clear();
+  if (st.trading) connectAccount(st.account); else connectPublic();
+}
+document.querySelectorAll("[data-bottf]").forEach((b) => b.addEventListener("click", () => setBotTf(+b.dataset.bottf)));
+$("tfSuggestBtn").addEventListener("click", () => setBotTf(3600));
+function setBotTf(tf) {
+  if (!BOT_TIMEFRAMES.includes(tf) || tf === botTf()) return;
+  if (st.running) { log("INFO", "Stop the bot before changing the timeframe it trades on"); return; }
+  settings.botTf = tf; saveSettings();
+  cancelPending("the timeframe changed");
+  log("INFO", `The bot now trades on ${TF_WORD[tf]} candles`,
+      settings.strategy === "ai" && tf !== 60 ? "The AI model was trained on 1-minute data. On this timeframe it is untested." : "");
+  renderTimeframe();
+  resubscribe();
+  renderControls();
+}
 $("fastSwitch").addEventListener("change", (e) => {
   const on = e.target.checked;
   if (on && st.trading && onReal()) {
@@ -1073,12 +1310,14 @@ $("accountSelect").addEventListener("change", (e) => {
   connectAccount(a);
 });
 $("symbolSelect").addEventListener("change", (e) => {
+  cancelPending("the market changed");
   settings.symbol = e.target.value; saveSettings();
   stopBot();
-  st.bars = []; st.forming = null; markers = []; series.setMarkers([]);
-  chartFeed.sub = null;   // the old socket's stream goes with it
-  plans.clear();
-  if (st.trading) connectAccount(st.account); else connectPublic();
+  st.noMultipliers = false;
+  st.multipliers = DEFAULT_MULTIPLIERS; st.minStake = 1; st.maxStake = Infinity;
+  if (isClosed(st.markets, settings.symbol)) log("INFO", `${symbolName(settings.symbol)} is closed now`, "The bot trades nothing until it opens again.");
+  resubscribe();
+  renderControls();
 });
 $("openList").addEventListener("click", (e) => {
   const id = e.target.closest("[data-close]")?.dataset.close;
@@ -1122,7 +1361,7 @@ $("downloadBtn").addEventListener("click", async () => {
 
 // ------------------------------------------------------------------ boot
 async function boot() {
-  $("symbolSelect").innerHTML = SYMBOLS.map(([v, n]) => `<option value="${v}" ${v === settings.symbol ? "selected" : ""}>${esc(n)}</option>`).join("");
+  renderMarkets();
   fillSettingsForm();
   renderMultipliers();
   renderTimeframe();
@@ -1150,5 +1389,5 @@ async function boot() {
   else if (!$("loginBtn").disabled) connectPublic();
 }
 
-if (isLocal) window.tbot = { st, settings, handleSignal, evaluate, plans, chartFeed, series };   // test hook
+if (isLocal) window.tbot = { st, settings, handleSignal, evaluate, plans, chartFeed, series, loadMarkets };   // test hook
 boot();

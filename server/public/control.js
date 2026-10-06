@@ -138,8 +138,11 @@ function stateOf(s) {
   return { key: "running", label: "Running" };
 }
 
+const TF_WORD = { 60: "1-minute", 900: "15-minute", 3600: "1-hour" };
+const stratName = (s) => (s.strategy === "ai" ? (s.fast ? "AI model · Fast" : "AI model") : s.strategy === "ict" ? "ICT" : "Rules");
+
 function detailText(s) {
-  const strat = s.strategy === "ai" ? (s.fast ? "the AI model in fast mode" : "the AI model") : "the rules strategy";
+  const strat = s.strategy === "ai" ? (s.fast ? "the AI model in fast mode" : "the AI model") : s.strategy === "ict" ? "the ICT strategy" : "the rules strategy";
   if (s.needsToken) return "Deriv did not accept the token, so the bot stopped. Add a new token under Deriv connection.";
   if (!s.running) {
     if (s.mode === "auto" && !s.hasToken) return "Add your Deriv token in Settings, then press Start.";
@@ -147,9 +150,12 @@ function detailText(s) {
                              : `Press Start to watch ${s.symbolName} for signals. Nothing will be traded.`;
   }
   if (s.fastBlocked && s.mode === "auto") return "Fast mode is demo only, so the bot places no trades on this REAL account. Switch to a demo account or turn fast mode off.";
+  if (s.ictBlocked) return "ICT is demo only for auto trade, so the bot places no trades on this REAL account. Switch to a demo account or use Signals only.";
   if (s.halted) return `The daily loss limit was hit (${s.haltReason}). The bot carries on tomorrow (UTC). Press Stop to stop it fully.`;
   let t = s.mode === "auto" ? `Auto trading ${s.symbolName} with ${strat}.` : `Watching ${s.symbolName} for signals with ${strat}. Nothing is traded.`;
   if (s.resumedAt && Date.now() - s.resumedAt < 12 * 3600e3) t += ` It carried on by itself after a server restart at ${when(s.resumedAt)}.`;
+  if (s.marketOpen === false) t += ` ${s.symbolName} is closed now, so nothing is traded until it opens.`;
+  else if (s.pending) t += " A setup has formed: waiting for price to come back to the entry zone.";
   if (s.connection !== "online") t += " Reconnecting to Deriv.";
   else if (s.syncing && s.mode === "auto") t += " Checking your open trades.";
   else if (s.blockReason) t += ` Waiting: ${s.blockReason}.`;
@@ -240,18 +246,27 @@ function renderSignal(s) {
   const box = $("signalBox");
   const sig = s.lastSignal;
   if (!sig) {
-    box.replaceChildren(el("p", "empty", s.running ? "No signal yet. The bot checks after every 1-minute candle." : "No signal yet."));
+    box.replaceChildren(el("p", "empty", s.running ? `No signal yet. The bot checks after every ${TF_WORD[s.botTf] || "1-minute"} candle.` : "No signal yet."));
   } else {
     const wrap = el("div", "signal");
     wrap.append(el("span", `tag ${sig.action}`, sig.action),
-                el("span", "title", `${sig.symbol} at ${px(sig.entry)}${sig.traded ? " · traded" : " · signal only"}`),
+                el("span", "title", `${sig.symbol} at ${px(sig.entry)}${sig.traded ? " · traded" : " · signal only"}${sig.fromPending ? " · price reached the zone" : ""}`),
                 el("span", "sub", `Stop loss ${px(sig.sl)} · take profit ${px(sig.tp)} · ${sig.sizeText}`),
                 el("span", "sub", `${sig.reason} · ${when(sig.at)}`));
     box.replaceChildren(wrap);
   }
   $("priceText").textContent = Number.isFinite(s.lastPrice) ? `Price ${px(s.lastPrice)}` : "";
   $("seesText").textContent = s.lastEval?.sees || (s.connection === "online" ? "Loading price history" : "Waiting for prices");
-  $("seesTime").textContent = s.lastEval ? `Checked at ${when(s.lastEval.at)} · ${s.strategy === "ai" ? "AI model" : "rules"}` : "";
+  $("seesTime").textContent = s.lastEval ? `Checked at ${when(s.lastEval.at)} · ${stratName(s)} · ${TF_WORD[s.botTf] || "1-minute"} candles` : "";
+  // the waiting plan, as text
+  const p = s.pending;
+  $("pendingBox").hidden = !p;
+  if (p) {
+    $("pendingSide").textContent = p.side;
+    $("pendingSide").className = `tag ${p.side}`;
+    $("pendingText").textContent = p.text;
+    $("pendingWhy").textContent = p.reason;
+  }
   const c = s.lastCost;
   $("costText").hidden = !c;
   if (c) $("costText").textContent = `Last commission: ${money(c.commission, c.currency)} (${(c.r * 100).toFixed(1)}% of the risk). This cost is why results lean negative.`;
@@ -266,7 +281,7 @@ function renderSettings(s) {
   $("sumDeriv").textContent = s.needsToken ? "Token not accepted" : s.hasToken ? "Connected" : "Not connected";
   $("sumAccount").textContent = s.account ? `${s.account.type === "real" ? "REAL" : "Demo"} · ${s.account.id}` : "None";
   $("sumMode").textContent = set.mode === "auto" ? "Auto trade" : "Signals only";
-  $("sumMarket").textContent = `${s.symbolName} · ${set.strategy === "ai" ? (s.fast ? "AI model · Fast" : "AI model") : "Rules"}`;
+  $("sumMarket").textContent = `${s.symbolName} · ${stratName(s)}${s.botTf && s.botTf !== 60 ? ` · ${{ 900: "15m", 3600: "1h" }[s.botTf]}` : ""}`;
   $("sumRisk").textContent = `${set.riskPct}% per trade · ${set.maxDailyLossPct}% a day`;
   $("sumReal").textContent = set.allowReal ? "On" : "Off";
   $("sumVersion").textContent = s.version?.commit ? s.version.commit.slice(0, 7) : "";
@@ -312,16 +327,37 @@ function renderSettings(s) {
 
   // market and strategy
   const sel = $("symbolSelect");
-  if (!sel.options.length && s.symbols) for (const [v, n] of s.symbols) sel.append(new Option(n, v));
+  // Deriv's market list, grouped (Synthetic indices, Forex, Commodities, Crypto...), closed ones marked
+  const groups = s.marketGroups || [{ name: "Synthetic indices", items: (s.symbols || []).map(([symbol, name]) => ({ symbol, name, open: true })) }];
+  const gsig = JSON.stringify(groups);
+  if (sel.dataset.sig !== gsig && !ui.dirty.has("marketForm")) {
+    sel.dataset.sig = gsig;
+    sel.replaceChildren(...groups.map((g) => {
+      const og = document.createElement("optgroup");
+      og.label = g.name;
+      for (const m of g.items) og.append(new Option(m.open ? m.name : `${m.name} (closed)`, m.symbol));
+      return og;
+    }));
+  }
+  $("marketClosed").hidden = s.marketOpen !== false && !s.noMultipliers;
+  $("marketClosed").textContent = s.noMultipliers ? "No Multipliers on this market. The bot trades nothing here." : "Market closed. The bot doesn't trade until it opens.";
+  const real = !!s.account && s.account.type !== "demo";
+  $("ictRealTag").hidden = !real;
   if (!ui.dirty.has("marketForm")) {
     sel.value = set.symbol;
     for (const r of document.querySelectorAll('input[name="strategy"]')) r.checked = r.value === set.strategy;
+    for (const r of document.querySelectorAll('input[name="botTf"]')) r.checked = Number(r.value) === s.botTf;
+    marketHints();
     const f = $("marketForm").elements;
     f.aiThreshold.value = Math.round(set.aiThreshold * 100);
     f.aiBarrier.value = set.aiBarrier;
     f.aiHorizon.value = set.aiHorizon;
     $("aiFields").hidden = set.strategy !== "ai";
   }
+  $("ictNote").hidden = !(set.strategy === "ict" && real);
+  if (!$("ictNote").hidden) $("ictNote").textContent = set.mode === "auto"
+    ? "ICT is demo only for auto trade. The bot never trades with it on a real money account. Signals only still works."
+    : "ICT is demo only for auto trade. Signals still show on this account.";
   const aiRadio = document.querySelector('input[name="strategy"][value="ai"]');
   aiRadio.disabled = !s.modelLoaded;
   renderFast(s);
@@ -512,15 +548,26 @@ $("fastInput").addEventListener("change", async (ev) => {
   } finally { ui.fastSaving = false; }
 });
 
-for (const r of document.querySelectorAll('input[name="strategy"]'))
-  r.addEventListener("change", () => { $("aiFields").hidden = r.value !== "ai" || !r.checked; });
+/** What the form shows now: ICT hint, AI on bigger candles, and 1h for real markets. */
+function marketHints() {
+  const f = $("marketForm").elements, s = ui.status;
+  const strategy = f.strategy.value, tf = Number(f.botTf.value) || 60;
+  $("aiFields").hidden = strategy !== "ai";
+  $("ictBox").hidden = strategy !== "ict";
+  $("aiTfNote").hidden = !(strategy === "ai" && tf !== 60);
+  const synthetic = (s?.marketGroups || []).find((g) => g.items.some((m) => m.symbol === f.symbol.value))?.name === "Synthetic indices"
+    || !s?.marketGroups;
+  $("tfSuggest").hidden = synthetic || tf === 3600;
+}
+$("marketForm").addEventListener("change", marketHints);
 
 $("marketForm").addEventListener("submit", (ev) => {
   ev.preventDefault();
   const f = ev.target.elements, s = ui.status;
-  const partial = { symbol: f.symbol.value, strategy: f.strategy.value,
+  const partial = { symbol: f.symbol.value, strategy: f.strategy.value, botTf: Number(f.botTf.value) || 60,
                     aiThreshold: Number(f.aiThreshold.value) / 100, aiBarrier: Number(f.aiBarrier.value), aiHorizon: Number(f.aiHorizon.value) };
-  if (s?.running && partial.symbol !== s.settings.symbol && !confirm("Changing the market stops the bot. Continue?")) return;
+  if (s?.running && (partial.symbol !== s.settings.symbol || partial.botTf !== s.botTf) &&
+      !confirm(`Changing the ${partial.symbol !== s.settings.symbol ? "market" : "timeframe"} stops the bot. Continue?`)) return;
   busy(ev.submitter || f[f.length - 1], async () => {
     const r = await saveSettings(partial, "marketMsg");
     if (r.ok) { ui.dirty.delete("marketForm"); renderSettings(r.data.status); }

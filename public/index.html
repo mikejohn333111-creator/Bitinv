@@ -45,6 +45,7 @@
       </label>
       <div class="price" id="lastPrice" aria-label="Last price">–</div>
     </div>
+    <p class="market-closed" id="marketClosed" role="status" hidden>Market closed. The bot doesn't trade until it opens.</p>
     <div class="market-meta">
       <span class="market-sub"><span id="tfName">1-minute</span> chart by <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">TradingView</a></span>
       <span class="conn"><span class="dot" id="connDot"></span><span id="connText">connecting…</span></span>
@@ -99,10 +100,13 @@
   <section class="panel" aria-labelledby="setupTitle">
     <h2 id="setupTitle" class="panel-title">Bot setup</h2>
     <div class="seg-label" id="stratLabel">Strategy</div>
-    <div class="seg" role="group" aria-labelledby="stratLabel">
+    <div class="seg seg-3" role="group" aria-labelledby="stratLabel">
       <button type="button" data-strategy="rules" aria-pressed="true"><span class="seg-t">Rules</span><span class="seg-s">Trend and range rules</span></button>
       <button type="button" data-strategy="ai" aria-pressed="false"><span class="seg-t">AI model</span><span class="seg-s">Trained on past prices</span></button>
+      <button type="button" data-strategy="ict" aria-pressed="false" aria-describedby="ictHint"><span class="seg-t">ICT</span><span class="seg-s">Sweep, break, gap</span><span class="acct-badge real ict-tag" id="ictRealTag" hidden>Demo only</span></button>
     </div>
+    <p class="strat-hint" id="ictHint" hidden>Waits for a liquidity sweep, a break in structure and a return to the fair value gap. In our tests it did not make money after fees.</p>
+    <p class="fast-note is-real strat-note" id="ictNote" hidden></p>
     <div class="fast-row" id="fastRow" hidden>
       <label class="fast-switch" for="fastSwitch">
         <span class="set-text">
@@ -113,12 +117,26 @@
       </label>
       <p class="fast-note" id="fastNote" hidden></p>
     </div>
+    <div class="seg-label" id="botTfLabel">Bot trades on</div>
+    <div class="tf-bar bot-tf" id="botTfSeg" role="group" aria-labelledby="botTfLabel">
+      <button type="button" data-bottf="60" aria-pressed="true">1m</button>
+      <button type="button" data-bottf="900" aria-pressed="false">15m</button>
+      <button type="button" data-bottf="3600" aria-pressed="false">1h</button>
+    </div>
+    <p class="strat-hint" id="tfSuggest" hidden>Costs are a smaller share of each trade on bigger charts. <button type="button" class="link-btn" id="tfSuggestBtn">Use 1h</button></p>
+    <p class="strat-hint is-warn" id="botTfNote" hidden></p>
     <div class="seg-label" id="modeLabel">What the bot does</div>
     <div class="seg seg-mode" id="modeSeg" role="group" aria-labelledby="modeLabel">
       <button type="button" data-mode="signals" aria-pressed="true"><span class="seg-t">Signals only</span><span class="seg-s">Alerts only, no trades</span></button>
       <button type="button" data-mode="auto" aria-pressed="false"><span class="seg-t">Auto trade</span><span class="seg-s">Opens trades for you</span></button>
     </div>
     <p class="mode-note" id="modeNote"></p>
+
+    <div class="pending-box" id="pendingBox" role="status" hidden>
+      <div class="pending-head"><span class="side-badge buy" id="pendingSide">Buy</span><b>Waiting for price</b></div>
+      <p id="pendingText"></p>
+      <p class="muted small" id="pendingWhy"></p>
+    </div>
 
     <dl class="stats">
       <div class="stat stat-market"><dt id="infoLabel">Market now</dt><dd><span class="mk-head" id="infoText">–</span><span class="mk-plain" id="infoPlain"></span><span class="stat-sub" id="infoSub"></span></dd></div>

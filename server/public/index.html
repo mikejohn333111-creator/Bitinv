@@ -104,6 +104,11 @@
     <section class="card" aria-labelledby="signalTitle">
       <div class="card-head"><h2 id="signalTitle">Latest signal</h2><span class="muted small" id="priceText"></span></div>
       <div id="signalBox"><p class="empty">No signal yet.</p></div>
+      <div class="pending" id="pendingBox" hidden>
+        <h3><span class="tag" id="pendingSide">BUY</span> Waiting for price</h3>
+        <p id="pendingText"></p>
+        <p class="muted small" id="pendingWhy"></p>
+      </div>
       <div class="sees">
         <h3>What the strategy sees</h3>
         <p id="seesText" class="sees-text">–</p>
@@ -179,14 +184,31 @@
         <div class="set-body">
           <form id="marketForm" novalidate>
             <label class="field"><span>Market</span><select name="symbol" id="symbolSelect"></select></label>
-            <p class="hint">Changing the market stops the bot. Press Start again after.</p>
+            <p class="msg warn-text" id="marketClosed" role="status" hidden>Market closed. The bot doesn't trade until it opens.</p>
+            <p class="hint">Changing the market or the timeframe stops the bot. Press Start again after.</p>
             <div class="field">
               <span id="strategyLabel">Strategy</span>
-              <fieldset class="seg" id="strategySeg" aria-labelledby="strategyLabel">
+              <fieldset class="seg seg-3" id="strategySeg" aria-labelledby="strategyLabel">
                 <label><input type="radio" name="strategy" value="rules"><span>Rules</span></label>
                 <label><input type="radio" name="strategy" value="ai"><span>AI model</span></label>
+                <label><input type="radio" name="strategy" value="ict" aria-describedby="ictHint"><span>ICT</span></label>
               </fieldset>
             </div>
+            <div id="ictBox" hidden>
+              <p class="hint" id="ictHint">Waits for a liquidity sweep, a break in structure and a return to the fair value gap. In our tests it did not make money after fees.
+                <span class="badge real" id="ictRealTag" hidden>Demo only</span></p>
+              <p class="fast-note real" id="ictNote" hidden></p>
+            </div>
+            <div class="field">
+              <span id="botTfLabel">Bot trades on</span>
+              <fieldset class="seg seg-3" id="botTfSeg" aria-labelledby="botTfLabel">
+                <label><input type="radio" name="botTf" value="60"><span>1m</span></label>
+                <label><input type="radio" name="botTf" value="900"><span>15m</span></label>
+                <label><input type="radio" name="botTf" value="3600"><span>1h</span></label>
+              </fieldset>
+            </div>
+            <p class="hint" id="tfSuggest" hidden>Costs are a smaller share of each trade on bigger charts. 1h is suggested for this market.</p>
+            <p class="hint warn-text" id="aiTfNote" hidden>The AI model was trained on 1-minute data. On 15m and 1h it is untested.</p>
             <div id="aiFields" hidden>
               <label class="field"><span>AI confidence needed (%)</span><input name="aiThreshold" type="number" inputmode="decimal" min="34" max="95" step="1"></label>
               <label class="field"><span>Stop distance (times the average range)</span><input name="aiBarrier" type="number" inputmode="decimal" min="0.5" max="10" step="0.5"></label>

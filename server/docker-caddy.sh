@@ -526,6 +526,10 @@ need_bot() {
   [[ -f $ENV_FILE ]] || die "The bot is not installed yet. Run the Tbot setup first: curl -fsSL $SITE_URL/setup.sh -o tbot-setup.sh && sudo bash tbot-setup.sh"
   PORT=$(env_get TBOT_PORT)
   [[ $PORT =~ ^[0-9]{2,5}$ ]] || die "Could not read the bot's port (TBOT_PORT) from /etc/tbot.env. Run the Tbot setup again first."
+  local main=$R/opt/tbot/app/server/main.mjs
+  if [[ -f $main ]] && ! grep -q TBOT_EXTRA_HOST "$main"; then
+    die "The bot on this server is an older version. Update it first by running the setup line again: curl -fsSL $SITE_URL/setup.sh -o tbot-setup.sh && sudo bash tbot-setup.sh"
+  fi
 }
 
 caddyfile_missing() {

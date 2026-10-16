@@ -1073,3 +1073,21 @@ test("markets: when Deriv refuses the Multipliers filter, the plain list is used
     assert.deepEqual(names, ["R_75", "frxEURUSD", "frxXAUUSD"]);
   } finally { ctx.cleanup(); }
 });
+
+test("ICT settings follow the market and timeframe: 4h trend filter on 1-hour real markets, none on synthetics", async () => {
+  const ctx = await ready(setup({ settings: { strategy: "ict", botTf: 3600 }, over: { active_symbols: () => ({ active_symbols: ACTIVE_SYMBOLS }) } }));
+  const { engine } = ctx;
+  try {
+    assert.equal(engine.tf(), 3600);
+    assert.equal(engine.strategyParams().htfBias, "off", "R_75 is a random number generator");
+    assert.equal(engine.strategyParams().barMinutes, 60);
+    engine.updateSettings({ symbol: "frxEURUSD" });
+    await flush();
+    assert.equal(engine.strategyParams().htfBias, "ema");
+    assert.equal(engine.strategyParams().htfMinutes, 240);
+    engine.updateSettings({ botTf: 900 });
+    await flush();
+    assert.equal(engine.strategyParams().killZone, true);
+    assert.equal(engine.strategyParams().htfBias, "off");
+  } finally { ctx.cleanup(); }
+});

@@ -1,8 +1,176 @@
-# Strategy backtests: ICT, Rules and AI (6 October 2026)
+# Strategy backtests: ICT, Rules and AI (6 October 2026, updated 16 October 2026)
 
 Short version: none of the three strategies makes money after realistic costs in an out-of-sample test. The new ICT strategy behaves like a coin flip on simulated Volatility 75 (as anything must on a random walk), and on real EURUSD it loses after costs on M1 and M15. One row (ICT on H1) is slightly positive, but with 75 trades in two years its uncertainty is about five times the result, so it is not evidence of an edge.
 
 All numbers are in R: 1R is the amount risked on a trade, so a stop loss costs -1R and +0.05R means winning 5% of the risk per trade on average. "±" is the 95% confidence interval of the average. If the interval includes zero, the result cannot be told apart from luck.
+
+## Update, 16 October 2026: a "smarter" ICT, and an SMC test
+
+**Short version.** Four ICT upgrades and an SMC-style order block entry were tested on real EURUSD with the same honest method as below, plus four extra years (2018 to 2021) as a second out-of-sample check. Two small upgrades did no harm out of sample and are now on for real markets only: the **4-hour trend filter on 1-hour candles** and **kill zones on 15-minute candles**. Premium/discount, OTE, the daily trend, and 4-hour structure as the trend all tested worse, so they stay off. Nothing here shows a proven edge. Every interval still includes zero, and on H1 the bot now trades about once every 20 days. SMC order blocks lost money on M15. On H1 they looked better, but the uncertainty is too large to tell, so SMC is **not** added as a strategy (see below).
+
+### What was tested
+
+All on top of the ICT rules described in the next section. The higher timeframe is built from the same bars, using closed higher-timeframe candles only (no lookahead; unit-tested).
+
+1. **Higher-timeframe bias.** Only buy when the higher timeframe trends up, only sell when it trends down. Three standard definitions were tested:
+   - **4h EMA**: the last closed 4-hour candle is above its 50-EMA, and the EMA is higher than 3 candles ago.
+   - **Daily EMA**: the same with daily candles and a 20-EMA.
+   - **4h structure**: the last close beyond a 4-hour swing high or low (a fractal of 2) decides the trend.
+2. **Premium/discount.** A buy only enters in the lower half (the "discount" half) of the dealing range, which runs from the swept low to the highest high since; sells are the mirror. The **OTE** variant only enters 62% to 79% of the way back.
+3. **Kill zones**: London 07:00 to 10:00 and New York 12:00 to 15:00 UTC (the existing option).
+4. **Timeframe settings**: 3R and 60 bars (T, the earlier H1 pick) against the defaults of 2R and 30 bars (D).
+5. **SMC order block** (`entryZone: "ob"`). The setup is unchanged: a sweep, then displacement that breaks structure. The entry is different: the first return to the last opposite-colour candle before the displacement (the order block, its full high-to-low range), with the stop beyond the block. No fair value gap is needed. It was tested alone and with the filters above, which together are the standard SMC model.
+
+That makes 23 candidates on each of M15 and H1, with all rows shown below.
+
+**Method.** The same as before: EURUSD M1 bid prices from HistData, resampled to M15 and H1, with a 0.8 pip round-trip cost charged as cost / stop distance. One trade at a time. Every candidate starts on the same bar (the longest warm-up, about 5 weeks). The rule, fixed before any test numbers were seen: on 2022 to 2023, pick the candidate with the best average after costs and at least 30 trades, then run it once on 2024 to 2025. All candidates were then also run on 2024 to 2025 and on 2018 to 2021 as an ablation, so that each upgrade can be judged against its base. **Caveat:** the defaults chosen below were set after seeing those out-of-sample rows, so no clean holdout period is left. Treat the results as "not worse", not as validation.
+
+### Picks made on 2022 to 2023 only, then tested once
+
+| Strategy | Bars | Picked on train | Train (after 0.8 pip) | Test 2024-25 (after 0.8 pip) | Extra 2018-21 (after 0.8 pip) |
+|---|---|---|---|---|---|
+| ICT | H1 | 3R, 60 bars | +0.05 ± 0.37 (70) | +0.08 ± 0.34 (74) | −0.08 ± 0.24 (125) |
+| ICT | M15 | defaults + 4h EMA trend | +0.26 ± 0.25 (105) | −0.05 ± 0.21 (117) | −0.09 ± 0.14 (279) |
+| SMC | H1 | order block, 3R, 60 bars | +0.26 ± 0.46 (63) | +0.27 ± 0.48 (58) | −0.11 ± 0.26 (149) |
+| SMC | M15 | order block, 3R, 60, 4h trend, discount | +0.09 ± 0.52 (49) | −0.13 ± 0.48 (48) | −0.22 ± 0.30 (114) |
+
+Average R per trade, ± 95% interval, with the number of trades in brackets. As before, the picks made on the training years fall back toward zero or below on the years they were not picked on.
+
+### ICT before and after (what the bot now does on real markets)
+
+| Variant | Period | Trades | Per day | Win rate | Avg R before costs | After 0.8 pip | Total R after 0.8 pip |
+|---|---|---|---|---|---|---|---|
+| ICT H1 before (defaults) | train 2022-23 | 74 | 0.102 | 43% | +0.02 | −0.00 ± 0.27 | −0.2 |
+| ICT H1 before (defaults) | test 2024-25 | 79 | 0.108 | 47% | +0.19 | +0.17 ± 0.26 | +13.2 |
+| ICT H1 before (defaults) | extra 2018-21 | 134 | 0.092 | 43% | −0.06 | −0.09 ± 0.18 | −11.4 |
+| ICT H1 pick on train (3R, 60 bars) | train 2022-23 | 70 | 0.096 | 33% | +0.07 | +0.05 ± 0.37 | +3.4 |
+| ICT H1 pick on train (3R, 60 bars) | test 2024-25 | 74 | 0.101 | 36% | +0.10 | +0.08 ± 0.34 | +5.7 |
+| ICT H1 pick on train (3R, 60 bars) | extra 2018-21 | 125 | 0.086 | 34% | −0.06 | −0.08 ± 0.24 | −10.5 |
+| ICT H1 new (4h trend) | train 2022-23 | 34 | 0.047 | 47% | +0.04 | +0.02 ± 0.38 | +0.5 |
+| ICT H1 new (4h trend) | test 2024-25 | 46 | 0.063 | 43% | +0.23 | +0.20 ± 0.35 | +9.4 |
+| ICT H1 new (4h trend) | extra 2018-21 | 72 | 0.049 | 46% | +0.09 | +0.06 ± 0.25 | +4.4 |
+| ICT M15 before (defaults) | train 2022-23 | 232 | 0.320 | 47% | +0.20 | +0.15 ± 0.17 | +35.4 |
+| ICT M15 before (defaults) | test 2024-25 | 254 | 0.348 | 37% | −0.06 | −0.12 ± 0.14 | −31.2 |
+| ICT M15 before (defaults) | extra 2018-21 | 545 | 0.373 | 42% | +0.02 | −0.04 ± 0.10 | −21.0 |
+| ICT M15 pick on train (4h trend) | train 2022-23 | 105 | 0.145 | 51% | +0.31 | +0.26 ± 0.25 | +27.2 |
+| ICT M15 pick on train (4h trend) | test 2024-25 | 117 | 0.160 | 41% | +0.02 | −0.05 ± 0.21 | −5.7 |
+| ICT M15 pick on train (4h trend) | extra 2018-21 | 279 | 0.191 | 41% | −0.02 | −0.09 ± 0.14 | −25.0 |
+| ICT M15 new (kill zones) | train 2022-23 | 100 | 0.138 | 45% | +0.17 | +0.13 ± 0.26 | +12.6 |
+| ICT M15 new (kill zones) | test 2024-25 | 103 | 0.141 | 40% | −0.03 | −0.09 ± 0.24 | −8.8 |
+| ICT M15 new (kill zones) | extra 2018-21 | 223 | 0.153 | 42% | +0.07 | +0.01 ± 0.17 | +2.8 |
+
+"Before" is the old default (2R, 30 bars, no filters). "New" is what `ictParamsFor` now gives a real market: on H1, the defaults plus the 4h EMA trend; on M15, the defaults plus kill zones. Win rate is before costs. Per day counts calendar days.
+
+What it means:
+
+- **H1, 4h trend (on).** It was better than without the filter in both out-of-sample periods: +0.20 against +0.17 on 2024-25, and +0.06 against −0.09 on 2018-21. Over all eight years it averaged +0.09 ± 0.18R on 152 trades, against +0.01 ± 0.13R on 287 trades without the filter. The difference is far smaller than the noise. The filter is kept because it is a faithful ICT idea, it did no harm out of sample, and it halves the number of trades, and with them the costs. With it the bot takes about 19 trades a year on H1.
+- **M15, kill zones (on).** Out of sample it did better than the defaults in both periods: −0.09 against −0.12, and +0.01 against −0.04. With 3R and 60 bars it also did better: +0.05 against −0.06, and +0.06 against −0.04. Over eight years: +0.02 ± 0.12R (426 trades) against −0.02 ± 0.07R (1,031 trades). This is still roughly zero, with fewer trades.
+- **H1, kill zones (off).** On H1 they were worse in training and on 2024-25. With 3R and 60 bars they were also worse on 2018-21.
+- **M15, 4h trend (off).** It was the training pick, but it lost money in both out-of-sample periods (−0.05 and −0.09). It did better than no filter on 2024-25 and worse on 2018-21.
+- **Daily EMA and 4h structure as the trend (off).** The daily EMA did worse than no filter on both timeframes. The 4h structure did worse than no filter on H1 and was mixed on M15.
+- **Premium/discount and OTE (off).** On H1 they leave only 7 to 29 trades per period, so they cannot be judged, and they were negative on 2018-21. On M15 discount lost −0.41 and −0.31 on 2024-25. OTE almost never triggers, because the gap usually sits in the upper part of the leg.
+- **3R and 60 bars on H1 (off).** No better than 2R and 30 bars out of sample (+0.08 against +0.17 on 2024-25, and the same −0.08 on 2018-21). The defaults stay.
+- **Synthetic indices.** None of these filters is used on Deriv's synthetic indices. Those are a random number generator around the clock, with no sessions and no higher-timeframe trend that means anything. There, ICT behaves exactly as before.
+
+### SMC (order block entries)
+
+| Variant | Period | Trades | Per day | Win rate | Avg R before costs | After 0.8 pip | Total R after 0.8 pip |
+|---|---|---|---|---|---|---|---|
+| SMC H1 pick on train (3R, 60 bars) | train 2022-23 | 63 | 0.087 | 35% | +0.31 | +0.26 ± 0.46 | +16.3 |
+| SMC H1 pick on train (3R, 60 bars) | test 2024-25 | 58 | 0.079 | 34% | +0.32 | +0.27 ± 0.48 | +15.3 |
+| SMC H1 pick on train (3R, 60 bars) | extra 2018-21 | 149 | 0.102 | 26% | −0.06 | −0.11 ± 0.26 | −17.0 |
+| SMC H1 + 4h trend (3R, 60) | train 2022-23 | 27 | 0.037 | 41% | +0.63 | +0.58 ± 0.76 | +15.6 |
+| SMC H1 + 4h trend (3R, 60) | test 2024-25 | 37 | 0.051 | 32% | +0.32 | +0.27 ± 0.61 | +9.9 |
+| SMC H1 + 4h trend (3R, 60) | extra 2018-21 | 66 | 0.045 | 32% | +0.18 | +0.12 ± 0.43 | +7.6 |
+| SMC H1 + 4h trend (2R, 30) | train 2022-23 | 27 | 0.037 | 48% | +0.41 | +0.36 ± 0.57 | +9.8 |
+| SMC H1 + 4h trend (2R, 30) | test 2024-25 | 37 | 0.051 | 32% | −0.03 | −0.09 ± 0.45 | −3.1 |
+| SMC H1 + 4h trend (2R, 30) | extra 2018-21 | 68 | 0.047 | 49% | +0.44 | +0.38 ± 0.35 | +25.6 |
+| SMC M15 pick on train (3R, 60, 4h trend, discount) | train 2022-23 | 49 | 0.067 | 31% | +0.22 | +0.09 ± 0.52 | +4.4 |
+| SMC M15 pick on train (3R, 60, 4h trend, discount) | test 2024-25 | 48 | 0.066 | 29% | +0.03 | −0.13 ± 0.48 | −6.3 |
+| SMC M15 pick on train (3R, 60, 4h trend, discount) | extra 2018-21 | 114 | 0.078 | 26% | −0.06 | −0.22 ± 0.30 | −25.0 |
+| SMC M15 plain (2R, 30) | train 2022-23 | 209 | 0.288 | 36% | +0.02 | −0.08 ± 0.19 | −17.3 |
+| SMC M15 plain (2R, 30) | test 2024-25 | 199 | 0.273 | 32% | −0.12 | −0.26 ± 0.18 | −52.5 |
+| SMC M15 plain (2R, 30) | extra 2018-21 | 476 | 0.326 | 40% | +0.14 | −0.00 ± 0.13 | −0.5 |
+
+**Verdict: it does not hold up well enough to add as a strategy.**
+
+- On M15, every SMC row lost after costs over the eight years (−0.08 to −0.16R per trade), worse than ICT's fair value gap entry. The order block is a deeper entry with a wider stop, so it fills more often on moves that then fail.
+- On H1, SMC with the 4h trend was the best-looking row in the whole study: positive in all three periods, at +0.26 ± 0.32R per trade over eight years on 130 trades. But it was not the pre-registered pick (it had only 27 training trades, below the 30-trade minimum), every interval includes zero, and it is the best of 46 rows. That is exactly what picking a winner from noise looks like. The same model with 2R and 30 bars lost on 2024-25.
+- Recommendation: do not add SMC as a fourth strategy now. If the user still wants it, add it as **signals only (no auto trade), on H1 only, with the 4h trend filter**, and judge it on a few months of forward signals before trusting it. The order block entry is already in the code as an ICT option (`entryZone: "ob"`, off by default; it reads "entering the bullish order block ..." and drives the "Waiting for price" zone), so wiring it up later is a small change.
+
+### All candidates
+
+
+**H1** (avg R per trade after the 0.8 pip cost, ± 95%; trades in brackets)
+
+| # | Candidate | Train 2022-23 | Test 2024-25 | Extra 2018-21 |
+|---|---|---|---|---|
+| 0 | D defaults 2R/30 | −0.00 ± 0.27 (74) | +0.17 ± 0.26 (79) | −0.09 ± 0.18 (134) |
+| 1 | T 3R/60 | +0.05 ± 0.37 (70) | +0.08 ± 0.34 (74) | −0.08 ± 0.24 (125) |
+| 2 | T + H4 EMA bias | −0.02 ± 0.49 (34) | +0.09 ± 0.45 (44) | +0.05 ± 0.34 (68) |
+| 3 | T + D1 EMA bias | +0.10 ± 0.57 (27) | −0.13 ± 0.46 (38) | −0.14 ± 0.33 (62) |
+| 4 | T + H4 structure bias | −0.05 ± 0.49 (37) | +0.01 ± 0.44 (44) | −0.13 ± 0.29 (81) |
+| 5 | T + discount | +0.07 ± 0.70 (21) | +0.66 ± 1.58 (7) | −0.41 ± 0.52 (29) |
+| 6 | T + OTE | −0.03 ± 1.28 (8) | +1.60 ± 2.60 (3) | −1.07 ± 0.02 (4) |
+| 7 | T + kill zone | −0.22 ± 0.55 (30) | +0.07 ± 0.70 (21) | −0.25 ± 0.46 (37) |
+| 8 | D + H4 EMA bias | +0.02 ± 0.38 (34) | +0.20 ± 0.35 (46) | +0.06 ± 0.25 (72) |
+| 9 | D + discount | −0.22 ± 0.49 (22) | +0.23 ± 1.19 (7) | −0.23 ± 0.44 (29) |
+| 10 | D + kill zone | −0.16 ± 0.45 (30) | −0.00 ± 0.54 (21) | +0.00 ± 0.39 (38) |
+| 11 | T + H4 EMA + discount | −0.18 ± 0.90 (10) | +0.29 ± 2.64 (3) | −0.16 ± 0.80 (16) |
+| 12 | T + H4 EMA + kill zone | +0.40 ± 1.04 (14) | −0.04 ± 1.02 (10) | −0.18 ± 0.63 (21) |
+| 13 | T + H4 EMA + discount + KZ | −0.36 ± 1.30 (6) | −1.05 ± – (1) | −0.02 ± 1.35 (6) |
+| 14 | T + H4 structure + discount | +0.24 ± 1.27 (8) | +0.96 ± 2.28 (4) | −0.44 ± 0.64 (20) |
+| 15 | T + D1 EMA + discount | −0.32 ± 0.95 (9) | −0.04 ± 1.98 (4) | −0.37 ± 0.74 (15) |
+| 16 | SMC OB 2R/30 | +0.06 ± 0.35 (64) | −0.08 ± 0.35 (58) | +0.03 ± 0.22 (153) |
+| 17 | SMC OB 3R/60 | +0.26 ± 0.46 (63) | +0.27 ± 0.48 (58) | −0.11 ± 0.26 (149) |
+| 18 | SMC OB T + H4 EMA | +0.58 ± 0.76 (27) | +0.27 ± 0.61 (37) | +0.12 ± 0.43 (66) |
+| 19 | SMC OB T + discount | +0.11 ± 0.59 (38) | +0.37 ± 0.72 (28) | −0.07 ± 0.41 (67) |
+| 20 | SMC OB T + H4 EMA + discount | +0.35 ± 0.94 (17) | +0.50 ± 0.93 (18) | +0.09 ± 0.65 (30) |
+| 21 | SMC OB D + H4 EMA | +0.36 ± 0.57 (27) | −0.09 ± 0.45 (37) | +0.38 ± 0.35 (68) |
+| 22 | SMC OB D + H4 EMA + discount | −0.05 ± 0.68 (17) | +0.11 ± 0.70 (18) | +0.41 ± 0.54 (30) |
+
+**M15** (avg R per trade after the 0.8 pip cost, ± 95%; trades in brackets)
+
+| # | Candidate | Train 2022-23 | Test 2024-25 | Extra 2018-21 |
+|---|---|---|---|---|
+| 0 | D defaults 2R/30 | +0.15 ± 0.17 (232) | −0.12 ± 0.14 (254) | −0.04 ± 0.10 (545) |
+| 1 | T 3R/60 | +0.14 ± 0.21 (219) | −0.06 ± 0.18 (245) | −0.04 ± 0.12 (514) |
+| 2 | T + H4 EMA bias | +0.23 ± 0.32 (103) | +0.07 ± 0.28 (115) | −0.12 ± 0.17 (268) |
+| 3 | T + D1 EMA bias | +0.22 ± 0.36 (87) | −0.20 ± 0.26 (112) | −0.09 ± 0.18 (241) |
+| 4 | T + H4 structure bias | +0.17 ± 0.30 (112) | +0.01 ± 0.25 (138) | −0.06 ± 0.17 (271) |
+| 5 | T + discount | +0.42 ± 0.57 (39) | −0.41 ± 0.35 (55) | +0.01 ± 0.37 (77) |
+| 6 | T + OTE | +0.06 ± 0.87 (13) | −1.12 ± 0.03 (9) | +0.33 ± 0.81 (20) |
+| 7 | T + kill zone | +0.15 ± 0.32 (100) | +0.05 ± 0.30 (102) | +0.06 ± 0.19 (222) |
+| 8 | D + H4 EMA bias | +0.26 ± 0.25 (105) | −0.05 ± 0.21 (117) | −0.09 ± 0.14 (279) |
+| 9 | D + discount | +0.26 ± 0.45 (39) | −0.31 ± 0.31 (55) | +0.00 ± 0.30 (78) |
+| 10 | D + kill zone | +0.13 ± 0.26 (100) | −0.09 ± 0.24 (103) | +0.01 ± 0.17 (223) |
+| 11 | T + H4 EMA + discount | +0.16 ± 0.85 (17) | −0.11 ± 0.63 (26) | −0.01 ± 0.50 (45) |
+| 12 | T + H4 EMA + kill zone | −0.01 ± 0.45 (47) | +0.29 ± 0.46 (48) | −0.06 ± 0.27 (112) |
+| 13 | T + H4 EMA + discount + KZ | −1.07 ± 0.04 (8) | +0.31 ± 0.93 (16) | +0.18 ± 0.82 (20) |
+| 14 | T + H4 structure + discount | +0.24 ± 0.82 (19) | −0.06 ± 0.54 (32) | +0.16 ± 0.56 (40) |
+| 15 | T + D1 EMA + discount | +0.45 ± 1.09 (13) | −0.50 ± 0.45 (30) | +0.04 ± 0.58 (37) |
+| 16 | SMC OB 2R/30 | −0.08 ± 0.19 (209) | −0.26 ± 0.18 (199) | −0.00 ± 0.13 (476) |
+| 17 | SMC OB 3R/60 | +0.01 ± 0.24 (207) | −0.30 ± 0.22 (194) | −0.05 ± 0.15 (459) |
+| 18 | SMC OB T + H4 EMA | +0.01 ± 0.34 (108) | −0.30 ± 0.33 (84) | −0.07 ± 0.21 (245) |
+| 19 | SMC OB T + discount | +0.06 ± 0.37 (94) | −0.35 ± 0.30 (106) | −0.06 ± 0.23 (217) |
+| 20 | SMC OB T + H4 EMA + discount | +0.09 ± 0.52 (49) | −0.13 ± 0.48 (48) | −0.22 ± 0.30 (114) |
+| 21 | SMC OB D + H4 EMA | −0.11 ± 0.27 (108) | −0.34 ± 0.27 (85) | −0.01 ± 0.17 (253) |
+| 22 | SMC OB D + H4 EMA + discount | −0.22 ± 0.39 (49) | −0.26 ± 0.38 (48) | −0.08 ± 0.25 (115) |
+
+D = defaults (2R target, 30-bar time exit). T = 3R, 60 bars. Rows with fewer than about 30 trades are noise whatever their sign.
+
+### Reproduce
+
+```
+node tools/backtest.mjs --train DAT_ASCII_EURUSD_M1_2022.csv,DAT_ASCII_EURUSD_M1_2023.csv \
+  --test DAT_ASCII_EURUSD_M1_2024.csv,DAT_ASCII_EURUSD_M1_2025.csv --tf 60 --strategy ict --grid upgrades
+```
+
+Use `--tf 15` for M15. For the 2018 to 2021 check, pass those four files as `--test`. The pick is made on `--train`, so it is the same. Training rows print the win rate after costs.
+
+---
+
+## Original report (6 October 2026)
 
 ## The ICT rules (as coded in `evaluateICT`)
 
@@ -14,7 +182,7 @@ The strategy looks only at closed bars. For a buy (sells are the exact mirror):
 4. **Fair value gap.** The up move leaves a 3-bar gap: the low of the third bar is above the high of the first.
 5. **Entry.** The first time a later bar trades back into the gap (and does not close below it), within 15 bars of the structure shift, the bot buys at that bar's close.
 6. **Exits.** Stop below the lowest point of the sweep plus 0.1 x ATR. Target 2R by default (or the nearest swing high, "liquidity" target). Time exit after 30 bars.
-7. **Kill zones** (London 07:00 to 10:00 UTC, New York 12:00 to 15:00 UTC) are optional and off by default. Deriv's synthetic indices are generated by a random number generator around the clock, so they have no sessions and nothing special happens at these hours.
+7. **Kill zones** (London 07:00 to 10:00 UTC, New York 12:00 to 15:00 UTC) are optional and off by default. Deriv's synthetic indices are generated by a random number generator around the clock, so they have no sessions and nothing special happens at these hours. (Since 16 October 2026 they are on for real markets on 15-minute candles, and real markets on 1-hour candles also follow the 4-hour trend: see the update above.)
 
 The reason shown for a trade reads like: "Swept the low at 1.03623, broke structure up above 1.03639, entering the fair value gap (1.03628 to 1.03637); target 2R".
 

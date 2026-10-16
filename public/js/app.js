@@ -1,7 +1,7 @@
 // Tbot web bot: wires the Deriv connection, the strategies, risk limits and the page.
 import { CONFIG } from "./config.js";
-import { evaluateRules, evaluateAI, evaluateICT, ICT_DEFAULTS, AI_DEFAULTS, AI_FAST, aiParams, fastModeOn,
-         BOT_TIMEFRAMES, botTfOf, rulesParamsFor, historyCount, minBarsFor } from "./strategy.js";
+import { evaluateRules, evaluateAI, evaluateICT, AI_DEFAULTS, AI_FAST, aiParams, fastModeOn,
+         BOT_TIMEFRAMES, botTfOf, rulesParamsFor, ictParamsFor, historyCount, minBarsFor } from "./strategy.js";
 import { PendingPlan, describePending, firstTouch } from "./pending.js";
 import { MARKETS_REQUEST, PLAIN_REQUEST, parseMarkets, marketsOrFallback, groupMarkets, findMarket, marketName,
          isSynthetic, isClosed } from "./markets.js";
@@ -494,19 +494,22 @@ const REGIME_PLAIN = {
   UNCLEAR: "No clear pattern, so Rules wait.",
 };
 const NOTE_PLAIN = { "loading history": "Loading price history…", "volatility spike": "Prices are jumping a lot, so the bot holds off for now.",
-                     "model not loaded": "The AI model couldn't be loaded." };
+                     "model not loaded": "The AI model couldn't be loaded.",
+                     "outside kill zone": "On this market ICT only looks for setups in the London and New York sessions (07:00 to 10:00 and 12:00 to 15:00 UTC)." };
+const notePlain = (n) => NOTE_PLAIN[n] || (/^no clear .* trend$/.test(n) ? `ICT only trades with the ${n.slice(9, -6)} trend, and right now it has none.` : "");
 function renderInfo(res) {
   const i = res.info || {};
   if (i.note) {
     $("infoText").textContent = i.note.charAt(0).toUpperCase() + i.note.slice(1);
-    $("infoPlain").textContent = NOTE_PLAIN[i.note] && NOTE_PLAIN[i.note].toLowerCase() !== i.note + "…" ? NOTE_PLAIN[i.note] : "";
+    $("infoPlain").textContent = notePlain(i.note) && notePlain(i.note).toLowerCase() !== i.note + "…" ? notePlain(i.note) : "";
     $("infoSub").textContent = "";
     return;
   }
   if (ictOn()) {
     $("infoText").textContent = res.pending ? "Setup found" : res.action ? "Entry now" : "No setup";
     $("infoPlain").textContent = res.pending ? "Waiting for price to come back to the fair value gap."
-      : res.action ? "Price came back to the fair value gap." : "Waiting for a liquidity sweep and a break in structure.";
+      : res.action ? "Price came back to the fair value gap."
+      : `Waiting for a liquidity sweep and a break in structure.${i.htfText ? ` The ${i.htfText}.` : ""}`;
     $("infoSub").textContent = Number.isFinite(i.atr) ? `Usual ${TF_SHORT[botTf()]} move (ATR) ${num(i.atr, i.atr >= 10 ? 2 : 5)}` : "";
     return;
   }
@@ -650,7 +653,8 @@ function updatePrice() {
 }
 
 function strategyParams() {
-  return settings.strategy === "ai" ? aiParams(settings) : ictOn() ? ICT_DEFAULTS : rulesParamsFor(botTf());
+  return settings.strategy === "ai" ? aiParams(settings)
+    : ictOn() ? ictParamsFor(botTf(), { real: !isSynthetic(st.markets, settings.symbol) }) : rulesParamsFor(botTf());
 }
 
 function evaluate(actOnSignal) {

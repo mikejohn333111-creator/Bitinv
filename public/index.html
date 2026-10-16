@@ -105,7 +105,7 @@
       <button type="button" data-strategy="ai" aria-pressed="false"><span class="seg-t">AI model</span><span class="seg-s">Trained on past prices</span></button>
       <button type="button" data-strategy="ict" aria-pressed="false" aria-describedby="ictHint"><span class="seg-t">ICT</span><span class="seg-s">Sweep, break, gap</span><span class="acct-badge real ict-tag" id="ictRealTag" hidden>Demo only</span></button>
     </div>
-    <p class="strat-hint" id="ictHint" hidden>Waits for a liquidity sweep, a break in structure and a return to the fair value gap. In our tests it did not make money after fees.</p>
+    <p class="strat-hint" id="ictHint" hidden>Waits for a liquidity sweep, a break in structure and a return to the fair value gap. On forex and other real markets it also follows the 4-hour trend on 1-hour candles, and trades only London and New York hours on 15-minute candles. In our tests it did not make money after fees.</p>
     <p class="fast-note is-real strat-note" id="ictNote" hidden></p>
     <div class="fast-row" id="fastRow" hidden>
       <label class="fast-switch" for="fastSwitch">

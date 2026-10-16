@@ -126,10 +126,27 @@ export function rulesParamsFor(granularity = 60) {
   const m = Math.max(1, Math.round(granularity / 60));
   return { ...RULES_DEFAULTS, barMinutes: m, htfMinutes: m <= 1 ? 15 : m * 4 };
 }
+/**
+ * ICT settings for a bot timeframe and market. The extra filters are only on for real markets
+ * (forex, commodities and the like): Deriv's synthetic indices are a random number generator
+ * around the clock, with no sessions and no higher-timeframe trend that means anything.
+ * Chosen on EURUSD 2018-2025 (docs/strategy-results.md, 16 October 2026):
+ *   1 hour:     4h trend filter (EMA 50 on 4-hour candles): it was not worse out of sample.
+ *   15 minutes: kill zones (London 07-10, New York 12-15 UTC): not worse out of sample.
+ * Neither is proof of an edge; premium/discount and the OTE tested worse and stay off.
+ */
+export function ictParamsFor(granularity = 60, { real = false } = {}) {
+  const m = Math.max(1, Math.round(granularity / 60));
+  const p = { ...ICT_DEFAULTS, barMinutes: m };
+  if (!real) return p;
+  if (m === 60) return { ...p, htfBias: "ema", htfMinutes: 240, htfEMA: 50 };
+  if (m === 15) return { ...p, killZone: true };
+  return p;
+}
 /** Closed bars a strategy needs before it can decide anything, on this timeframe. */
 export function minBarsFor(strategy, granularity = 60) {
   if (strategy === "ai") return AI_MIN_BARS;
-  if (strategy === "ict") return ictMinBars();
+  if (strategy === "ict") return ictMinBars(ictParamsFor(granularity, { real: true }));   // enough for either market
   return rulesMinBars(rulesParamsFor(granularity));
 }
 /**
@@ -315,10 +332,71 @@ export const ICT_DEFAULTS = {
   // have no sessions, no session liquidity and nothing special about these hours.
   killZone: false,
   killZones: [[7, 10], [12, 15]],
+  // Higher-timeframe bias: only buy when the higher timeframe trends up, only sell when it
+  // trends down. "off", "ema" (last closed higher-timeframe candle above its EMA and the EMA
+  // rising) or "structure" (the last higher-timeframe break of a swing was upward).
+  // Built from the same bars, closed higher-timeframe candles only.
+  htfBias: "off",
+  htfMinutes: 240,
+  htfEMA: 50,
+  htfSlopeBars: 3,
+  htfSwingLookback: 60, // higher-timeframe candles searched for swings ("structure")
+  barMinutes: 1,        // minutes per bar fed in (the backtester and the bots' timeframe)
+  // Premium / discount: "off", "discount" (a buy enters in the lower half of the range from the
+  // swept low to the highest high since; sells in the upper half) or "ote" (62% to 79% back).
+  pdFilter: "off",
+  oteLow: 0.62,
+  oteHigh: 0.79,
+  // Where price must come back to: "fvg" (fair value gap, ICT) or "ob" (order block: the last
+  // opposite candle before the displacement, as in Smart Money Concepts; stop beyond it).
+  entryZone: "fvg",
 };
 
+/** Closed bars needed for the higher-timeframe bias (0 when it is off). */
+function htfBarsNeeded(p) {
+  if (!p.htfBias || p.htfBias === "off") return 0;
+  const per = Math.ceil(p.htfMinutes / (p.barMinutes || 1));
+  return per * ((p.htfBias === "ema" ? p.htfEMA + p.htfSlopeBars : p.htfSwingLookback) + 2);
+}
+
 export function ictMinBars(p = ICT_DEFAULTS) {
-  return p.atrPeriod + p.liqLookback + p.sweepWindow + p.entryWindow + 2 * p.swingLen + 6;
+  return Math.max(p.atrPeriod + p.liqLookback + p.sweepWindow + p.entryWindow + 2 * p.swingLen + 6, htfBarsNeeded(p));
+}
+
+/** Plain-words name of a higher timeframe in minutes: "4h", "daily", "15m". */
+export const htfName = (m) => (m >= 1440 && m % 1440 === 0 ? (m === 1440 ? "daily" : `${m / 1440}-day`) : m >= 60 ? `${m / 60}h` : `${m}m`);
+
+/**
+ * The higher-timeframe trend from closed higher-timeframe candles only: "up", "down" or null.
+ *   ema:       last closed candle above EMA(htfEMA) and the EMA higher than htfSlopeBars candles ago (mirror for down).
+ *   structure: the most recent close beyond a confirmed swing (fractal of 2) decides: above a swing high = up.
+ */
+export function ictHtfBias(bars, p = ICT_DEFAULTS) {
+  if (!p.htfBias || p.htfBias === "off") return null;
+  const htf = aggregate(bars, p.htfMinutes, p.barMinutes || 1);
+  const h = htf.length - 1;
+  if (p.htfBias === "ema") {
+    const ema = emaSeries(htf.map((b) => b.close), p.htfEMA);
+    const e1 = ema[h], eN = ema[h - p.htfSlopeBars], c = htf[h]?.close;
+    if (![e1, eN, c].every(Number.isFinite)) return null;
+    return c > e1 && e1 > eN ? "up" : c < e1 && e1 < eN ? "down" : null;
+  }
+  // structure: walk forward; a swing is known 2 candles after it formed
+  const L = 2, from = Math.max(0, h - p.htfSwingLookback);
+  let hi = NaN, lo = NaN, trend = null;
+  for (let k = from + 2 * L; k <= h; k++) {
+    const j = k - L;
+    let isH = true, isL = true;
+    for (let m = 1; m <= L; m++) {
+      if (!(htf[j].high > htf[j - m].high && htf[j].high > htf[j + m].high)) isH = false;
+      if (!(htf[j].low < htf[j - m].low && htf[j].low < htf[j + m].low)) isL = false;
+    }
+    if (isH) hi = htf[j].high;
+    if (isL) lo = htf[j].low;
+    if (htf[k].close > hi) { trend = "up"; hi = NaN; }
+    else if (htf[k].close < lo) { trend = "down"; lo = NaN; }
+  }
+  return trend;
 }
 
 const flipBar = (b) => ({ epoch: b.epoch, open: -b.open, high: -b.low, low: -b.high, close: -b.close });
@@ -328,8 +406,10 @@ const flipBar = (b) => ({ epoch: b.epoch, open: -b.open, high: -b.low, low: -b.h
  * ({kind: "entry"}), or one that has formed and waits for price to come back to the gap
  * ({kind: "pending"}).
  */
-function ictBullish(bars, tr, p, newest = bars.length - 3) {
-  const i = bars.length - 1, L = p.swingLen;
+function ictBullish(bars, tr, p, waiting = false) {
+  const i = bars.length - 1, L = p.swingLen, ob = p.entryZone === "ob";
+  // An order block is known when the displacement bar closes, a gap one bar later.
+  const newest = i - (ob ? 1 : 2) + (waiting ? 1 : 0);
   const H = (j) => bars[j].high, Lo = (j) => bars[j].low;
   const isHigh = (j) => { if (j - L < 0 || j + L > i) return false;
     for (let k = 1; k <= L; k++) if (!(H(j) > H(j - k) && H(j) > H(j + k))) return false; return true; };
@@ -367,35 +447,49 @@ function ictBullish(bars, tr, p, newest = bars.length - 3) {
       if (!firstBreak) continue;
       let sweepLow = Infinity;
       for (let j = s; j <= d; j++) sweepLow = Math.min(sweepLow, Lo(j));
-      // fair value gap from the displacement leg: centre c in [s+1, d], nearest to d
+      // The zone price must come back to. FVG: the gap from the displacement leg, centre c in
+      // [s+1, d], nearest to d. Order block: the last down candle before the displacement
+      // (from the sweep on). from = first bar that may revisit, formed = bar that completes it.
       let gap = null;
-      for (let c = d; c >= s + 1; c--) {
-        const bot = H(c - 1), top = Lo(c + 1);
-        if (top - bot > p.fvgMinATR * atrD && top > bot) { gap = { c, bot, top }; break; }
+      if (ob) {
+        for (let k = d - 1; k >= s; k--) if (bars[k].close < bars[k].open) { gap = { bot: Lo(k), top: H(k), start: k, from: d + 1, formed: d }; break; }
+      } else {
+        for (let c = d; c >= s + 1; c--) {
+          const bot = H(c - 1), top = Lo(c + 1);
+          if (top - bot > p.fvgMinATR * atrD && top > bot) { gap = { bot, top, start: c - 1, from: c + 2, formed: c + 1 }; break; }
+        }
       }
-      if (!gap) continue;
+      if (!gap || (ob && !(gap.top < bd.close))) continue;
+      // the stop goes beyond the order block's low (it is at or above the sweep's low), else the sweep's
+      const stopLevel = ob ? gap.bot : sweepLow;
       // first revisit must be the last bar; stop must not have been hit since
       // (the most recent structure shift decides: a used or broken setup means no trade)
       let ok = true;
-      for (let j = gap.c + 2; ok && j < i; j++) if (Lo(j) <= gap.top) ok = false;
-      for (let j = d + 1; ok && j <= i; j++) if (Lo(j) <= sweepLow) ok = false;
+      for (let j = gap.from; ok && j < i; j++) if (Lo(j) <= gap.top) ok = false;
+      for (let j = d + 1; ok && j <= i; j++) if (Lo(j) <= stopLevel) ok = false;
       if (!ok) return null;
       const b = bars[i];
-      const touched = i >= gap.c + 2 && Lo(i) <= gap.top;
+      const touched = i >= gap.from && Lo(i) <= gap.top;
       if (touched && !(b.close > gap.bot)) return null;
       // Waiting: price is still above the gap. The plan enters at the gap's top, the price
       // reaches first, so stop and target are worked out from there.
       const entry = touched ? b.close : gap.top;
-      const slDist = entry - sweepLow + p.stopBufferATR * atrI;
+      const slDist = entry - stopLevel + p.stopBufferATR * atrI;
       if (slDist < p.minStopATR * atrI) return null;
+      // dealing range: the swept low to the highest high since the sweep (closed bars only)
+      let rangeHigh = -Infinity;
+      for (let j = s; j <= i; j++) rangeHigh = Math.max(rangeHigh, H(j));
+      const depth = rangeHigh > sweepLow ? (entry - sweepLow) / (rangeHigh - sweepLow) : 1;   // 0 = the low, 1 = the high
+      if (p.pdFilter === "discount" && !(depth <= 0.5)) return null;
+      if (p.pdFilter === "ote" && !(depth >= 1 - p.oteHigh && depth <= 1 - p.oteLow)) return null;
       let tpDist = p.rMultiple * slDist, targetNote = `${p.rMultiple}R`;
       if (p.target === "liquidity") {
         let best = Infinity;
         for (let j = i - L; j >= Math.max(L, i - p.liqLookback); j--) if (isHigh(j) && H(j) > entry) best = Math.min(best, H(j));
         if (Number.isFinite(best)) { tpDist = best - entry; targetNote = "the nearest swing high"; }
       }
-      return { kind: touched ? "entry" : "pending", level, mss, sweepLow, gap, entry, slDist, tpDist, targetNote,
-               sweepAgo: i - s, atr: atrI, d, gapBar: gap.c + 1 };
+      return { kind: touched ? "entry" : "pending", level, mss, sweepLow, stopLevel, gap, entry, slDist, tpDist, targetNote,
+               sweepAgo: i - s, atr: atrI, d, gapBar: gap.formed, depth };
     }
   }
   return null;
@@ -413,39 +507,61 @@ export function evaluateICT(bars, p = ICT_DEFAULTS) {
   }
   const fmt = (v) => { const a = Math.abs(v); return v.toFixed(a >= 1000 ? 2 : a >= 10 ? 3 : 5); };
   const sec = barSeconds(bars);
+  // Higher-timeframe bias: which sides may trade at all.
+  const biasOn = p.htfBias && p.htfBias !== "off";
+  const bias = biasOn ? ictHtfBias(bars, p) : null;
+  if (biasOn) {
+    res.info.htfBias = bias || "none";
+    if (!bias) { res.info.note = `no clear ${htfName(p.htfMinutes)} trend`; return res; }
+    res.info.htfText = `${htfName(p.htfMinutes)} trend is ${bias}, so ${bias === "up" ? "buys" : "sells"} only`;
+  }
+  const canBuy = !biasOn || bias === "up", canSell = !biasOn || bias === "down";
+  // The extra checks in plain words, added to every reason.
+  const checks = (q, side) => {
+    const out = [];
+    if (biasOn) out.push(`${htfName(p.htfMinutes)} trend is ${side === "BUY" ? "up" : "down"}`);
+    if (p.pdFilter === "discount" || p.pdFilter === "ote") {
+      const pct = Math.round(100 * q.depth), where = side === "BUY" ? "discount" : "premium";
+      out.push(p.pdFilter === "ote" ? `entry in the optimal trade entry zone (${100 - pct}% back)`
+                                    : `entry in ${where} (${side === "BUY" ? pct : 100 - pct}% of the range)`);
+    }
+    return out.length ? `; ${out.join("; ")}` : "";
+  };
+  const ob = p.entryZone === "ob", tag = ob ? "smc" : "ict";
+  const zoneName = (side) => (ob ? `${side === "BUY" ? "bullish" : "bearish"} order block` : "fair value gap");
   // A setup that has formed but waits for price: a plan the bot can enter on a later tick.
   const waiting = (q, side) => {
     const s = side === "BUY" ? 1 : -1, v = (x) => s * x;   // mirror prices back for sells
     const sl = v(q.entry - q.slDist), tp = v(q.entry + q.tpDist);
     const zone = side === "BUY" ? [q.gap.bot, q.gap.top] : [-q.gap.top, -q.gap.bot];
-    return { ...res, setupId: `ict:${side}:${bars[q.d].epoch}`,
+    return { ...res, setupId: `${tag}:${side}:${bars[q.d].epoch}`,
       info: { ...res.info, sweptLevel: v(q.level), structureLevel: v(q.mss), gapLow: zone[0], gapHigh: zone[1] },
-      pending: { id: `ict:${side}:${bars[q.d].epoch}`, side, zone, sl, tp, sticky: true, since: bars[q.gap.c - 1].epoch,
-        expiresAt: bars[q.gapBar].epoch + sec * (1 + (p.pendingBars ?? PENDING_BARS)), invalidateAt: v(q.sweepLow),
+      pending: { id: `${tag}:${side}:${bars[q.d].epoch}`, side, zone, sl, tp, sticky: true, since: bars[q.gap.start].epoch,
+        expiresAt: bars[q.gapBar].epoch + sec * (1 + (p.pendingBars ?? PENDING_BARS)), invalidateAt: v(q.stopLevel),
         horizonBars: p.horizonBars,
         reason: `Swept the ${side === "BUY" ? "low" : "high"} at ${fmt(v(q.level))} and broke structure ${side === "BUY" ? "up above" : "down below"} ` +
-                `${fmt(v(q.mss))}. Waiting for price to come back to the fair value gap (${fmt(zone[0])} to ${fmt(zone[1])}); ` +
-                `target ${side === "BUY" ? q.targetNote : q.targetNote.replace("swing high", "swing low")}` } };
+                `${fmt(v(q.mss))}. Waiting for price to come back to the ${zoneName(side)} (${fmt(zone[0])} to ${fmt(zone[1])}); ` +
+                `target ${side === "BUY" ? q.targetNote : q.targetNote.replace("swing high", "swing low")}${checks(q, side)}` } };
   };
   const flipped = bars.map(flipBar);   // true ranges are identical on flipped bars
-  const bull = ictBullish(bars, tr, p), last = bars.length - 1;
-  const bear = bull?.kind === "entry" ? null : ictBullish(flipped, tr, p);
+  const bull = canBuy ? ictBullish(bars, tr, p) : null;
+  const bear = bull?.kind === "entry" || !canSell ? null : ictBullish(flipped, tr, p);
   if (bull?.kind === "entry") {
-    return { ...res, action: "BUY", slDist: bull.slDist, tpDist: bull.tpDist, horizonBars: p.horizonBars, setupId: `ict:BUY:${bars[bull.d].epoch}`,
+    return { ...res, action: "BUY", slDist: bull.slDist, tpDist: bull.tpDist, horizonBars: p.horizonBars, setupId: `${tag}:BUY:${bars[bull.d].epoch}`,
       info: { ...res.info, sweptLevel: bull.level, structureLevel: bull.mss, gapLow: bull.gap.bot, gapHigh: bull.gap.top },
       reason: `Swept the low at ${fmt(bull.level)}, broke structure up above ${fmt(bull.mss)}, ` +
-              `entering the fair value gap (${fmt(bull.gap.bot)} to ${fmt(bull.gap.top)}); target ${bull.targetNote}` };
+              `entering the ${zoneName("BUY")} (${fmt(bull.gap.bot)} to ${fmt(bull.gap.top)}); target ${bull.targetNote}${checks(bull, "BUY")}` };
   }
   if (bear?.kind === "entry") {
-    return { ...res, action: "SELL", slDist: bear.slDist, tpDist: bear.tpDist, horizonBars: p.horizonBars, setupId: `ict:SELL:${bars[bear.d].epoch}`,
+    return { ...res, action: "SELL", slDist: bear.slDist, tpDist: bear.tpDist, horizonBars: p.horizonBars, setupId: `${tag}:SELL:${bars[bear.d].epoch}`,
       info: { ...res.info, sweptLevel: -bear.level, structureLevel: -bear.mss, gapLow: -bear.gap.top, gapHigh: -bear.gap.bot },
       reason: `Swept the high at ${fmt(-bear.level)}, broke structure down below ${fmt(-bear.mss)}, ` +
-              `entering the fair value gap (${fmt(-bear.gap.top)} to ${fmt(-bear.gap.bot)}); target ` +
-              bear.targetNote.replace("swing high", "swing low") };
+              `entering the ${zoneName("SELL")} (${fmt(-bear.gap.top)} to ${fmt(-bear.gap.bot)}); target ` +
+              bear.targetNote.replace("swing high", "swing low") + checks(bear, "SELL") };
   }
-  const bullWait = ictBullish(bars, tr, p, last - 1);
+  const bullWait = canBuy ? ictBullish(bars, tr, p, true) : null;
   if (bullWait?.kind === "pending") return waiting(bullWait, "BUY");
-  const bearWait = ictBullish(flipped, tr, p, last - 1);
+  const bearWait = canSell ? ictBullish(flipped, tr, p, true) : null;
   if (bearWait?.kind === "pending") return waiting(bearWait, "SELL");
   return res;
 }

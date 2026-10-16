@@ -8,8 +8,8 @@
 // crash, reboot or update the bot resumes on its own and picks up its open trades again.
 import { readFileSync } from "node:fs";
 import { CONFIG } from "../public/js/config.js";
-import { evaluateRules, evaluateAI, evaluateICT, ICT_DEFAULTS, AI_DEFAULTS, AI_FAST, aiParams, fastModeOn,
-         BOT_TIMEFRAMES, botTfOf, rulesParamsFor, historyCount, minBarsFor } from "../public/js/strategy.js";
+import { evaluateRules, evaluateAI, evaluateICT, AI_DEFAULTS, AI_FAST, aiParams, fastModeOn,
+         BOT_TIMEFRAMES, botTfOf, rulesParamsFor, ictParamsFor, historyCount, minBarsFor } from "../public/js/strategy.js";
 import { PendingPlan, describePending, firstTouch } from "../public/js/pending.js";
 import { MARKETS_REQUEST, PLAIN_REQUEST, FALLBACK_MARKETS, parseMarkets, marketsOrFallback, groupMarkets, findMarket,
          marketName, isSynthetic, isClosed } from "../public/js/markets.js";
@@ -541,7 +541,8 @@ export class TradingEngine {
 
   strategyParams() {
     const s = this.settings;
-    return s.strategy === "ai" ? aiParams(s) : s.strategy === "ict" ? ICT_DEFAULTS : rulesParamsFor(this.tf());
+    return s.strategy === "ai" ? aiParams(s)
+      : s.strategy === "ict" ? ictParamsFor(this.tf(), { real: !isSynthetic(this.markets, s.symbol) }) : rulesParamsFor(this.tf());
   }
 
   evaluate(actOnSignal) {
@@ -566,7 +567,8 @@ export class TradingEngine {
     const i = res.info || {};
     if (i.note) return i.note === "loading history" ? "Loading price history" : i.note === "model not loaded" ? "AI model not loaded" : i.note;
     if (this.settings.strategy === "ict")
-      return res.pending ? `Setup found, waiting for price: ${res.pending.reason}` : res.action ? res.reason : "No setup right now";
+      return res.pending ? `Setup found, waiting for price: ${res.pending.reason}` : res.action ? res.reason
+        : `No setup right now${i.htfText ? ` (${i.htfText})` : ""}`;
     return this.settings.strategy === "ai"
       ? `up ${(i.pUp * 100).toFixed(0)}% · down ${(i.pDn * 100).toFixed(0)}% · flat ${(i.pNone * 100).toFixed(0)}%`
       : `${i.regime} · ADX ${i.adx?.toFixed(0)} · RSI ${i.rsi?.toFixed(0)}`;

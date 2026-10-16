@@ -5,6 +5,7 @@
 //   node tools/backtest.mjs --seeds 1,2,3         # several simulated runs, trades pooled
 //   node tools/backtest.mjs --strategy ict        # only one strategy: rules, ai or ict
 //   node tools/backtest.mjs --strategy ict --sweep  # ICT parameter grid (R multiple x horizon x kill zone)
+//   ... --strategy ict --grid upgrades             # ICT upgrade candidates (HTF bias, premium/discount, SMC order blocks)
 //   node tools/backtest.mjs --csv R_75_M1.csv     # real history (Settings > Download CSV)
 //   node tools/backtest.mjs --csv DAT_ASCII_EURUSD_M1_2024.csv,DAT_ASCII_EURUSD_M1_2025.csv --spread 0.00008
 //   node tools/backtest.mjs --tf 15 ...            # resample M1 to 15-minute (or 60) bars first
@@ -124,6 +125,27 @@ function strategies(tf) {
   for (const killZone of [false, true]) for (const rMultiple of [1.5, 2, 3]) for (const horizonBars of [15, 30, 60])
     ictGrid.push({ label: `${rMultiple}R, ${horizonBars} bars, kill zone ${killZone ? "on" : "off"}`, p: { ...ICT_DEFAULTS, rMultiple, horizonBars, killZone } });
   ictGrid.push({ label: "liquidity target, 30 bars, kill zone off", p: { ...ICT_DEFAULTS, target: "liquidity" } });
+  if (args.grid === "upgrades") {
+    // 16 October 2026: higher-timeframe bias, premium/discount, kill zones, 3R/60, and order
+    // block entries (SMC). D = defaults (2R, 30 bars), T = 3R, 60 bars. See docs/strategy-results.md.
+    const D = { ...ICT_DEFAULTS, barMinutes: tf }, T = { ...D, rMultiple: 3, horizonBars: 60 };
+    const h4e = { htfBias: "ema", htfMinutes: 240, htfEMA: 50 }, d1e = { htfBias: "ema", htfMinutes: 1440, htfEMA: 20 };
+    const h4s = { htfBias: "structure", htfMinutes: 240 }, disc = { pdFilter: "discount" }, ote = { pdFilter: "ote" }, kz = { killZone: true };
+    const ob = { entryZone: "ob" };
+    ictGrid.splice(0, ictGrid.length, ...[
+      ["D defaults 2R/30", D], ["T 3R/60", T],
+      ["T + H4 EMA bias", { ...T, ...h4e }], ["T + D1 EMA bias", { ...T, ...d1e }], ["T + H4 structure bias", { ...T, ...h4s }],
+      ["T + discount", { ...T, ...disc }], ["T + OTE", { ...T, ...ote }], ["T + kill zone", { ...T, ...kz }],
+      ["D + H4 EMA bias", { ...D, ...h4e }], ["D + discount", { ...D, ...disc }], ["D + kill zone", { ...D, ...kz }],
+      ["T + H4 EMA + discount", { ...T, ...h4e, ...disc }], ["T + H4 EMA + kill zone", { ...T, ...h4e, ...kz }],
+      ["T + H4 EMA + discount + KZ", { ...T, ...h4e, ...disc, ...kz }], ["T + H4 structure + discount", { ...T, ...h4s, ...disc }],
+      ["T + D1 EMA + discount", { ...T, ...d1e, ...disc }],
+      ["SMC OB 2R/30", { ...D, ...ob }], ["SMC OB 3R/60", { ...T, ...ob }],
+      ["SMC OB T + H4 EMA", { ...T, ...h4e, ...ob }], ["SMC OB T + discount", { ...T, ...disc, ...ob }],
+      ["SMC OB T + H4 EMA + discount", { ...T, ...h4e, ...disc, ...ob }],
+      ["SMC OB D + H4 EMA", { ...D, ...h4e, ...ob }], ["SMC OB D + H4 EMA + discount", { ...D, ...h4e, ...disc, ...ob }],
+    ].map(([label, p]) => ({ label, p })));
+  }
   let model = null;
   const ai = () => model ??= JSON.parse(readFileSync(new URL("../public/model/tbotai-model.json", import.meta.url)));
   return {
@@ -139,7 +161,8 @@ function strategies(tf) {
       evaluate: (p) => (b) => evaluateAI(b, ai(), p),
     },
     ict: {
-      name: "ICT", minBars: ictMinBars(), window: ictMinBars(),
+      // every candidate starts at the same bar (the longest warm-up); each sees the bars it needs
+      name: "ICT", minBars: Math.max(...ictGrid.map((c) => ictMinBars(c.p))), window: ictMinBars(), windowFor: (p) => ictMinBars(p),
       grid: ictGrid, defaultIndex: 4,       // 2R, 30 bars, kill zone off = ICT_DEFAULTS
       evaluate: (p) => (b) => evaluateICT(b, p),
     },
@@ -167,13 +190,13 @@ if (args.train) {
     console.log(`\n== ${st.name}, ${TF}-minute bars. Training years, every candidate (avg R after ${spreads[0]} spread):`);
     let best = null;
     for (const c of st.grid) {
-      const raw = trade(train, st.evaluate(c.p), st.minBars, st.window);
+      const raw = trade(train, st.evaluate(c.p), st.minBars, st.windowFor?.(c.p) ?? st.window);
       const s = stats(raw, dTrain, spreads[0]);
       console.log(`  ${c.label.padEnd(40)} ${fmtRow(s)}`);
       if (s.n >= 30 && (!best || s.avg > best.s.avg)) best = { c, s };
     }
     if (!best) { console.log("  no candidate made 30 trades in training; nothing to test"); continue; }
-    const raw = trade(test, st.evaluate(best.c.p), st.minBars, st.window);
+    const raw = trade(test, st.evaluate(best.c.p), st.minBars, st.windowFor?.(best.c.p) ?? st.window);
     console.log(`  picked: ${best.c.label}`);
     console.log(`  TEST (out of sample):`);
     console.log(`    before costs          ${fmtRow(stats(raw, dTest, 0))}`);
@@ -204,7 +227,7 @@ if (args.train) {
     report(`AI model (threshold ${aiP.threshold})`, stats(pooled(S.ai.evaluate(aiP), S.ai.minBars, S.ai.window), totalDays));
   }
   if (want("ict")) {
-    const runIct = (p) => stats(pooled(S.ict.evaluate(p), S.ict.minBars, S.ict.window), totalDays);
+    const runIct = (p) => stats(pooled(S.ict.evaluate(p), S.ict.minBars, S.ict.windowFor(p)), totalDays);
     if (!args.sweep) {
       report("ICT (sweep, structure shift, fair value gap)", runIct(ICT_DEFAULTS));
     } else {

@@ -24,7 +24,7 @@ if (SHOTS) mkdirSync(SHOTS, { recursive: true });
 const { chromium } = await import(process.env.PLAYWRIGHT || "/opt/node22/lib/node_modules/playwright/index.mjs");
 
 // ---------------------------------------------------------------- mock
-Object.assign(process.env, { PORT: String(MOCK_PORT), BAR_MS: "1000", MOCK_PAT: PAT });
+Object.assign(process.env, { PORT: String(MOCK_PORT), BAR_MS: "1000", MOCK_PAT: PAT, MOCK_CONTROL: "1" });
 await import("./mock-deriv.mjs");
 const MOCK = `http://localhost:${MOCK_PORT}`;
 
@@ -32,7 +32,8 @@ const MOCK = `http://localhost:${MOCK_PORT}`;
 const dataDir = mkdtempSync(join(tmpdir(), "tbot-e2e-"));
 const serverEnv = { ...process.env, TBOT_DATA_DIR: dataDir, TBOT_PORT: String(SERVER_PORT), TBOT_HOST: "127.0.0.1", TBOT_DEV: "1",
                     DERIV_API_URL: MOCK, DERIV_PUBLIC_WS: `ws://localhost:${MOCK_PORT}/trading/v1/options/ws/public` };
-for (const k of ["PORT", "BAR_MS", "MOCK_PAT"]) delete serverEnv[k];
+for (const k of ["PORT", "BAR_MS", "MOCK_PAT", "MOCK_CONTROL"]) delete serverEnv[k];
+const mockClock = (barMs) => fetch(`${MOCK}/mock/clock`, { method: "POST", body: JSON.stringify({ barMs }) });
 const pw = spawnSync(process.execPath, ["server/main.mjs", "set-password"], { cwd: ROOT, input: PASSWORD + "\n", env: serverEnv, encoding: "utf8" });
 assert.equal(pw.stdout, "Password saved.\n", pw.stderr);
 let server, serverOut = "";
@@ -159,9 +160,30 @@ try {
       step = "stop";
       await page.click("#runBtn");
       await page.waitForFunction(() => document.getElementById("stateLabel").textContent === "Stopped");
+
+      step = "signals only: the signal on the chart with its stop loss and take profit";
+      await page.click('#modeSeg label:has(input[value="signals"])');
+      await page.waitForFunction(() => document.getElementById("runBtn").textContent.trim() === "Start signals");
+      await mockClock(200);   // fast candles, so the rules strategy finds a setup soon
+      await page.click("#runBtn");
+      await page.waitForFunction(() => document.getElementById("chart").dataset.plans?.split(" ").includes("signal"), null, { timeout: 120000 });
+      await mockClock(1000);
+      assert.match(await page.textContent("#signalBox"), /signal only/);
+      await shot("signal");
+      await page.click("#runBtn");
+      await page.waitForFunction(() => document.getElementById("stateLabel").textContent === "Stopped");
     } else {
       await page.waitForFunction(() => /10,000|USD/.test(document.getElementById("balance").textContent));
     }
+
+    step = "chart";
+    await page.waitForFunction(() => Number(document.getElementById("chart").dataset.candles) > 50, null, { timeout: 15000 });
+    await page.click('[data-tf="300"]');
+    await page.waitForFunction(() => document.getElementById("chart").getAttribute("aria-label").startsWith("5m") &&
+                                     Number(document.getElementById("chart").dataset.candles) > 5, null, { timeout: 15000 });
+    assert.equal(await page.textContent("#tfNote"), "The bot trades on 1-minute candles; this only changes the chart.");
+    await page.click('[data-tf="60"]');
+    await page.waitForFunction(() => document.getElementById("tfNote").hidden);
 
     step = "page checks";
     assert.ok(!(await page.content()).includes(PAT), "the token never reaches the page");

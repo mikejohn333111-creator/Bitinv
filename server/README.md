@@ -112,7 +112,7 @@ The token is never written to the log, never printed, and never sent back to the
 - The password-change form needs a session and is limited per session only.
 - Every request that changes something must be a `POST` with `Content-Type: application/json`, an `Origin` header of this same site (and no cross-site `Sec-Fetch-Site`), and a body of at most 16 KB.
 - On every response: `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`, `X-Content-Type-Options: nosniff`, `Referrer-Policy: no-referrer`, `X-Frame-Options: DENY`, and `Strict-Transport-Security` when the request came over https. API answers have `Cache-Control: no-store`.
-- Static files come only from `server/public/`, with dot files, unknown file types, encoded `..` and symlinks out of the folder refused.
+- Static files come only from `server/public/`, with dot files, unknown file types, encoded `..` and symlinks out of the folder refused. The two exceptions are the website's chart code, served by name as it is: `/lib/plan.js` (`public/js/plan.js`) and `/lib/lightweight-charts.mjs` (`public/vendor/`).
 
 ## API
 
@@ -123,7 +123,8 @@ All under `/api/`, JSON in and out. Every call needs the session cookie except l
 | `GET /healthz` | `200 ok`, no login needed. |
 | `POST /api/login` `{password}` | Sets the session cookie. 401 wrong password, 429 too many tries. |
 | `POST /api/logout` | Ends this session. |
-| `GET /api/status` | Everything the page shows: `running`, `mode`, `strategy`, `symbol`, `connection`, `account {id,type,currency}`, `balance`, `equity`, `dayPL` (%), `tradesToday`, `halted`, `haltReason`, `cooldownUntil`, `blockReason`, `lastPrice`, `lastEval` (what the strategy sees), `lastSignal` (kept across restarts), `resumedAt` (when it carried on by itself after a restart), `lastCost`, `open` trades (`id, side, symbol, stake, profit, opened, horizon`), `botTf` (seconds per candle the strategy reads), `pending` (the waiting plan: `side, zone, sl, tp, expiresAt, invalidateAt, reason, text`, or null), `marketOpen`, `synthetic`, `noMultipliers`, `marketGroups` (Deriv's Multiplier markets by group, with `open`), `ictBlocked`, `accounts`, `needsToken`, `hasToken`, `tokenHint` (last 4 characters), `appId`, `error`, `settings`, `limits`, `multipliers`, `version`. |
+| `GET /api/status` | Everything the page shows: `running`, `mode`, `strategy`, `symbol`, `connection`, `account {id,type,currency}`, `balance`, `equity`, `dayPL` (%), `tradesToday`, `halted`, `haltReason`, `cooldownUntil`, `blockReason`, `lastPrice`, `lastEval` (what the strategy sees), `lastSignal` (kept across restarts; with `end`, `slMoney`, `tpMoney` for the chart), `marks` (recent signals and trades as `{t, side}`, for chart arrows), `resumedAt` (when it carried on by itself after a restart), `lastCost`, `open` trades (`id, side, symbol, stake, profit, opened, horizon, plan`; `plan` is `{side, entry, sl, tp, slMoney, tpMoney, start, end}` from Deriv's numbers, or null), `botTf` (seconds per candle the strategy reads), `pending` (the waiting plan: `side, zone, sl, tp, expiresAt, invalidateAt, reason, text, start, slMoney, tpMoney`, or null), `marketOpen`, `synthetic`, `noMultipliers`, `marketGroups` (Deriv's Multiplier markets by group, with `open`), `ictBlocked`, `accounts`, `needsToken`, `hasToken`, `tokenHint` (last 4 characters), `appId`, `error`, `settings`, `limits`, `multipliers`, `version`. |
+| `GET /api/candles?tf=<sec>[&after=<epoch>]` | The chart's candles of the bot's market, `tf` one of 60, 300, 900, 3600, 14400, 86400: `{symbol, tf, botTf, live, full, candles: [[epoch, open, high, low, close], ...], message}`. The bot's own timeframe is its own candles; others are loaded on the bot's Deriv connection (at most every 15 seconds per timeframe, 500 candles). With `after`, only that candle and newer ones (`full: false`). An empty list comes with a `message` (not connected, loading). 400 for another `tf`. |
 | `GET /api/log?after=<seq>` | Activity log entries newer than `seq` (up to 200), plus `last`. |
 | `POST /api/start` | Starts the bot. 409 with a message if it can't (no token, real account not allowed, not connected yet). |
 | `POST /api/stop` | Stops the bot. Open trades keep their stop loss and take profit. |
@@ -146,4 +147,5 @@ All under `/api/`, JSON in and out. Every call needs the session cookie except l
 - `server/proxy-ips.mjs`: `TBOT_PROXY_IPS` parsing and matching.
 - `server/setup.sh`, `server/uninstall.sh`, `server/docker-caddy.sh`: install, remove, and the Caddy-in-Docker step (tested by `tools/test-setup.sh`).
 - `server/store.mjs`: the data folder.
-- `server/public/`: the control page (`index.html`, `control.js`, `control.css`).
+- `server/public/`: the control page (`index.html`, `control.js`, `control.css`, and `chart.js`, the live chart, loaded once you are logged in).
+- `server/chart.mjs`: the chart's candles for `/api/candles` and the open trades' plans.

@@ -2,7 +2,7 @@
 // the page is visible and pauses while it is hidden. No inline scripts (strict CSP).
 const $ = (id) => document.getElementById(id);
 const POLL_MS = 3000;
-const ui = { screen: "loading", status: null, lastSeq: 0, stateKey: null, timer: null, dirty: new Set(), restart: null };
+const ui = { screen: "loading", status: null, lastSeq: 0, stateKey: null, timer: null, dirty: new Set(), restart: null, chart: null };
 
 // ------------------------------------------------------------- helpers
 async function api(method, path, body) {
@@ -207,6 +207,24 @@ function render(s) {
   renderTrades(s);
   renderSignal(s);
   renderSettings(s);
+  renderChart(s);
+}
+
+/**
+ * The live chart (chart.js) is loaded once the control page shows, so the login screen stays
+ * small. If it can't load, the rest of the page works without it.
+ */
+function renderChart(s) {
+  $("chartPrice").textContent = Number.isFinite(s.lastPrice) ? px(s.lastPrice) : "";
+  if (!ui.chart) {
+    ui.chart = import("./chart.js").then((m) => m.mountChart()).catch(() => {
+      $("chartCard").hidden = false;
+      $("chartEmpty").textContent = "The chart couldn't load. Reload the page to try again.";
+      $("chartEmpty").hidden = false;
+      return null;
+    });
+  }
+  ui.chart.then((c) => { if (c && ui.status === s) c.update(s); });
 }
 
 function renderTrades(s) {

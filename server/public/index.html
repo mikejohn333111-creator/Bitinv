@@ -94,6 +94,28 @@
       </p>
     </div>
 
+    <section class="card chart-card" id="chartCard" aria-labelledby="chartTitle" hidden>
+      <div class="card-head"><h2 id="chartTitle" class="chart-market"><span id="chartMarket">Chart</span></h2><span class="chart-price num" id="chartPrice"></span></div>
+      <p class="chart-sub"><span id="tfName">1-minute</span> chart by <a href="https://www.tradingview.com/" target="_blank" rel="noopener noreferrer">TradingView</a></p>
+      <div class="tf-bar" role="group" aria-label="Chart timeframe">
+        <button type="button" data-tf="60" aria-pressed="true">1m</button>
+        <button type="button" data-tf="300" aria-pressed="false">5m</button>
+        <button type="button" data-tf="900" aria-pressed="false">15m</button>
+        <button type="button" data-tf="3600" aria-pressed="false">1h</button>
+        <button type="button" data-tf="14400" aria-pressed="false">4h</button>
+        <button type="button" data-tf="86400" aria-pressed="false">1D</button>
+      </div>
+      <p class="tf-note" id="tfNote" hidden>The bot trades on 1-minute candles; this only changes the chart.</p>
+      <div class="plan-bar">
+        <label class="plan-toggle" for="planToggle"><input id="planToggle" type="checkbox" checked><span>Show trade plan</span></label>
+        <span class="plan-legend" aria-hidden="true"><i class="lg-tp"></i>Target <i class="lg-sl"></i>Stop</span>
+      </div>
+      <div class="chart-wrap">
+        <div id="chart" class="chart" role="img" aria-label="1-minute candlestick chart"></div>
+        <p class="chart-empty" id="chartEmpty" hidden></p>
+      </div>
+    </section>
+
     <section class="card" aria-labelledby="openTitle">
       <div class="card-head"><h2 id="openTitle">Open trades</h2><span class="muted small" id="multInfo"></span></div>
       <ul class="trades" id="openList"></ul>

@@ -11,10 +11,12 @@ import { createServer } from "node:http";
 import { readFile, stat, realpath } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { execFile } from "node:child_process";
+import { gzipSync } from "node:zlib";
 import { join, resolve, sep, extname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { CONFIG } from "../public/js/config.js";
 import { TradingEngine, cleanSettings, UserError } from "./engine.mjs";
+import { ChartFeed } from "./chart.mjs";
 import { FileStore, ensureDataDir } from "./store.mjs";
 import { parseProxyList } from "./proxy-ips.mjs";
 import { PasswordFile, Sessions, Devices, LoginLimiter, ipBucket, hashPassword, verifyPassword, writeAuthFile, checkNewPassword,
@@ -26,6 +28,11 @@ const env = process.env;
 const DATA_DIR = env.TBOT_DATA_DIR ? resolve(env.TBOT_DATA_DIR) : join(ROOT, ".tbot-data");
 const GIT_DIR = env.TBOT_GIT_DIR ? resolve(env.TBOT_GIT_DIR) : ROOT;   // TBOT_GIT_DIR is for tests only
 const BODY_LIMIT = 16 * 1024;
+// The website's chart code, served to the control page as it is (no copies): page path -> file.
+const SHARED = {
+  "/lib/lightweight-charts.mjs": join(ROOT, "public", "vendor", "lightweight-charts.mjs"),
+  "/lib/plan.js": join(ROOT, "public", "js", "plan.js"),
+};
 const NO_PASSWORD_MSG = "No password is set yet. Run the setup script again to set one.";
 const CSP = "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; " +
             "frame-ancestors 'none'; base-uri 'none'; form-action 'self'";
@@ -117,6 +124,7 @@ async function startServer() {
     store,
     log: (e) => console.log(`${e.tag} ${e.title}${e.detail ? `: ${e.detail}` : ""}`),
   });
+  const chartFeed = new ChartFeed(engine);
 
   // ------------------------------------------------------------ helpers
   const LOCAL = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
@@ -141,6 +149,14 @@ async function startServer() {
     res.writeHead(status, { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store",
                             "Content-Length": Buffer.byteLength(body), ...headers });
     res.end(body);
+  }
+  // Phones on mobile data: text over 1 KB is sent gzipped when the browser accepts it.
+  const gzipOk = (req, data) => data.length > 1024 && /\bgzip\b/i.test(String(req.headers["accept-encoding"] || ""));
+  function jsonZipped(req, res, obj) {
+    let body = Buffer.from(JSON.stringify(obj));
+    const headers = { "Content-Type": "application/json; charset=utf-8", "Cache-Control": "no-store", Vary: "Accept-Encoding" };
+    if (gzipOk(req, body)) { body = gzipSync(body); headers["Content-Encoding"] = "gzip"; }
+    res.writeHead(200, { ...headers, "Content-Length": body.length }).end(body);
   }
   const text = (res, status, body, headers = {}) =>
     res.writeHead(status, { "Content-Type": "text/plain; charset=utf-8", "Content-Length": Buffer.byteLength(body), ...headers }).end(body);
@@ -263,6 +279,12 @@ async function startServer() {
       return json(res, 200, { ok: true }, { "Set-Cookie": sessionCookie("", 0) });
     } },
     "GET /api/status": { fn: () => ({ ...engine.status(), version: version.commit ? version : null }) },
+    "GET /api/candles": { fn: async ({ req, res, url }) => {
+      let out;
+      try { out = await chartFeed.candles(url.searchParams.get("tf"), url.searchParams.get("after")); }
+      catch (e) { if (e instanceof RangeError) throw new UserError(e.message, 400, "bad_timeframe"); throw e; }
+      jsonZipped(req, res, out);
+    } },
     "GET /api/log": { fn: ({ url }) => {
       const after = Math.max(0, Number(url.searchParams.get("after")) || 0);
       return { entries: engine.logsAfter(after), last: engine.seq };
@@ -385,9 +407,32 @@ async function startServer() {
     }
   }
 
+  const zipped = new Map();   // path -> {tag, data}: static files gzipped once
+  /** Sends a static file with an ETag (a reload asks "changed?" and usually gets a 304), gzipped when it helps. */
+  async function sendFile(req, res, file, type) {
+    const st = await stat(file);
+    if (!st.isFile()) return false;
+    const tag = `W/"${st.size.toString(36)}-${Math.floor(st.mtimeMs).toString(36)}"`;
+    const headers = { "Content-Type": type, "Cache-Control": "no-cache", ETag: tag, Vary: "Accept-Encoding" };
+    if (String(req.headers["if-none-match"] || "").split(/\s*,\s*/).includes(tag)) { res.writeHead(304, headers).end(); return true; }
+    let data = await readFile(file);
+    if (gzipOk(req, data) && !/^image\/(png|x-icon)/.test(type)) {
+      let z = zipped.get(file);
+      if (z?.tag !== tag) { z = { tag, data: gzipSync(data) }; zipped.set(file, z); }
+      data = z.data; headers["Content-Encoding"] = "gzip";
+    }
+    res.writeHead(200, { ...headers, "Content-Length": data.length });
+    res.end(req.method === "HEAD" ? undefined : data);
+    return true;
+  }
+
   async function serveStatic(ctx, url) {
     const { req, res } = ctx;
     const notFound = () => text(res, 404, "Not found");
+    if (Object.hasOwn(SHARED, url.pathname)) {
+      try { if (await sendFile(req, res, SHARED[url.pathname], TYPES[extname(url.pathname)])) return; } catch { /* missing */ }
+      return notFound();
+    }
     let p;
     try { p = decodeURIComponent(url.pathname); } catch { return notFound(); }
     if (p.includes("\0") || p.includes("\\")) return notFound();
@@ -396,14 +441,10 @@ async function startServer() {
     if (!segs.length || segs.some((s) => s.startsWith(".")) || !TYPES[extname(p).toLowerCase()]) return notFound();
     const file = resolve(STATIC_DIR, ...segs);
     if (!file.startsWith(STATIC_DIR + sep)) return notFound();
-    let data;
     try {
       const real = await realpath(file);
-      if (!real.startsWith(staticReal + sep) || !(await stat(real)).isFile()) return notFound();
-      data = await readFile(real);
-    } catch { return notFound(); }
-    res.writeHead(200, { "Content-Type": TYPES[extname(p).toLowerCase()], "Content-Length": data.length, "Cache-Control": "no-cache" });
-    res.end(req.method === "HEAD" ? undefined : data);
+      if (!real.startsWith(staticReal + sep) || !(await sendFile(req, res, real, TYPES[extname(p).toLowerCase()]))) return notFound();
+    } catch { if (!res.headersSent) notFound(); }
   }
 
   async function handle(req, res) {
@@ -491,10 +532,11 @@ async function startServer() {
 // ==================================================================== main
 const cmd = process.argv[2];
 if (cmd === "self-test") {
-  // Every import above has loaded by now (config, engine, strategy, risk, deriv, store, auth).
+  // Every import above has loaded by now (config, engine, chart, plan, strategy, risk, deriv, store, auth).
   try {
     JSON.parse(readFileSync(new URL("../public/model/tbotai-model.json", import.meta.url), "utf8"));
     readFileSync(join(STATIC_DIR, "index.html"));
+    for (const file of Object.values(SHARED)) readFileSync(file);   // the chart's code from public/
   } catch (e) { fail(`Self-test failed: ${e.message}`); }
   process.stdout.write("Self-test passed.\n");
   process.exit(0);

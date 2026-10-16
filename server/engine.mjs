@@ -10,11 +10,12 @@ import { readFileSync } from "node:fs";
 import { CONFIG } from "../public/js/config.js";
 import { evaluateRules, evaluateAI, evaluateICT, ICT_DEFAULTS, AI_DEFAULTS, AI_FAST, aiParams, fastModeOn,
          BOT_TIMEFRAMES, botTfOf, rulesParamsFor, historyCount, minBarsFor } from "../public/js/strategy.js";
-import { PendingPlan, describePending } from "../public/js/pending.js";
+import { PendingPlan, describePending, firstTouch } from "../public/js/pending.js";
 import { MARKETS_REQUEST, PLAIN_REQUEST, FALLBACK_MARKETS, parseMarkets, marketsOrFallback, groupMarkets, findMarket,
          marketName, isSynthetic, isClosed } from "../public/js/markets.js";
 import { sizeMultiplier, RiskGuard } from "../public/js/risk.js";
 import { getAccounts, createDemoAccount, getTradingSocketUrl, DerivSocket, cleanAppId } from "../public/js/deriv.js";
+import { tradePlan, planView } from "./chart.mjs";
 
 export const HISTORY_BARS = 1200;
 const DEFAULT_MULTIPLIERS = [10, 20, 30, 40, 50, 100, 200, 300, 400];
@@ -158,6 +159,7 @@ export class TradingEngine {
     this.noMultipliers = false;          // contracts_for says this market has no Multipliers
     this.pending = new PendingPlan();    // the one "Waiting for price" plan
     this.pendingEnteredBar = 0;          // the candle a waiting plan was entered in
+    this.pendingStart = 0;               // the candle a waiting plan was made in (for the chart)
     this.contracts = new Map();          // contract_id -> {side, entryEpoch, horizon, profit, buyPrice, sub, opened}
     this.busy = false;                   // an order is in flight
     this.syncing = false;                // open trades not loaded yet after (re)connecting
@@ -166,6 +168,7 @@ export class TradingEngine {
     // The latest signal is kept in state.json, so the page still shows it after a restart.
     this.lastSignal = this.state.lastSignal && typeof this.state.lastSignal === "object" ? this.state.lastSignal : null;
     this.resumedAt = 0;
+    this.marks = [];                     // the latest signals and trades, for arrows on the chart: {t, side, symbol}
     this.retryTimer = null; this.retryDelay = 5000; this.pfTimer = null;
     this.settling = 0;                   // a trade just closed; the daily loss check waits for the new balance
     this.pendingBuy = null;              // a buy that may have gone through: {checks, meta}
@@ -516,6 +519,7 @@ export class TradingEngine {
   #pendingEvent(ev) {
     const s = this.settings, p = ev.plan;
     if (ev.type === "new") {
+      this.pendingStart = this.forming?.epoch ?? this.bars.at(-1)?.epoch ?? 0;
       if (ev.replaced) this.log("INFO", `Dropped the waiting ${ev.replaced.side} plan`, "A newer setup replaced it.");
       this.log("INFO", `Waiting for price: ${p.side} ${s.symbol}`, `${describePending(p, fmtNum, (t) => new Date(t * 1000).toISOString().slice(11, 16) + " UTC")} ${p.reason}`);
     } else if (ev.type === "cancel") {
@@ -607,11 +611,15 @@ export class TradingEngine {
     const sizeText = size?.ok ? `stake ${this.#money(size.stake)} at x${mult} · risk ${this.#money(size.stopLoss)} · target ${this.#money(size.takeProfit)}`
                    : size ? size.reason : "add your Deriv token to see the stake for your balance";
     const signal = { action: sig.action, symbol: s.symbol, entry, sl, tp, sizeText, reason: sig.reason || "", at: this.now(), barEpoch,
-                     ...(opts.fromPending && { fromPending: true }) };
+                     ...(opts.fromPending && { fromPending: true }),
+                     // for the chart: the planned close, and the money at the stop and the target
+                     ...(sig.horizonBars && { end: signalEpoch + (sig.horizonBars + 1) * barSec }),
+                     ...(size?.ok && { slMoney: size.stopLoss, tpMoney: size.takeProfit }) };
 
     if (s.mode === "signals") {
       this.state.lastSignalEpoch = barEpoch;
       this.lastSignal = this.state.lastSignal = { ...signal, traded: false };
+      this.#mark(barEpoch, sig.action);
       this.#saveState();
       this.log(sig.action, `${sig.action} ${s.symbol} @ ${fmtNum(entry)}`, `SL ${fmtNum(sl)} · TP ${fmtNum(tp)} · ${sizeText} · ${sig.reason}`);
       return;
@@ -650,6 +658,7 @@ export class TradingEngine {
       this.state.lastSignalEpoch = barEpoch;
       this.state.lastTradeEpoch = barEpoch;
       this.lastSignal = this.state.lastSignal = { ...signal, traded: true };
+      this.#mark(this.forming?.epoch ?? signalEpoch + barSec, sig.action);   // the trade opens in the candle after the signal
       this.trackContract(buy.contract_id, { side: sig.action, entryEpoch: signalEpoch, horizon: sig.horizonBars || 0,
                                             buyPrice: Number(buy.buy_price), symbol: s.symbol, ...(barSec !== 60 && { barSec }) });
       this.log(sig.action, `Opened ${sig.action} ${s.symbol}`,
@@ -736,6 +745,7 @@ export class TradingEngine {
       if (!c.opened && poc.date_start) c.opened = Number(poc.date_start) * 1000;
       if (c.side === "?") c.side = String(poc.contract_type).includes("DOWN") ? "SELL" : "BUY";
       const sold = poc.is_sold === 1 || poc.is_sold === true || ["sold", "won", "lost"].includes(poc.status);
+      if (!sold) { try { c.plan = tradePlan(poc, c, c.plan); } catch { /* chart only */ } }
       if (sold) {
         this.#forget(id, c);
         const soldAt = Number(poc.sell_time) > 0 ? Math.min(Number(poc.sell_time) * 1000, this.now()) : this.now();
@@ -1025,7 +1035,7 @@ export class TradingEngine {
       marketOpen: !this.marketClosed(), synthetic: isSynthetic(this.markets, s.symbol), noMultipliers: this.noMultipliers,
       marketsLoaded: this.markets.length > 0,
       pending: this.pending.plan ? { ...this.pending.plan, text: describePending(this.pending.plan, fmtNum,
-        (t) => new Date(t * 1000).toISOString().slice(11, 16) + " UTC") } : null,
+        (t) => new Date(t * 1000).toISOString().slice(11, 16) + " UTC"), ...this.#pendingChart(this.pending.plan) } : null,
       connection: this.connection, feed: this.feed,
       account: this.publicAccount(),
       balance: Number.isFinite(this.balance) ? this.balance : null,
@@ -1041,10 +1051,11 @@ export class TradingEngine {
       lastPriceAt: this.lastPriceAt || null,
       lastEval: this.lastEval,
       lastSignal: this.lastSignal,
+      marks: this.marks.filter((m) => m.symbol === s.symbol).map(({ t, side }) => ({ t, side })),
       lastCost: this.lastCost,
       open: [...this.contracts.entries()].filter(([, c]) => !c.stale).map(([id, c]) => ({
         id, side: c.side, symbol: c.symbol || s.symbol, stake: Number.isFinite(c.buyPrice) ? c.buyPrice : null, profit: Number.isFinite(c.profit) ? c.profit : null,
-        opened: c.opened || null, horizon: c.horizon || 0, closing: !!c.closing,
+        opened: c.opened || null, horizon: c.horizon || 0, closing: !!c.closing, plan: planView(c.plan),
       })),
       hasToken: !!token,
       needsToken: this.needsToken,
@@ -1067,6 +1078,19 @@ export class TradingEngine {
       resumedAt: this.running ? this.resumedAt || null : null,
       lastLogSeq: this.seq,
     };
+  }
+
+  #mark(t, side) { this.marks = [...this.marks, { t, side, symbol: this.settings.symbol }].slice(-50); }
+
+  /** The waiting plan on the chart: where its box starts, and the money at its stop and target for the balance now. */
+  #pendingChart(plan) {
+    const ref = firstTouch(plan), up = plan.side === "BUY";
+    const size = Number.isFinite(this.balance)
+      ? sizeMultiplier({ balance: this.balance, riskPct: +this.settings.riskPct, entry: ref, slDist: up ? ref - plan.sl : plan.sl - ref,
+                         tpDist: up ? plan.tp - ref : ref - plan.tp, multiplier: this.chooseMultiplier(), minStake: this.minStake, maxStake: this.maxStake })
+      : null;
+    return { start: plan.since ?? (this.pendingStart || null),
+             slMoney: size?.ok ? size.stopLoss : null, tpMoney: size?.ok ? size.takeProfit : null };
   }
 
   // ------------------------------------------------------------ watchdog

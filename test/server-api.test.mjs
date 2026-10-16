@@ -354,6 +354,48 @@ test("static files: only server/public, no path tricks", async () => {
   } finally { await srv.stop(); }
 });
 
+test("the chart: the website's chart code is served as JavaScript (ETag, gzip), and /api/candles needs a login", async () => {
+  const dir = tempDir();
+  setPassword(dir, PASSWORD);
+  const srv = await startServer(dir);
+  const get = (path, headers = {}) => new Promise((resolve, reject) => {
+    const u = new URL(srv.base);
+    http.get({ host: u.hostname, port: u.port, path, headers }, (res) => {
+      const chunks = [];
+      res.on("data", (c) => chunks.push(c));
+      res.on("end", () => resolve({ status: res.statusCode, headers: res.headers, body: Buffer.concat(chunks) }));
+    }).on("error", reject);
+  });
+  try {
+    for (const [path, file] of [["/lib/plan.js", "public/js/plan.js"], ["/lib/lightweight-charts.mjs", "public/vendor/lightweight-charts.mjs"]]) {
+      const r = await get(path);
+      assert.equal(r.status, 200, path);
+      assert.match(r.headers["content-type"], /^text\/javascript/, "a module script needs a JavaScript type (nosniff)");
+      assert.equal(r.headers["content-security-policy"], CSP);
+      assert.ok(r.body.equals(readFileSync(join(ROOT, file))), `${path} is ${file} as it is`);
+      const again = await get(path, { "if-none-match": r.headers.etag });
+      assert.equal(again.status, 304, "a reload doesn't download it again");
+      assert.equal(again.body.length, 0);
+      const z = await get(path, { "accept-encoding": "gzip, br" });
+      assert.equal(z.headers["content-encoding"], "gzip");
+      assert.ok(z.body.length < r.body.length);
+    }
+    assert.equal((await get("/chart.js")).status, 200);
+    for (const p of ["/lib/", "/lib/app.js", "/lib/../js/plan.js", "/lib/config.js", "/lib/plan.js/x"]) assert.equal((await get(p)).status, 404, p);
+
+    const c = client(srv.base);
+    assert.equal((await c.get("/api/candles?tf=60")).status, 401);
+    await c.login();
+    const r = await c.get("/api/candles?tf=900");
+    assert.equal(r.status, 200);
+    assert.equal(r.headers.get("cache-control"), "no-store");
+    assert.deepEqual({ ...r.data, message: "" }, { symbol: "R_75", tf: 900, botTf: 60, live: false, full: true, candles: [], message: "" });
+    assert.match(r.data.message, /Not connected to Deriv/, "Deriv can't be reached in this test");
+    assert.equal((await c.get("/api/candles?tf=7")).status, 400);
+    assert.equal((await c.get("/api/candles")).data.error, "bad_timeframe");
+  } finally { await srv.stop(); }
+});
+
 test("the mock accepts MOCK_PAT only with a Deriv-App-ID header", async () => {
   const mock = await startMock({ MOCK_PAT: "pat_only_for_tests" });
   try {
@@ -456,7 +498,7 @@ test("update: a version that can't start is rolled back; a good one is pulled wi
   git(base, "init", "--bare", "-q", remote);
   git(base, "init", "-q", work);
   // A real copy of the server code, so the update's self-test runs what was pulled.
-  for (const d of ["server", "public/js", "public/model"]) cpSync(join(ROOT, d), join(work, d), { recursive: true });
+  for (const d of ["server", "public/js", "public/model", "public/vendor"]) cpSync(join(ROOT, d), join(work, d), { recursive: true });
   cpSync(join(ROOT, "package.json"), join(work, "package.json"));
   writeFileSync(join(work, "a.txt"), "one\n");
   git(work, "add", "-A"); git(work, "commit", "-q", "-m", "one"); git(work, "push", "-q", remote, "HEAD:main");

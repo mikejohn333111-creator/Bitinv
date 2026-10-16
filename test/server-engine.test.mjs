@@ -155,6 +155,15 @@ test("connects with the token, subscribes like the browser, and a signal sends a
     assert.equal(logged(engine, /^Opened SELL R_75/).length, 1);
     assert.equal(st.lastSignal.traded, true);
     assert.ok(Math.abs(st.lastCost.commission - 0.25) < 1e-9);
+    // The chart: an arrow on the entry candle, and the trade's plan from Deriv's own numbers.
+    assert.deepEqual(st.marks, [{ t: fx.bars[SIG + 1].epoch, side: "SELL" }]);
+    assert.equal(st.open[0].plan, null, "no plan before Deriv tells the entry");
+    sock.push((r) => r.proposal_open_contract === 1, { msg_type: "proposal_open_contract", proposal_open_contract: {
+      contract_id: 9000, contract_type: "MULTDOWN", entry_spot: 100, buy_price: 10, multiplier: 50, date_start: fx.bars[SIG + 1].epoch + 5,
+      limit_order: { stop_loss: { order_amount: -2, value: "100.4" }, take_profit: { order_amount: 3, value: "99.4" } }, profit: 0 } });
+    const plan = engine.status().open[0].plan;
+    assert.deepEqual(plan, { side: "SELL", entry: 100, sl: 100.4, tp: 99.4, slMoney: 2, tpMoney: 3, start: fx.bars[SIG + 1].epoch,
+                             end: fx.bars[SIG].epoch + 61 * 60 });
   } finally { ctx.cleanup(); }
 });
 
@@ -169,8 +178,14 @@ test("signals mode logs one signal per gap and trades nothing", async () => {
     await flush();
     assert.equal(engine.logs.filter((e) => e.tag === "SELL").length, 1);
     assert.equal(sentOf(sock, "proposal").length, 0);
-    assert.equal(engine.status().lastSignal.barEpoch, fx.bars[SIG].epoch);
+    const sig = engine.status().lastSignal;
+    assert.equal(sig.barEpoch, fx.bars[SIG].epoch);
     assert.equal(engine.state.lastSignalEpoch, fx.bars[SIG].epoch);
+    // The chart draws every signal with its stop and target, up to the planned close.
+    assert.ok(sig.tp < sig.entry && sig.sl > sig.entry, "a SELL's target below and stop above");
+    assert.equal(sig.end, fx.bars[SIG].epoch + 61 * 60, "AI time limit of 60 candles");
+    assert.ok(sig.slMoney > 0 && sig.tpMoney > 0, "money at the stop and the target");
+    assert.deepEqual(engine.status().marks, [{ t: fx.bars[SIG].epoch, side: "SELL" }]);
   } finally { ctx.cleanup(); }
 });
 
@@ -851,6 +866,8 @@ test("ICT: a waiting plan is made at the candle close and entered on the tick th
     assert.match(plan.text, /^Buy if price comes back to 9990\.0+ to 10012\.0+\. Stop loss .*, take profit .*\. Cancelled at \d\d:\d\d UTC or if price goes below 9965/);
     assert.equal(logged(engine, /^Waiting for price: BUY R_75/).length, 1);
     assert.equal(sentOf(sock, "proposal").length, 0, "nothing traded yet");
+    assert.ok(plan.start > 0 && plan.start < plan.expiresAt, "the chart's box starts at the setup");
+    assert.ok(plan.slMoney > 0 && plan.tpMoney > 0, "money at the stop and the target for the balance now");
     tickAt(sock, ICT_LAST + 1, U(101.5));     // still above the zone
     await flush();
     assert.equal(sentOf(sock, "proposal").length, 0);

@@ -87,7 +87,23 @@ If you write the nginx part by hand, keep the line `proxy_set_header Host $host;
 
 To take it away later, delete `/etc/nginx/conf.d/tbot.conf` and reload nginx (for Apache: `sudo a2dissite tbot`, then reload Apache).
 
-**For anything else** (Docker, Traefik, HAProxy, or a program the setup could not name), the setup prints a short block of details at the end, between two lines. Copy that block and send it to us. We will tell you the change to make. You can show the same details again any time with:
+**If the setup named Caddy in a Docker container** (for example a website started with Docker Compose), it printed this line. Paste it:
+
+```
+curl -fsSL https://tbot-mauve-eta.vercel.app/docker-caddy.sh -o tbot-docker-caddy.sh && sudo bash tbot-docker-caddy.sh
+```
+
+It finds the Caddy container and the Caddyfile it reads, then:
+
+- lets the bot also listen on the container network's own address (like `172.18.0.1`), so Caddy can reach it. If a firewall (ufw or iptables) blocks that, it opens the bot's port for that network only, never to the internet;
+- saves a dated copy of the Caddyfile next to it (`Caddyfile.tbot-backup-...`) and adds one marked block for the bot at the end. Your website's own lines are not changed;
+- checks the new Caddyfile with Caddy, reloads Caddy (the container is not restarted), and checks that your sites still answer as before. If Caddy says no, or a site stops answering, it puts the old Caddyfile back by itself.
+
+At the end it prints your bot's address. Running it again is safe. To take the bot's block away again: `sudo bash tbot-docker-caddy.sh --remove` (the uninstall line below does this too).
+
+It stops without changing anything when the Caddyfile is built into the container's image instead of shared from the server, or when more than one container runs Caddy. In the second case it shows how to name the right one: `sudo env TBOT_CADDY_CONTAINER=name bash tbot-docker-caddy.sh`. Its log is `/var/log/tbot-docker-caddy.log`.
+
+**For anything else** (Docker without Caddy, Traefik, HAProxy, or a program the setup could not name), the setup prints a short block of details at the end, between two lines. Copy that block and send it to us. We will tell you the change to make. You can show the same details again any time with:
 
 ```
 sudo cat /root/tbot-setup-result.txt
@@ -137,7 +153,7 @@ Paste this line:
 curl -fsSL https://tbot-mauve-eta.vercel.app/uninstall.sh -o tbot-uninstall.sh && sudo bash tbot-uninstall.sh
 ```
 
-It stops the bot and removes what the setup added. It asks before deleting the bot's saved settings and history. Your Deriv token is always removed from the server, even when you keep the rest. Your other programs are not touched. If you added the bot's file to nginx or Apache yourself, delete it as shown above.
+It stops the bot and removes what the setup added. It asks before deleting the bot's saved settings and history. Your Deriv token is always removed from the server, even when you keep the rest. Your other programs are not touched. If `tbot-docker-caddy.sh` added the bot to a Caddy container, its block is taken out of that Caddyfile and Caddy is reloaded. If you added the bot's file to nginx or Apache yourself, delete it as shown above.
 
 Trades that are still open stay open at Deriv, with their stop loss and take profit. Close them first on the bot page if you want.
 
@@ -183,7 +199,7 @@ sudo journalctl -u tbot -n 50 --no-pager
 | `tbot` service | Starts the bot when the server starts, and restarts it if it stops. |
 | Caddy | The web server that gives the bot its https address. Installed only when ports 80 and 443 were free. |
 
-The bot itself only listens inside the server (127.0.0.1). Caddy passes the web page to it.
+The bot itself only listens inside the server (127.0.0.1). Caddy passes the web page to it. With a Caddy container, the bot also listens on that Docker network's address, which only the server and its containers can reach.
 
 ## Appendix: a brand-new server, set up while it is created
 

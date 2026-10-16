@@ -15,6 +15,7 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 SETUP=$HERE/server/setup.sh
 UNINSTALL=$HERE/server/uninstall.sh
+DOCKER_CADDY=$HERE/server/docker-caddy.sh
 REAL_NODE=$(command -v node)
 REAL_CURL=$(command -v curl)
 REAL_NODE_RUN=0
@@ -52,7 +53,7 @@ count() { grep -cF -- "$2" "$1" 2>/dev/null || true; }
 SAFE=$T/safebin
 mkdir -p "$SAFE"
 for c in bash sh env cat cp mv rm mkdir rmdir ln chmod touch ls find sort tail head tr sed awk mawk grep cmp \
-  date dirname basename uname install mktemp sha256sum tar xz flock git node printf id stat wc cut readlink \
+  date dirname basename uname install mktemp sha256sum tar xz flock git node printf id stat wc cut readlink seq \
   realpath diff stty tee; do
   p=$(command -v "$c" || true)
   [[ -n $p ]] && ln -sf "$p" "$SAFE/$c"
@@ -242,12 +243,13 @@ EOF
 mk curl <<'EOF'
 #!/bin/bash
 S=$STUB_STATE
-out="" url="" resolve=""
+out="" url="" resolve="" wfmt=""
 while (($#)); do
   case $1 in
     -o) out=$2; shift 2 ;;
+    -w) wfmt=$2; shift 2 ;;
     --resolve) resolve=$2; shift 2 ;;
-    --max-time | --retry) shift 2 ;;
+    --max-time | --retry | --noproxy) shift 2 ;;
     -*) shift ;;
     *) url=$1; shift ;;
   esac
@@ -272,11 +274,27 @@ case $url in
     port=${url#http://127.0.0.1:}; port=${port%%/*}
     [[ -f $S/active-tbot ]] && grep -q "127.0.0.1:$port .*pid=4242" "$S/listen" || exit 7
     echo ok | emit ;;
+  http://172.*:*/healthz)
+    # The bot's extra address (the Docker network's gateway), asked from this server.
+    a=${url#http://}; a=${a%%/*}
+    [[ -f $S/active-tbot ]] || exit 7
+    [[ ${a%:*} == "$(sed -n 's/^TBOT_EXTRA_HOST=//p' "$ROOT/etc/tbot.env")" ]] || exit 7
+    [[ ${a#*:} == "$(sed -n 's/^TBOT_PORT=//p' "$ROOT/etc/tbot.env")" ]] || exit 7
+    echo ok | emit ;;
   https://*/healthz)
     host=${url#https://}; host=${host%%/*}
-    [[ -z ${STUB_CERT_FAIL:-} && -f $S/active-caddy ]] || exit 35
+    [[ -z ${STUB_CERT_FAIL:-} && ( -f $S/active-caddy || -f $S/reloads-docker ) ]] || exit 35
     grep -q "^$host {" "$S/caddy-loaded" 2>/dev/null || exit 35
     echo ok | emit ;;
+  http*://*/)
+    # A website behind the Caddy container: $S/site-<name> holds "code-before code-after-reload".
+    host=${url#*://}; host=${host%%[:/]*}
+    read -r b a <"$S/site-$host" 2>/dev/null || { b=000 a=000; }
+    code=$b
+    [[ -f $S/reloads-docker ]] && code=${a:-$b}
+    [[ $code == 000 ]] || echo page | emit
+    [[ -z $wfmt ]] || printf '%s' "$code"
+    [[ $code != 000 ]] || exit 7 ;;
   *) exit 6 ;;
 esac
 EOF
@@ -295,8 +313,19 @@ case $1 in
     else
       echo "Status: inactive"
     fi ;;
-  allow) grep -q "^$2 " "$S/ufw-rules" || printf '%-26s ALLOW       Anywhere\n' "$2" >>"$S/ufw-rules" ;;
-  delete) grep -v "^$3 " "$S/ufw-rules" >"$S/ufw.tmp" || true; mv "$S/ufw.tmp" "$S/ufw-rules" ;;
+  allow)
+    if [[ $2 == in ]]; then
+      touch "$S/ufw-in"
+      if grep -qxF "${*:2}" "$S/ufw-in"; then echo "Skipping adding existing rule"; else echo "${*:2}" >>"$S/ufw-in"; echo "Rule added"; fi
+    else
+      grep -q "^$2 " "$S/ufw-rules" || printf '%-26s ALLOW       Anywhere\n' "$2" >>"$S/ufw-rules"
+    fi ;;
+  delete)
+    if [[ $3 == in ]]; then
+      grep -vxF "${*:3}" "$S/ufw-in" >"$S/ufw.tmp" || true; mv "$S/ufw.tmp" "$S/ufw-in"
+    else
+      grep -v "^$3 " "$S/ufw-rules" >"$S/ufw.tmp" || true; mv "$S/ufw.tmp" "$S/ufw-rules"
+    fi ;;
 esac
 EOF
 
@@ -309,7 +338,7 @@ echo "iptables $*" >>"$S/calls.log"
 op=$1 chain=$2
 shift 2
 case $op in
-  -S) echo "-P INPUT ACCEPT"; sed 's/^/-A INPUT /' "$F" ;;
+  -S) echo "-P INPUT ${STUB_IPT_POLICY:-ACCEPT}"; sed 's/^/-A INPUT /' "$F" ;;
   -C) grep -qxF -- "$*" "$F" ;;
   -I)
     n=$1; shift
@@ -368,6 +397,86 @@ mk journalctl <<'EOF'
 #!/bin/bash
 echo "(fake journal)"
 EOF
+# Fake Docker. $S/docker holds the running containers ("name<TAB>image" in containers),
+# each container's command, mounts and networks (c-<name>/), and the networks (n-<id>).
+mk docker <<'EOF'
+#!/bin/bash
+S=$STUB_STATE
+D=$S/docker
+echo "docker $*" >>"$S/calls.log"
+[[ -d $D ]] || { echo "Cannot connect to the Docker daemon" >&2; exit 1; }
+cmd=$1
+shift
+fmt=""
+if [[ ${1:-} == -f || ${1:-} == --format ]]; then fmt=$2; shift 2; fi
+# The Caddyfile path inside the container, as a file on this (fake) server.
+host_path() {
+  local c=$1 in=$2 type src dst
+  while IFS='|' read -r type src dst; do
+    if [[ $in == "$dst" ]]; then echo "$ROOT$src"; return; fi
+    if [[ $in == "$dst"/* ]]; then echo "$ROOT$src${in#"$dst"}"; return; fi
+  done <"$D/c-$c/mounts"
+  echo "/nonexistent"
+}
+fw_open() { # is the bot's port open to the container network?
+  local g=$1 p=$2
+  if [[ -n ${STUB_UFW_ACTIVE:-} ]]; then grep -q "to $g port $p proto tcp" "$S/ufw-in" 2>/dev/null || return 1; fi
+  if [[ ${STUB_IPT_POLICY:-ACCEPT} != ACCEPT ]]; then grep -q -- "-d $g -p tcp --dport $p -j ACCEPT" "$S/iptables" 2>/dev/null || return 1; fi
+  [[ -z ${STUB_DOCKER_UNREACHABLE:-} ]]
+}
+case $cmd in
+  info) exit 0 ;;
+  ps)
+    if [[ $fmt == *.Names* ]]; then cat "$D/containers"; else cut -f2 "$D/containers"; fi ;;
+  inspect)
+    c=$1
+    [[ -d $D/c-$c ]] && grep -q "^$c	" "$D/containers" || { echo "Error: No such object: $c" >&2; exit 1; }
+    case $fmt in
+      *State.Running*) echo true ;;
+      *.Path*) cat "$D/c-$c/args" ;;
+      *.Mounts*) cat "$D/c-$c/mounts" ;;
+      *NetworkMode*) cat "$D/c-$c/netmode" 2>/dev/null || echo server_default ;;
+      *NetworkID*) cat "$D/c-$c/networks" ;;
+      *NetworkSettings.Networks*) cut -d'|' -f1 "$D/c-$c/networks" | tr '\n' ' ' ;;
+      *Config.Image*) grep "^$c	" "$D/containers" | cut -f2 ;;
+    esac ;;
+  network)
+    [[ $1 == inspect ]] && shift
+    [[ $1 == -f ]] && shift 2
+    cat "$D/n-$1" ;;
+  exec)
+    c=$1
+    shift
+    case "$1 $2" in
+      "sh -c") [[ -z ${STUB_NO_WGET:-} ]] && echo /usr/bin/wget ;;
+      "wget -qO-")
+        url=${*: -1}; a=${url#http://}; a=${a%%/*}
+        env_host=$(sed -n 's/^TBOT_EXTRA_HOST=//p' "$ROOT/etc/tbot.env")
+        env_port=$(sed -n 's/^TBOT_PORT=//p' "$ROOT/etc/tbot.env")
+        if [[ -f $S/active-tbot && ${a%:*} == "$env_host" && ${a#*:} == "$env_port" ]] && fw_open "$env_host" "$env_port"; then
+          echo ok
+        else
+          echo "wget: can't connect to remote host: Connection refused" >&2; exit 1
+        fi ;;
+      "caddy validate" | "caddy reload")
+        cfg=""
+        for ((i = 1; i <= $#; i++)); do [[ ${!i} == --config ]] && { j=$((i + 1)); cfg=${!j}; }; done
+        f=$(host_path "$c" "$cfg")
+        [[ -f $f ]] || { echo "Error: reading config file: open $cfg: no such file or directory" >&2; exit 1; }
+        [[ -z ${STUB_CADDY_VALIDATE_FAIL:-} ]] || { echo "Error: adapting config using caddyfile: fake validation failure" >&2; exit 1; }
+        ! grep -q INVALID "$f" || { echo "Error: unrecognized directive: INVALID" >&2; exit 1; }
+        if [[ $2 == reload ]]; then
+          [[ -z ${STUB_CADDY_RELOAD_FAIL:-} ]] || { echo "Error: sending configuration to instance: fake" >&2; exit 1; }
+          cp "$f" "$S/caddy-loaded"
+          echo x >>"$S/reloads-docker"
+        fi
+        echo "Valid configuration" ;;
+      *) exit 127 ;;
+    esac ;;
+  *) exit 0 ;;
+esac
+EOF
+
 mk sleep <<'EOF'
 #!/bin/bash
 exit 0
@@ -459,6 +568,7 @@ SCENARIO_ENV=()
 run() { # run setup|uninstall [args...]; output in $OUT, status in $RC
   local script=$SETUP
   [[ $1 == uninstall ]] && script=$UNINSTALL
+  [[ $1 == dc ]] && script=$DOCKER_CADDY
   shift
   OUT=$BOX/out.$((++RUNS))
   RC=0
@@ -947,6 +1057,272 @@ if command -v script >/dev/null; then
 else
   echo "  (skipped: the script command is not installed)"
 fi
+
+# ============================================================ Caddy in Docker (docker-caddy.sh)
+NET_ID=4f6a1c2b9d8e7f00112233445566778899aabbccddeeff001122334455667788
+BR=br-${NET_ID:0:12}
+SITE_CF='{
+	email admin@example.com
+}
+
+api.example.com {
+	reverse_proxy api:3000
+}
+
+www.example.com, example.com {
+	root * /srv
+	file_server
+}'
+dc_box() { # dc_box name file|dir|baked: a server like the one with the Docker Compose website
+  new_box "$1"
+  printf '%s\n' "# Settings for the Tbot service, written by the Tbot setup script." "TBOT_DATA_DIR=/var/lib/tbot" \
+    "TBOT_HOST=127.0.0.1" "TBOT_PORT=8080" "TBOT_TRUST_PROXY=1" "MY_OWN_SETTING=keep" >"$ROOT/etc/tbot.env"
+  mkdir -p "$ROOT/opt/tbot/app" "$ROOT/var/lib/tbot"
+  touch "$ST/active-tbot" "$ST/unit-tbot"
+  echo 4242 >"$ST/pid-tbot"
+  echo 'LISTEN 0 511 127.0.0.1:8080 0.0.0.0:* users:(("node",pid=4242,fd=21))' >>"$ST/listen"
+  printf '%s\n' 'LISTEN 0 4096 0.0.0.0:80 0.0.0.0:* users:(("docker-proxy",pid=3100,fd=7))' \
+    'LISTEN 0 4096 0.0.0.0:443 0.0.0.0:* users:(("docker-proxy",pid=3101,fd=7))' >>"$ST/listen"
+  local D=$ST/docker C=$ST/docker/c-server-caddy-1
+  mkdir -p "$C"
+  printf 'server-api-1\tserver-api\nserver-caddy-1\tcaddy:2-alpine\nserver-db-1\ttimescale/timescaledb:latest-pg16\n' >"$D/containers"
+  printf '%s\n' caddy run --config /etc/caddy/Caddyfile --adapter caddyfile >"$C/args"
+  echo "server_default|$NET_ID|172.18.0.1|172.18.0.3|16" >"$C/networks"
+  echo "bridge||172.18.0.0/16 " >"$D/n-$NET_ID"
+  local data="volume|/var/lib/docker/volumes/server_caddy_data/_data|/data"
+  case $2 in
+    file)
+      CF=$ROOT/root/server/Caddyfile
+      printf '%s\n' "bind|/root/server/Caddyfile|/etc/caddy/Caddyfile" "$data" >"$C/mounts" ;;
+    dir)
+      CF=$ROOT/root/server/caddy/Caddyfile
+      printf '%s\n' "$data" "bind|/root/server/caddy|/etc/caddy" >"$C/mounts" ;;
+    baked)
+      CF=$ROOT/root/server/Caddyfile
+      printf '%s\n' "$data" >"$C/mounts" ;;
+  esac
+  mkdir -p "$(dirname "$CF")"
+  printf '%s\n' "$SITE_CF" >"$CF"
+  cp "$CF" "$BOX/Caddyfile.orig"
+  echo "200 200" >"$ST/site-api.example.com"
+  echo "301 301" >"$ST/site-www.example.com"
+  echo "308 308" >"$ST/site-example.com"
+}
+inode() { stat -c %i "$1"; }
+restarts() { if [[ -f $ST/restarts-tbot ]]; then wc -l <"$ST/restarts-tbot"; else echo 0; fi; }
+no_dash() { ! grep -q $'—' "$1"; }
+DC_BLOCK=$'# >>> tbot (added by the Tbot setup) >>>\n'"$HOSTN"$' {\n\treverse_proxy 172.18.0.1:8080\n}\n# <<< tbot <<<'
+
+echo "D1. Caddy in Docker, Caddyfile shared as a single file, ufw active"
+dc_box dc-file file
+ino=$(inode "$CF")
+SCENARIO_ENV=(STUB_IP_A="$IP" STUB_UFW_ACTIVE=1)
+run dc
+check "succeeds (rc=$RC)" test "$RC" = 0
+check "names the container" has "$OUT" "Found the Caddy container: server-caddy-1"
+check "finds the Caddyfile on this server" has "$OUT" "which is /root/server/Caddyfile on this server"
+check "ends with the address" has "$OUT" "https://$HOSTN"
+check "says log in with the bot password" has "$OUT" "log in with your bot password"
+check "says connect the Deriv token" has "$OUT" "Deriv token"
+check "says demo first" has "$OUT" "Start on a demo account"
+check "says all done (certificate answered)" has "$OUT" "All done"
+check "no em-dashes in the output" no_dash "$OUT"
+check "same file (inode kept for the bind mount)" test "$(inode "$CF")" = "$ino"
+check "website's own lines unchanged at the top" bash -c "head -n $(wc -l <"$BOX/Caddyfile.orig") '$CF' | cmp -s - '$BOX/Caddyfile.orig'"
+check "block appended" test "$(tail -n 5 "$CF")" = "$DC_BLOCK"
+check "dated backup equals the old file" bash -c "ls '$ROOT/root/server/'Caddyfile.tbot-backup-[0-9]* >/dev/null && cmp -s '$BOX/Caddyfile.orig' \$(ls '$ROOT/root/server/'Caddyfile.tbot-backup-* | head -n 1)"
+check "validated inside the container" has "$ST/calls.log" "docker exec server-caddy-1 caddy validate --config /etc/caddy/Caddyfile --adapter caddyfile"
+check "reloaded inside the container" has "$ST/calls.log" "docker exec server-caddy-1 caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile"
+check "never restarts or recreates the container" bash -c "! grep -qE 'docker (restart|stop|rm|compose|run|kill)' '$ST/calls.log'"
+check "env: extra host is the gateway" has "$ROOT/etc/tbot.env" "TBOT_EXTRA_HOST=172.18.0.1"
+check "env: trusts the network's range" has "$ROOT/etc/tbot.env" "TBOT_PROXY_IPS=172.18.0.0/16"
+check "env: other lines kept" bash -c "grep -qx MY_OWN_SETTING=keep '$ROOT/etc/tbot.env' && grep -qx TBOT_PORT=8080 '$ROOT/etc/tbot.env' && grep -qx TBOT_TRUST_PROXY=1 '$ROOT/etc/tbot.env'"
+check "env: records the container and Caddyfile" has "$ROOT/etc/tbot.env" "# tbot-docker-caddy: server-caddy-1|/root/server/Caddyfile|/etc/caddy/Caddyfile"
+check "ufw: one narrow rule for the bridge" test "$(cat "$ST/ufw-in")" = "in on $BR to 172.18.0.1 port 8080 proto tcp"
+check "env: records the ufw rule" has "$ROOT/etc/tbot.env" "# tbot-docker-caddy-firewall: ufw in on $BR to 172.18.0.1 port 8080 proto tcp"
+check "bot restarted once" test "$(restarts)" = 1
+check "probed from inside the container" has "$ST/calls.log" "docker exec server-caddy-1 wget -qO- -T 5 http://172.18.0.1:8080/healthz"
+check "website checked before and after" bash -c "test \$(grep -c 'curl https://api.example.com:443/ resolve=api.example.com:443:127.0.0.1' '$ST/calls.log') -ge 2"
+check "https checked through the container's Caddy" has "$ST/calls.log" "curl https://$HOSTN/healthz resolve=$HOSTN:443:127.0.0.1"
+check "log written" test -s "$ROOT/var/log/tbot-docker-caddy.log"
+check "a copy kept for the uninstall" test -f "$ROOT/opt/tbot/docker-caddy.sh"
+
+echo "D2. Run again: nothing changes"
+sum1=$(sha256sum <"$CF")
+nb=$(find "$ROOT/root/server/" -name "*tbot-backup*" | wc -l)
+r1=$(restarts)
+run dc
+check "succeeds (rc=$RC)" test "$RC" = 0
+check "Caddyfile unchanged" test "$(sha256sum <"$CF")" = "$sum1"
+check "one block only" test "$(count "$CF" '# >>> tbot')" = 1
+check "no new backup" test "$(find "$ROOT/root/server/" -name "*tbot-backup*" | wc -l)" = "$nb"
+check "bot not restarted" test "$(restarts)" = "$r1"
+check "says nothing to change" has "$OUT" "already has the bot's block"
+check "ufw rule still recorded (it was ours)" has "$ROOT/etc/tbot.env" "# tbot-docker-caddy-firewall: ufw in"
+check "env lines not doubled" test "$(count "$ROOT/etc/tbot.env" TBOT_EXTRA_HOST=)" = 1
+
+echo "D2b. Port changed by the setup: run again updates the block in place"
+sed -i 's/^TBOT_PORT=8080/TBOT_PORT=8081/' "$ROOT/etc/tbot.env"
+sed -i 's/127.0.0.1:8080/127.0.0.1:8081/' "$ST/listen"
+run dc
+check "succeeds (rc=$RC)" test "$RC" = 0
+check "block replaced, not added" bash -c "test \$(grep -c '# >>> tbot' '$CF') = 1 && grep -q 'reverse_proxy 172.18.0.1:8081' '$CF' && ! grep -q ':8080' '$CF'"
+check "old ufw rule removed, new one added" test "$(cat "$ST/ufw-in")" = "in on $BR to 172.18.0.1 port 8081 proto tcp"
+sed -i 's/^TBOT_PORT=8081/TBOT_PORT=8080/' "$ROOT/etc/tbot.env"
+sed -i 's/127.0.0.1:8081/127.0.0.1:8080/' "$ST/listen"
+run dc
+check "and back (rc=$RC)" test "$RC" = 0
+
+echo "D3. --remove"
+r1=$(restarts)
+rl=$(wc -l <"$ST/reloads-docker")
+run dc --remove
+check "succeeds (rc=$RC)" test "$RC" = 0
+check "Caddyfile back to the website's own" cmp -s "$CF" "$BOX/Caddyfile.orig"
+check "same file (inode kept)" test "$(inode "$CF")" = "$ino"
+check "Caddy reloaded" test "$(wc -l <"$ST/reloads-docker")" -gt "$rl"
+check "env lines removed" bash -c "! grep -qE 'TBOT_EXTRA_HOST|TBOT_PROXY_IPS|tbot-docker-caddy' '$ROOT/etc/tbot.env'"
+check "env: other lines kept" bash -c "grep -qx MY_OWN_SETTING=keep '$ROOT/etc/tbot.env' && grep -qx TBOT_PORT=8080 '$ROOT/etc/tbot.env'"
+check "ufw rule removed" test ! -s "$ST/ufw-in"
+check "bot restarted" test "$(restarts)" -gt "$r1"
+check "says the website was not changed" has "$OUT" "Your website was not changed"
+run dc --remove
+check "--remove again is harmless (rc=$RC)" test "$RC" = 0
+
+echo "D4. Caddyfile folder shared, iptables DROP policy, then uninstall"
+dc_box dc-dir dir
+SCENARIO_ENV=(STUB_IP_A="$IP" STUB_IPT_POLICY=DROP)
+run dc
+check "succeeds (rc=$RC)" test "$RC" = 0
+check "edits the Caddyfile in the shared folder" has "$CF" "reverse_proxy 172.18.0.1:8080"
+check "iptables: narrow rule inserted first" test "$(head -n 1 "$ST/iptables")" = "-i $BR -d 172.18.0.1 -p tcp --dport 8080 -j ACCEPT"
+check "env: records the iptables rule" has "$ROOT/etc/tbot.env" "# tbot-docker-caddy-firewall: iptables -i $BR -d 172.18.0.1"
+check "no ufw used" lacks "$ST/calls.log" "ufw allow"
+run uninstall --purge
+check "uninstall succeeds (rc=$RC)" test "$RC" = 0
+check "uninstall took the block out" cmp -s "$CF" "$BOX/Caddyfile.orig"
+check "uninstall removed the iptables rule" test ! -s "$ST/iptables"
+check "uninstall reloaded the container's Caddy" test "$(wc -l <"$ST/reloads-docker")" = 2
+check "uninstall did not restart the bot it removes" bash -c "test \$(wc -l <'$ST/restarts-tbot') = 1"
+check "uninstall removed the env file" test ! -e "$ROOT/etc/tbot.env"
+check "uninstall removed the docker-caddy log" test ! -e "$ROOT/var/log/tbot-docker-caddy.log"
+
+echo "D5. Caddyfile built into the image: refused, nothing changed"
+dc_box dc-baked baked
+cp "$ROOT/etc/tbot.env" "$BOX/env.orig"
+SCENARIO_ENV=(STUB_IP_A="$IP" STUB_UFW_ACTIVE=1)
+run dc
+check "refused (rc=$RC)" test "$RC" != 0
+check "explains" has "$OUT" "probably built into the container's image"
+check "prints what to send" bash -c "grep -q 'Container: server-caddy-1' '$OUT' && grep -q 'Image: caddy:2-alpine' '$OUT' && grep -q 'server_caddy_data' '$OUT'"
+check "env unchanged" cmp -s "$ROOT/etc/tbot.env" "$BOX/env.orig"
+check "bot not restarted" test "$(restarts)" = 0
+check "Caddy not touched" lacks "$ST/calls.log" "caddy reload"
+check "no firewall change" test ! -s "$ST/ufw-in"
+
+echo "D6. Two Caddy containers: refused unless one is named"
+dc_box dc-two file
+printf 'other-caddy\tcaddy:2\n' >>"$ST/docker/containers"
+cp -r "$ST/docker/c-server-caddy-1" "$ST/docker/c-other-caddy"
+SCENARIO_ENV=(STUB_IP_A="$IP")
+run dc
+check "refused (rc=$RC)" test "$RC" != 0
+check "names both and how to choose" bash -c "grep -q 'More than one running container has Caddy' '$OUT' && grep -q 'TBOT_CADDY_CONTAINER=' '$OUT'"
+check "Caddyfile unchanged" cmp -s "$CF" "$BOX/Caddyfile.orig"
+check "env unchanged" lacks "$ROOT/etc/tbot.env" "TBOT_EXTRA_HOST"
+SCENARIO_ENV=(STUB_IP_A="$IP" TBOT_CADDY_CONTAINER=server-caddy-1)
+run dc
+check "TBOT_CADDY_CONTAINER picks one (rc=$RC)" test "$RC" = 0
+SCENARIO_ENV=(STUB_IP_A="$IP" TBOT_CADDY_CONTAINER=nope)
+run dc --remove
+check "a wrong name is reported" has "$OUT" 'no running container called "nope"'
+
+echo "D7. Caddy rejects the new Caddyfile: put back"
+dc_box dc-invalid file
+ino=$(inode "$CF")
+SCENARIO_ENV=(STUB_IP_A="$IP" STUB_CADDY_VALIDATE_FAIL=1)
+run dc
+check "stops (rc=$RC)" test "$RC" != 0
+check "Caddyfile put back" cmp -s "$CF" "$BOX/Caddyfile.orig"
+check "same file (inode kept)" test "$(inode "$CF")" = "$ino"
+check "never reloaded" lacks "$ST/calls.log" "caddy reload"
+check "explains and shows Caddy's message" bash -c "grep -q 'did not accept' '$OUT' && grep -q 'fake validation failure' '$OUT'"
+
+echo "D7b. Caddy reload fails: put back and loaded again"
+dc_box dc-reloadfail file
+SCENARIO_ENV=(STUB_IP_A="$IP" STUB_CADDY_RELOAD_FAIL=1)
+run dc
+check "stops (rc=$RC)" test "$RC" != 0
+check "Caddyfile put back" cmp -s "$CF" "$BOX/Caddyfile.orig"
+check "reload tried again with the old file" test "$(count "$ST/calls.log" "caddy reload")" = 2
+
+echo "D8. A website stops answering after the reload: put back"
+dc_box dc-regress file
+echo "200 502" >"$ST/site-api.example.com"
+SCENARIO_ENV=(STUB_IP_A="$IP")
+run dc
+check "stops (rc=$RC)" test "$RC" != 0
+check "Caddyfile put back" cmp -s "$CF" "$BOX/Caddyfile.orig"
+check "Caddy loaded the old file again" bash -c "test \$(wc -l <'$ST/reloads-docker') = 2 && cmp -s '$ST/caddy-loaded' '$BOX/Caddyfile.orig'"
+check "names the site" has "$OUT" "https://api.example.com (answered 200 before, now 502)"
+dc_box dc-down-before file
+echo "000 000" >"$ST/site-api.example.com"
+echo "502 000" >"$ST/site-example.com"
+run dc
+check "sites already down before don't count (rc=$RC)" test "$RC" = 0
+
+echo "D9. The Caddyfile already has a site for the bot's address"
+dc_box dc-taken file
+printf '\n%s {\n\trespond "hi"\n}\n' "$HOSTN" >>"$CF"
+cp "$CF" "$BOX/Caddyfile.orig"
+run dc
+check "stops (rc=$RC)" test "$RC" != 0
+check "explains" has "$OUT" "already has a site for $HOSTN"
+check "nothing changed" bash -c "cmp -s '$CF' '$BOX/Caddyfile.orig' && ! grep -q TBOT_EXTRA_HOST '$ROOT/etc/tbot.env'"
+
+echo "D10. The container can't reach the bot: website untouched"
+dc_box dc-unreach file
+SCENARIO_ENV=(STUB_IP_A="$IP" STUB_DOCKER_UNREACHABLE=1)
+run dc
+check "stops (rc=$RC)" test "$RC" != 0
+check "explains" has "$OUT" "can't reach the bot at 172.18.0.1:8080"
+check "Caddyfile untouched" bash -c "cmp -s '$CF' '$BOX/Caddyfile.orig' && ! ls '$ROOT/root/server/' | grep -q tbot-backup"
+
+echo "D11. Other refusals"
+dc_box dc-nodocker file
+rm -rf "$ST/docker"
+SCENARIO_ENV=(STUB_IP_A="$IP")
+run dc
+check "no Docker: refused (rc=$RC)" bash -c "test $RC != 0 && grep -q 'Docker is not running' '$OUT'"
+dc_box dc-nobot file
+rm -f "$ROOT/etc/tbot.env"
+run dc
+check "bot not installed: points to the setup (rc=$RC)" bash -c "test $RC != 0 && grep -q 'not installed yet' '$OUT'"
+dc_box dc-json file
+printf '%s\n' caddy run --config /etc/caddy/caddy.json >"$ST/docker/c-server-caddy-1/args"
+run dc
+check "JSON config: refused, nothing changed (rc=$RC)" bash -c "test $RC != 0 && cmp -s '$CF' '$BOX/Caddyfile.orig'"
+dc_box dc-domain file
+SCENARIO_ENV=(TBOT_DOMAIN=Bot.Example.ORG)
+run dc
+check "TBOT_DOMAIN is used (rc=$RC)" has "$CF" "bot.example.org {"
+
+echo "D12. The setup on that server points to this script"
+dc_box dc-setup file
+rm -f "$ROOT/etc/tbot.env" "$ST/active-tbot" "$ST/pid-tbot"
+rm -rf "$ROOT/opt/tbot" "$ROOT/var/lib/tbot"
+sed -i '/pid=4242/d' "$ST/listen"
+SCENARIO_ENV=(TBOT_PASSWORD="$PW1" STUB_IP_A="$IP")
+run setup
+check "setup succeeds (rc=$RC)" test "$RC" = 0
+check "prints the one-line command" has "$OUT" "curl -fsSL https://tbot-mauve-eta.vercel.app/docker-caddy.sh -o tbot-docker-caddy.sh && sudo bash tbot-docker-caddy.sh"
+check "says it is Caddy in Docker" has "$OUT" "Caddy running in a Docker container"
+check "no Caddy installed" lacks "$ST/calls.log" "install -y --no-install-recommends caddy"
+run dc
+check "then docker-caddy works (rc=$RC)" test "$RC" = 0
+run setup
+check "setup again keeps the extra lines" has "$ROOT/etc/tbot.env" "TBOT_EXTRA_HOST=172.18.0.1"
+check "and reports the working address" bash -c "grep -q 'All done' '$OUT' && grep -q 'https://$HOSTN' '$OUT'"
 
 if ((REAL_NODE_RUN)); then
   echo "21. Real Node.js from nodejs.org"

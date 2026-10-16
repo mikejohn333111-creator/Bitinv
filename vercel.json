@@ -5,7 +5,8 @@
   "outputDirectory": "public",
   "rewrites": [
     { "source": "/setup.sh", "destination": "https://raw.githubusercontent.com/mikejohn333111-creator/Bitinv/main/server/setup.sh" },
-    { "source": "/uninstall.sh", "destination": "https://raw.githubusercontent.com/mikejohn333111-creator/Bitinv/main/server/uninstall.sh" }
+    { "source": "/uninstall.sh", "destination": "https://raw.githubusercontent.com/mikejohn333111-creator/Bitinv/main/server/uninstall.sh" },
+    { "source": "/docker-caddy.sh", "destination": "https://raw.githubusercontent.com/mikejohn333111-creator/Bitinv/main/server/docker-caddy.sh" }
   ],
   "headers": [
     {

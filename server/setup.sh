@@ -1099,6 +1099,31 @@ EOF
   put_file "$tmp" "$dir/apache-tbot.conf" 0644
 }
 
+# True when a running Docker container's image is Caddy (like a website started with Docker Compose).
+docker_caddy_running() {
+  command -v docker >/dev/null 2>&1 || return 1
+  docker ps --format '{{.Image}}' 2>/dev/null | sed -e 's|^docker\.io/||' -e 's|^library/||' | grep -q '^caddy'
+}
+
+report_docker_caddy() {
+  if grep -qs '^# tbot-docker-caddy:' "$ENV_FILE" && [[ -n $HOST ]]; then
+    note "The bot was already added to the Caddy container (by tbot-docker-caddy.sh)."
+    wait_https
+    if [[ $HTTPS_STATE == working ]]; then return 0; fi
+    HTTPS_STATE="added to Caddy in Docker, but https://$HOST does not answer yet"
+    say "It does not answer on https://$HOST right now. Run this to check and fix it:"
+  else
+    HTTPS_STATE="ports 80/443 are used by Caddy in Docker, steps printed, not changed"
+    say ""
+    say "Ports 80 and 443 belong to Caddy running in a Docker container (your website)."
+    say "To put the bot on ${HOST:+https://$HOST through }that Caddy, without changing your website's own"
+    say "sites, run this one line:"
+  fi
+  say "    curl -fsSL $SITE_URL/docker-caddy.sh -o tbot-docker-caddy.sh && sudo bash tbot-docker-caddy.sh"
+  say "It adds one marked block for the bot at the end of Caddy's settings, and puts the old"
+  say "settings back by itself if Caddy or your website complains."
+}
+
 report_busy() {
   HTTPS_STATE="ports 80/443 are used by another program, not changed"
   say ""
@@ -1106,6 +1131,11 @@ report_busy() {
   local line kind="" users=${WEB_USERS%$'\n'}
   while IFS= read -r line; do say "    $line"; done <<<"$users"
   say "Those are the ports for web addresses. We did not touch that program or its settings."
+  if docker_caddy_running; then
+    report_docker_caddy
+    say "(The details are also saved in /root/tbot-setup-result.txt)"
+    return 0
+  fi
   # Ready steps when it is only nginx, or only Apache (the usual cases).
   if ! grep -qv ': nginx$' <<<"$users"; then kind=nginx; fi
   if ! grep -qv ': Apache$' <<<"$users"; then kind=apache; fi

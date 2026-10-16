@@ -48,11 +48,17 @@ There are no packages to install. It needs Node 22 or newer (for the built-in `f
 | `TBOT_DATA_DIR` | `.tbot-data` in the repo | Where everything is saved. Production: `/var/lib/tbot`. |
 | `TBOT_HOST` | `127.0.0.1` | Address to listen on. |
 | `TBOT_PORT` | `8080` | Port to listen on (`0` picks a free one). |
-| `TBOT_TRUST_PROXY` | off | Set to `1` behind a reverse proxy on the same machine. `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` are then trusted, but only from `127.0.0.1` or `::1`. |
+| `TBOT_TRUST_PROXY` | off | Set to `1` behind a reverse proxy on the same machine. `X-Forwarded-For`, `X-Forwarded-Proto` and `X-Forwarded-Host` are then trusted, but only from `127.0.0.1` or `::1` (and `TBOT_PROXY_IPS`). |
+| `TBOT_EXTRA_HOST` | none | A second address to listen on as well, on the same port, such as a Docker network's gateway (`172.18.0.1`) so a web server in a container can reach the bot. If it can't be used yet (the network isn't up at boot), the bot logs it once, keeps running on `TBOT_HOST`, and tries again every 10 seconds. |
+| `TBOT_PROXY_IPS` | none | More addresses to trust as the reverse proxy when `TBOT_TRUST_PROXY=1`: comma-separated IPv4 addresses or ranges, such as `172.18.0.0/16`. Invalid entries are logged and ignored. Without `TBOT_TRUST_PROXY=1` it does nothing. |
 | `TBOT_DEV` | off | Set to `1` for local testing over plain http: the cookies drop the `Secure` flag and the `__Host-` prefix. |
 | `DERIV_API_URL` | `https://api.derivws.com` | Deriv's REST API. |
 | `DERIV_PUBLIC_WS` | `wss://api.derivws.com/trading/v1/options/ws/public` | Deriv's public prices feed (used when no token is set). |
 | `TBOT_GIT_DIR` | the repo | Only for tests: the git checkout that the Update button pulls. |
+
+### Behind Caddy in a Docker container
+
+`server/docker-caddy.sh` (served as `/docker-caddy.sh`) puts the bot behind a Caddy that runs in a container and already holds ports 80 and 443. It sets `TBOT_EXTRA_HOST` to the gateway of the container's network and `TBOT_PROXY_IPS` to that network's range in `/etc/tbot.env` (the setup keeps those lines), and records what it changed in comment lines there (`# tbot-docker-caddy...`) so `--remove` and the uninstall script can undo it. Every container on that Docker network can then reach the bot and is trusted to send `X-Forwarded-*` headers. Those are your own containers; the login limits still apply (the overall limit of 30 wrong passwords per 15 minutes counts every source). See `docs/server-setup.md`.
 
 ### The password
 
@@ -137,5 +143,7 @@ All under `/api/`, JSON in and out. Every call needs the session cookie except l
 - `server/main.mjs`: HTTP server, API, security, `set-password` and `self-test` commands.
 - `server/engine.mjs`: the trading engine (a port of the engine in `public/js/app.js`).
 - `server/auth.mjs`: password hashing, sessions, login limits.
+- `server/proxy-ips.mjs`: `TBOT_PROXY_IPS` parsing and matching.
+- `server/setup.sh`, `server/uninstall.sh`, `server/docker-caddy.sh`: install, remove, and the Caddy-in-Docker step (tested by `tools/test-setup.sh`).
 - `server/store.mjs`: the data folder.
 - `server/public/`: the control page (`index.html`, `control.js`, `control.css`).

@@ -3,8 +3,9 @@
 #
 # Removes what server/setup.sh added, and nothing else:
 #   the tbot service, /opt/tbot, /etc/tbot.env, the tbot user, and the bot's
-#   Caddy site. Caddy itself is removed only if the setup installed it and it
-#   served nothing but the bot. Other programs and their settings are never touched.
+#   Caddy site (also the block docker-caddy.sh added to a Caddy container). Caddy
+#   itself is removed only if the setup installed it and it served nothing but
+#   the bot. Other programs and their settings are never touched.
 #
 #   curl -fsSL https://tbot-mauve-eta.vercel.app/uninstall.sh -o tbot-uninstall.sh && sudo bash tbot-uninstall.sh
 #
@@ -53,6 +54,25 @@ only_comments() {
 }
 
 port_rule_spec() { echo "-p tcp -m state --state NEW -m tcp --dport $1 -j ACCEPT"; }
+
+# The bot's block in a Caddy that runs in Docker (added by docker-caddy.sh). That script
+# knows how to take it out again, so it is run with --uninstalling.
+remove_docker_caddy() {
+  local rec script
+  rec=$(sed -n 's/^# tbot-docker-caddy: //p' "$ENV_FILE" 2>/dev/null | tail -n 1)
+  [[ -n $rec ]] || return 0
+  for script in "$OPT/docker-caddy.sh" "$OPT/app/server/docker-caddy.sh"; do
+    [[ -f $script ]] || continue
+    if bash "$script" --uninstalling; then return 0; fi
+    break
+  done
+  local file=${rec#*|}
+  file=${file%%|*}
+  say "==> The bot's address in Caddy (Docker)"
+  note "Could not take the bot's block out of Caddy's settings by itself."
+  note "Please delete the lines between \"# >>> tbot\" and \"# <<< tbot <<<\" in $file"
+  note "and reload Caddy: docker exec ${rec%%|*} caddy reload --config ${rec##*|} --adapter caddyfile"
+}
 
 PURGE_CADDY=0
 remove_caddy_site() {
@@ -157,7 +177,7 @@ main() {
       --purge) mode=purge ;;
       --keep-data) mode=keep ;;
       -h | --help)
-        sed -n '2,15p' "$0"
+        sed -n '2,16p' "$0"
         exit 0
         ;;
       *)
@@ -187,11 +207,12 @@ main() {
   systemctl reset-failed tbot 2>/dev/null || true
   note "Stopped. Trades that are still open stay open on Deriv, with their stop loss and take profit."
 
+  remove_docker_caddy
   remove_caddy_site
   if ((PURGE_CADDY)); then purge_caddy; fi
 
   say "==> Removing the bot's files"
-  rm -rf "$OPT" "$ENV_FILE" "$R/root/tbot-setup-result.txt" "$R/var/log/tbot-setup.log"
+  rm -rf "$OPT" "$ENV_FILE" "$R/root/tbot-setup-result.txt" "$R/var/log/tbot-setup.log" "$R/var/log/tbot-docker-caddy.log"
   note "Removed /opt/tbot and /etc/tbot.env"
 
   if [[ -d $DATA ]]; then

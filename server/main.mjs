@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { CONFIG } from "../public/js/config.js";
 import { TradingEngine, cleanSettings, UserError } from "./engine.mjs";
 import { FileStore, ensureDataDir } from "./store.mjs";
+import { parseProxyList } from "./proxy-ips.mjs";
 import { PasswordFile, Sessions, Devices, LoginLimiter, ipBucket, hashPassword, verifyPassword, writeAuthFile, checkNewPassword,
          SESSION_DAYS, DEVICE_DAYS } from "./auth.mjs";
 
@@ -96,6 +97,12 @@ async function startServer() {
   const port = Number(env.TBOT_PORT ?? 8080);
   const dev = env.TBOT_DEV === "1";
   const trustProxy = env.TBOT_TRUST_PROXY === "1";
+  // A second address to listen on, for a web server in a Docker container that can't reach
+  // 127.0.0.1 (usually the Docker network's gateway, such as 172.18.0.1).
+  const extraHost = String(env.TBOT_EXTRA_HOST || "").trim();
+  const extraRetryMs = Math.max(50, Number(env.TBOT_EXTRA_RETRY_MS) || 10000);   // TBOT_EXTRA_RETRY_MS is for tests only
+  const proxyIps = parseProxyList(env.TBOT_PROXY_IPS);
+  if (proxyIps.bad.length) console.error(`TBOT_PROXY_IPS: ignored ${proxyIps.bad.map((b) => `"${b.slice(0, 40)}"`).join(", ")} (use IPv4 addresses or ranges like 172.18.0.0/16).`);
 
   const store = new FileStore(DATA_DIR);
   const passwords = new PasswordFile(DATA_DIR);
@@ -113,7 +120,7 @@ async function startServer() {
 
   // ------------------------------------------------------------ helpers
   const LOCAL = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
-  const viaProxy = (req) => trustProxy && LOCAL.has(req.socket.remoteAddress);
+  const viaProxy = (req) => trustProxy && (LOCAL.has(req.socket.remoteAddress) || proxyIps.has(req.socket.remoteAddress));
   const lastValue = (h) => String(h || "").split(",").map((s) => s.trim()).filter(Boolean).at(-1) || "";
   const clientIp = (req) => ipBucket((viaProxy(req) && lastValue(req.headers["x-forwarded-for"]).slice(0, 64)) || req.socket.remoteAddress || "?");
   const isHttps = (req) => !!req.socket.encrypted || (viaProxy(req) && lastValue(req.headers["x-forwarded-proto"]).toLowerCase() === "https");
@@ -415,15 +422,44 @@ async function startServer() {
   let version = { commit: null };
   versionInfo().then((v) => { version = v; }).catch(() => {});
 
-  const server = createServer((req, res) => {
+  const onRequest = (req, res) => {
     handle(req, res).catch((e) => {
       console.error("Request failed:", e?.stack || e);
       if (!res.headersSent) json(res, 500, { error: "server_error", message: "Something went wrong on the server." });
       else res.end();
     });
-  });
-  server.headersTimeout = 20000;
-  server.requestTimeout = 30000;
+  };
+  const newServer = () => {
+    const s = createServer(onRequest);
+    s.headersTimeout = 20000;
+    s.requestTimeout = 30000;
+    return s;
+  };
+  const server = newServer();
+  const shown = (a) => `http://${a.family === "IPv6" ? `[${a.address}]` : a.address}:${a.port}`;
+
+  // The extra address may not exist yet (Docker creates its network after the bot starts at
+  // boot), so a failure is logged and tried again every 10 seconds. The main address keeps working.
+  let extraServer = null, extraTimer = null, extraTries = 0;
+  function listenExtra(port) {
+    if (closing) return;
+    const s = newServer();
+    s.once("error", (e) => {
+      s.close();
+      extraTries++;
+      // Logged the first time, then about every 5 minutes, so a missing network doesn't fill the log.
+      if (extraTries === 1 || extraTries % 30 === 0)
+        console.error(`Can't listen on ${extraHost}:${port} as well (${e.code || e.message}). Trying again every ${Math.round(extraRetryMs / 1000)} seconds.`);
+      extraTimer = setTimeout(() => listenExtra(port), extraRetryMs);
+      extraTimer.unref?.();
+    });
+    s.listen(port, extraHost, () => {
+      s.removeAllListeners("error");
+      s.on("error", (e) => console.error(`Listener on ${extraHost}:${port} failed: ${e.code || e.message}`));
+      extraServer = s;
+      console.log(`Also listening on ${shown(s.address())}`);
+    });
+  }
 
   let closing = false;
   function shutdown(code, why) {
@@ -432,6 +468,8 @@ async function startServer() {
     console.log(`Shutting down (${why}). The bot ${engine.running ? "resumes" : "stays stopped"} when it starts again.`);
     engine.shutdown();
     try { sessions.flush(); } catch { /* best effort */ }
+    clearTimeout(extraTimer);
+    if (extraServer) { extraServer.close(); extraServer.closeIdleConnections?.(); }
     server.close(() => process.exit(code));
     server.closeIdleConnections?.();
     setTimeout(() => process.exit(code), 3000).unref();
@@ -443,8 +481,9 @@ async function startServer() {
   server.on("error", (e) => { console.error(`Can't listen on ${host}:${port} (${e.code || e.message}).`); process.exit(1); });
   server.listen(port, host, () => {
     const a = server.address();
-    console.log(`Tbot server listening on http://${a.family === "IPv6" ? `[${a.address}]` : a.address}:${a.port}`);
+    console.log(`Tbot server listening on ${shown(a)}`);
     if (!passwords.current()) console.log(NO_PASSWORD_MSG);
+    if (extraHost && extraHost !== host) listenExtra(a.port);
   });
   engine.init().catch((e) => console.error("Engine start failed:", e?.stack || e));
 }

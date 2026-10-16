@@ -524,6 +524,7 @@ cat >"$W/package.json" <<'EOF'
 EOF
 cat >"$W/server/main.mjs" <<'EOF'
 // Stand-in for the real server: only "set-password" is needed by the setup.
+// Understands TBOT_EXTRA_HOST like the real server (checked by docker-caddy.sh).
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";

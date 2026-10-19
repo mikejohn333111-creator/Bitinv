@@ -253,6 +253,13 @@ export async function getTradingSocketUrl(cfg, auth, accountId) {
 }
 
 // -------------------------------------------------------------- WebSocket
+const STREAM_RETRIES = 4;   // re-asks in a row for a stream Deriv closed, before reporting it
+
+/** True for Deriv's error that ends a running stream ("subscription closed by server"). */
+export function isStreamClosed(err) {
+  return /subscription.*closed|closed by server/i.test(`${err?.message ?? ""} ${err?.code ?? ""}`);
+}
+
 export class DerivSocket {
   /** @param urlProvider async () => wss URL (called again on every reconnect) */
   constructor(urlProvider, { onStatus = () => {}, onError = () => {} } = {}) {
@@ -313,6 +320,24 @@ export class DerivSocket {
     ws.onerror = () => setTimeout(() => { if (ws.readyState === WebSocket.CLOSED) end(1006, "connection refused"); }, 100);
   }
 
+  /**
+   * Deriv sometimes ends a running stream with "subscription closed by server" (its side restarts
+   * or rebalances). The socket stays open, so nothing else would bring the stream back: ask for
+   * it again after a short pause. Gives up (and reports the error) after a few tries in a row
+   * that got no data; any message with data resets the count.
+   */
+  #resubscribe(id, stream) {
+    if ((stream.closedRetries ?? 0) >= STREAM_RETRIES) return false;
+    const delay = 1000 * 2 ** (stream.closedRetries ?? 0);
+    stream.closedRetries = (stream.closedRetries ?? 0) + 1;
+    stream.subId = undefined;
+    setTimeout(() => {
+      if (this.streams.get(id) !== stream || this.ws?.readyState !== WebSocket.OPEN) return;   // unsubscribed, or a reconnect re-sends it
+      this.ws.send(JSON.stringify({ ...stream.request, req_id: id }));
+    }, delay);
+    return true;
+  }
+
   #scheduleReconnect() {
     const delay = Math.min(30000, 1000 * 2 ** this.retry++);
     clearTimeout(this.reconnectTimer);
@@ -326,7 +351,9 @@ export class DerivSocket {
     const stream = this.streams.get(id);
     if (stream) {
       if (msg.subscription?.id) stream.subId = msg.subscription.id;
+      if (msg.error && isStreamClosed(msg.error) && this.#resubscribe(id, stream)) return;
       if (msg.error) this.onError(new Error(msg.error.message || msg.error.code));
+      else stream.closedRetries = 0;
       stream.onMessage(msg);
     }
     const p = this.pending.get(id);

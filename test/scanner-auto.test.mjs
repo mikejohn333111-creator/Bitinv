@@ -359,3 +359,21 @@ test("Scanner: after a finished scan it hands the engine its ready setups, best 
   assert.deepEqual(v.auto, { on: true, today: 1, maxDay: 4 });
   assert.deepEqual(v.items.map((i) => [i.id, i.traded]), [["b", true], ["a", false], ["w", false]]);
 });
+
+test("a scanner trade's plan on the chart comes from the setup when Deriv's contract details have no stop or target", async () => {
+  const ctx = await setup();
+  const { engine, sock } = ctx;
+  try {
+    engine.start();
+    engine.autoScan([setup1()]);
+    await flush();
+    // Deriv's update without limit_order: the stop and target stay the setup's (price 1001, stop 10, target 20)
+    sock.push((r) => r.contract_id === 9000, { msg_type: "proposal_open_contract", proposal_open_contract: { contract_id: 9000, contract_type: "MULTUP", buy_price: 200.2, profit: 1, is_sold: 0, entry_spot: 1001.2 } });
+    await flush();
+    const { plan } = engine.status().open[0];
+    assert.equal(plan.side, "BUY");
+    assert.equal(plan.entry, 1001.2, "Deriv's entry");
+    assert.deepEqual([plan.sl, plan.tp, plan.slMoney, plan.tpMoney], [991, 1021, 100, 200]);
+    assert.deepEqual(engine.state.openMeta["9000"].plan.sl, 991, "kept for a restart");
+  } finally { ctx.cleanup(); }
+});

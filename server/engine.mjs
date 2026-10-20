@@ -745,8 +745,11 @@ export class TradingEngine {
       if (!size?.ok) { this.#scanSkip(it, size?.reason || "the balance isn't known yet"); return false; }
       const sizeText = `stake ${this.#money(size.stake)} at x${mult} · risk ${this.#money(size.stopLoss)} · target ${this.#money(size.takeProfit)}`;
       const scan = { strategy: it.strategy, tf: it.tf, name: it.name || it.symbol, id: it.id };
-      const meta = { side: it.side, entryEpoch: it.start, horizon: it.horizonBars || 0, symbol: it.symbol, barSec: it.tf, source: "scanner", scan };
+      // The setup's own prices: the chart draws them if Deriv's contract details don't give the stop and target.
       const up = it.side === "BUY";
+      const plan = { side: it.side, entry, sl: up ? entry - it.slDist : entry + it.slDist, tp: up ? entry + it.tpDist : entry - it.tpDist,
+                     slMoney: size.stopLoss, tpMoney: size.takeProfit };
+      const meta = { side: it.side, entryEpoch: it.start, horizon: it.horizonBars || 0, symbol: it.symbol, barSec: it.tf, source: "scanner", scan, plan };
       const ok = await this.#order({ side: it.side, symbol: it.symbol, size, mult, meta, sizeText, reason: it.reason || "",
         title: `Opened ${it.side} ${it.symbol} from the scanner (${name})`,
         // Deriv's price now: refused when it is already past the plan's stop loss or take profit.
@@ -816,7 +819,7 @@ export class TradingEngine {
     this.contracts.set(id, c);
     if ((meta.side || meta.horizon) && !c.stale) {
       this.state.openMeta[id] = { side: c.side, entryEpoch: c.entryEpoch, horizon: c.horizon, symbol: c.symbol, ...(c.barSec && { barSec: c.barSec }),
-                                  ...(c.source && { source: c.source }), ...(c.scan && { scan: c.scan }) };
+                                  ...(c.source && { source: c.source }), ...(c.scan && { scan: c.scan }), ...(c.plan && { plan: c.plan }) };
       this.#saveState();
     }
     const sock = this.socket;

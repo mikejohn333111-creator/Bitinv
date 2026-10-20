@@ -1,24 +1,29 @@
-// Tbot server engine: the browser bot's trading logic (public/js/app.js) without the page,
-// so it can run 24/7 on a server. It uses the same strategy, sizing, risk-limit and Deriv
-// modules as the browser, and trades the same way: one evaluation per closed M1 bar,
-// proposal then buy with underlying_symbol and limit_order, open trades tracked with
-// proposal_open_contract, the daily loss limit checked on equity, time exits for the AI.
+// Tbot server engine: the scanner's trader. It holds the Deriv connection, the account and the
+// risk limits, and (in Auto trade, demo only) takes the scanner's "Ready now" setups on their own
+// markets (autoScan). It has no single-market strategy of its own any more: the strategies
+// (ICT, Rules, AI model) run inside the scanner (server/scanner.mjs).
+//
+// Orders go out as on the website: proposal then buy with underlying_symbol and limit_order, open
+// trades tracked with proposal_open_contract, the daily loss limit checked on equity, time exits.
+// A 1-minute candle stream of one synthetic index (open around the clock) is the bot's clock:
+// each candle close runs the time exits and the daily loss check, and a quiet stream means a
+// stuck connection (watchdog).
 //
 // What the server adds: settings, state and the activity log live in files, so after a
 // crash, reboot or update the bot resumes on its own and picks up its open trades again.
 import { readFileSync } from "node:fs";
 import { CONFIG } from "../public/js/config.js";
-import { evaluateRules, evaluateAI, evaluateICT, AI_DEFAULTS, AI_FAST, aiParams, fastModeOn,
-         BOT_TIMEFRAMES, botTfOf, rulesParamsFor, ictParamsFor, historyCount, minBarsFor } from "../public/js/strategy.js";
-import { PendingPlan, describePending, firstTouch } from "../public/js/pending.js";
-import { MARKETS_REQUEST, PLAIN_REQUEST, FALLBACK_MARKETS, parseMarkets, marketsOrFallback, groupMarkets, findMarket,
-         marketName, isSynthetic, isClosed } from "../public/js/markets.js";
+import { AI_DEFAULTS } from "../public/js/strategy.js";
+import { MARKETS_REQUEST, PLAIN_REQUEST, parseMarkets, marketsOrFallback, marketName, isClosed } from "../public/js/markets.js";
 import { sizeMultiplier, RiskGuard } from "../public/js/risk.js";
 import { getAccounts, createDemoAccount, getTradingSocketUrl, DerivSocket, cleanAppId } from "../public/js/deriv.js";
 import { tradePlan, planView } from "./chart.mjs";
 import { staleReason } from "./scanner.mjs";
 
 export const HISTORY_BARS = 1200;
+/** The clock: a synthetic index that ticks around the clock. Its 1-minute candles drive the time exits and loss checks. */
+export const CLOCK_SYMBOL = "R_75";
+const CLOCK_BARS = 120;
 const DEFAULT_MULTIPLIERS = [10, 20, 30, 40, 50, 100, 200, 300, 400];
 const LOG_KEEP = 500;                 // entries kept in memory (the file keeps 2000)
 const MARKETS_REFRESH_MS = 5 * 60000;  // Deriv's market list (open / closed) is loaded again this often
@@ -28,27 +33,25 @@ const WATCHDOG_TICK_MS = 30000;
 const FEED_QUIET_MS = 3 * 60000;      // synthetic indices tick every 1-2 s, so 3 quiet minutes means the feed is stuck
 
 // ------------------------------------------------------------- settings
+/** Saved settings carry this version. A file without it is from before the bot became scanner-only. */
+export const SETTINGS_VERSION = 2;
 export const DEFAULT_SETTINGS = {
-  symbol: "R_75", strategy: "rules", mode: "auto",
-  riskPct: 1, maxDailyLossPct: 3, maxOpen: 1, maxTradesPerDay: 20, maxConsecLosses: 3, cooldownMinutes: 15,
-  multiplier: 0, signalGap: 8,
+  v: SETTINGS_VERSION,
+  // "auto": the scanner's ready setups are traded (demo only). "signals": the scanner only shows them.
+  mode: "auto",
+  riskPct: 1, maxDailyLossPct: 3, maxConsecLosses: 3, cooldownMinutes: 15,
+  scanAutoMaxDay: 4, scanAutoMaxOpen: 2,      // trades per day and open at once
+  // The scanner's AI model reads these (not on the page).
   aiThreshold: 0.55, aiBarrier: AI_DEFAULTS.barrierATR, aiHorizon: AI_DEFAULTS.horizonBars,
-  aiFast: false,                      // fast mode (AI only, demo only): see AI_FAST in public/js/strategy.js
-  botTf: 60,                          // the candles the strategy reads: 60, 900 or 3600 seconds
   allowReal: false,
-  // Auto-trade scanner setups (demo only): the scanner's "Ready now" setups on any market it watches.
-  scanAuto: false, scanAutoStrategies: ["ict", "rules"], scanAutoTfs: [900, 3600], scanAutoMaxDay: 4, scanAutoMaxOpen: 2,
 };
 export const SCAN_AUTO_STRATEGIES = ["ict", "rules", "ai"];
 export const SCAN_AUTO_TFS = [900, 3600];
-const FAST_REAL_MSG = "Fast mode is demo only. It never trades on a real money account.";
-const ICT_REAL_MSG = "ICT is demo only for auto trade. It never trades on a real money account. Signals only still works.";
 const SCAN_REAL_MSG = "Scanner auto-trade is demo only. It never trades on a real money account.";
 const SCAN_STRATEGY_NAMES = { ict: "ICT", rules: "Rules", ai: "AI model" };
 const SCAN_TF_NAMES = { 900: "15m", 3600: "1h" };
 const SCAN_TAKEN_KEEP = 300;          // setup ids remembered (each is taken at most once)
 const SYMBOL_INFO_MS = 60 * 60000;    // a market's Multiplier range and stake limits are asked again after this
-const TF_WORDS = { 60: "1-minute", 900: "15-minute", 3600: "1-hour" };
 /** A time limit in plain words: "60 min", "30 hours". */
 export function spanText(bars, barSec = 60) {
   const min = Math.round((bars * barSec) / 60);
@@ -58,41 +61,25 @@ export function spanText(bars, barSec = 60) {
 const NUMBERS = {
   riskPct:         { min: 0.1, max: 5, label: "Risk per trade" },
   maxDailyLossPct: { min: 0.5, max: 20, label: "Daily loss limit" },
-  maxOpen:         { min: 1, max: 5, int: true, label: "Max open trades" },
-  maxTradesPerDay: { min: 1, max: 500, int: true, label: "Max trades per day" },
   maxConsecLosses: { min: 0, max: 20, int: true, label: "Losses in a row before a pause" },
   cooldownMinutes: { min: 0, max: 1440, int: true, label: "Pause length" },
-  multiplier:      { min: 0, max: 5000, int: true, label: "Multiplier" },
-  signalGap:       { min: 0, max: 240, int: true, label: "Minutes between signals" },
   aiThreshold:     { min: 0.34, max: 0.95, label: "AI confidence" },
   aiBarrier:       { min: 0.5, max: 10, label: "AI stop distance" },
   aiHorizon:       { min: 5, max: 240, int: true, label: "AI time limit" },
-  scanAutoMaxDay:  { min: 1, max: 10, int: true, label: "Scanner trades per day" },
-  scanAutoMaxOpen: { min: 1, max: 5, int: true, label: "Scanner trades open at once" },
+  scanAutoMaxDay:  { min: 1, max: 10, int: true, label: "Trades per day" },
+  scanAutoMaxOpen: { min: 1, max: 5, int: true, label: "Trades open at once" },
 };
-const CHOICES = {
-  strategy: ["rules", "ai", "ict"],
-  mode: ["auto", "signals"],
-};
+const CHOICES = { mode: ["auto", "signals"] };
 
 /**
  * Checks a partial settings update. Numbers are clamped to safe ranges. Turning on real
- * money needs confirmReal: "REAL" in the same update. `symbols` are the market codes the bot
- * knows (Deriv's list once loaded, else the built-in one). Returns {settings, errors}.
+ * money needs confirmReal: "REAL" in the same update. Keys the bot no longer uses (the old
+ * market, strategy and multiplier settings) are ignored. Returns {settings, errors}.
  */
-export function cleanSettings(input, current = DEFAULT_SETTINGS, symbols = FALLBACK_MARKETS.map((m) => m.symbol)) {
+export function cleanSettings(input, current = DEFAULT_SETTINGS) {
   const out = {}, errors = [];
   if (!input || typeof input !== "object" || Array.isArray(input)) return { settings: out, errors: ["Settings must be an object."] };
   for (const [k, v] of Object.entries(input)) {
-    if (k === "symbol") {
-      if (typeof v !== "string" || !symbols.includes(v)) { errors.push("Unknown market."); continue; }
-      out[k] = v; continue;
-    }
-    if (k === "botTf") {
-      const n = Number(v);
-      if (!BOT_TIMEFRAMES.includes(n)) { errors.push("The bot can trade on 1-minute, 15-minute or 1-hour candles."); continue; }
-      out[k] = n; continue;
-    }
     if (NUMBERS[k]) {
       const spec = NUMBERS[k];
       let n = typeof v === "string" && v.trim() !== "" ? Number(v) : v;
@@ -102,17 +89,6 @@ export function cleanSettings(input, current = DEFAULT_SETTINGS, symbols = FALLB
     } else if (CHOICES[k]) {
       if (!CHOICES[k].includes(v)) { errors.push(`Unknown ${k}.`); continue; }
       out[k] = v;
-    } else if (k === "aiFast" || k === "scanAuto") {
-      if (typeof v !== "boolean") { errors.push(`${k === "aiFast" ? "Fast mode" : "Scanner auto-trade"} must be on or off.`); continue; }
-      out[k] = v;
-    } else if (k === "scanAutoStrategies") {
-      const list = Array.isArray(v) ? [...new Set(v)] : null;
-      if (!list?.length || list.some((x) => !SCAN_AUTO_STRATEGIES.includes(x))) { errors.push("Pick at least one strategy for scanner auto-trade (ICT, Rules or AI model)."); continue; }
-      out[k] = SCAN_AUTO_STRATEGIES.filter((x) => list.includes(x));
-    } else if (k === "scanAutoTfs") {
-      const list = Array.isArray(v) ? [...new Set(v.map(Number))] : null;
-      if (!list?.length || list.some((x) => !SCAN_AUTO_TFS.includes(x))) { errors.push("Pick 15m, 1h or both for scanner auto-trade."); continue; }
-      out[k] = SCAN_AUTO_TFS.filter((x) => list.includes(x));
     } else if (k === "allowReal") {
       if (typeof v !== "boolean") { errors.push("Allow real money must be on or off."); continue; }
       if (v && !current.allowReal && String(input.confirmReal ?? "").trim() !== "REAL") {
@@ -120,19 +96,32 @@ export function cleanSettings(input, current = DEFAULT_SETTINGS, symbols = FALLB
       }
       out[k] = v;
     }
-    // anything else (confirmReal, unknown keys) is ignored
+    // anything else (confirmReal, old or unknown keys) is ignored
   }
   return { settings: out, errors };
 }
 
-/** Settings read from disk: anything odd falls back to the default. */
-function loadSettings(raw) {
-  // A market from Deriv's list may not be in the built-in one; it is checked again once the list loads.
-  const known = typeof raw?.symbol === "string" && /^\w{2,30}$/.test(raw.symbol) ? [raw.symbol] : [];
-  const { settings } = cleanSettings({ ...raw, allowReal: undefined }, DEFAULT_SETTINGS, known);
-  return { ...DEFAULT_SETTINGS, ...settings, allowReal: raw?.allowReal === true,
-           scanAutoStrategies: [...(settings.scanAutoStrategies || DEFAULT_SETTINGS.scanAutoStrategies)],
-           scanAutoTfs: [...(settings.scanAutoTfs || DEFAULT_SETTINGS.scanAutoTfs)] };
+/**
+ * Settings read from disk: anything odd falls back to the default. A file from before the bot
+ * became scanner-only (no `v`) is moved over: Auto trade only if scanner auto-trade was on (and
+ * the bot was in Auto trade), else Signals only, so an update never starts trading by itself.
+ * Returns {settings, legacy}: legacy holds what the scanner's settings may need from the old file.
+ */
+export function loadSettings(raw) {
+  raw = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : {};
+  const { mode, allowReal, ...rest } = raw;
+  const { settings } = cleanSettings(rest, DEFAULT_SETTINGS);
+  const out = { ...DEFAULT_SETTINGS, ...settings, v: SETTINGS_VERSION, allowReal: allowReal === true };
+  const isLegacy = Object.keys(raw).length > 0 && raw.v !== SETTINGS_VERSION;
+  if (!isLegacy) { out.mode = CHOICES.mode.includes(mode) ? mode : DEFAULT_SETTINGS.mode; return { settings: out, legacy: null }; }
+  const autoOn = raw.scanAuto === true && mode !== "signals";
+  out.mode = autoOn ? "auto" : "signals";
+  // One "trades per day" now: the old bot-wide limit, if it was the smaller one.
+  const day = Number(raw.maxTradesPerDay);
+  if (Number.isFinite(day) && day >= 1 && day < out.scanAutoMaxDay) out.scanAutoMaxDay = Math.round(day);
+  const list = (v, ok) => (Array.isArray(v) ? ok.filter((x) => v.map((y) => (typeof x === "number" ? Number(y) : y)).includes(x)) : []);
+  return { settings: out, legacy: { scanAuto: autoOn, strategies: list(raw.scanAutoStrategies, SCAN_AUTO_STRATEGIES), timeframes: list(raw.scanAutoTfs, SCAN_AUTO_TFS),
+                                    symbol: typeof raw.symbol === "string" ? raw.symbol.slice(0, 30) : "", strategy: typeof raw.strategy === "string" ? raw.strategy.slice(0, 10) : "" } };
 }
 
 // ----------------------------------------------------------------- helpers
@@ -164,8 +153,12 @@ export class TradingEngine {
     this.now = now;
     this.modelPath = modelPath ?? new URL("../public/model/tbotai-model.json", import.meta.url);
 
-    this.settings = loadSettings(store.getSettings());
-    this.state = { running: false, accountId: null, lastSignalEpoch: 0, lastTradeEpoch: 0, openMeta: {},
+    const loaded = loadSettings(store.getSettings());
+    this.settings = loaded.settings;
+    this.legacy = loaded.legacy;         // set once, on the first start after the update to scanner-only
+    if (this.legacy) { try { store.saveSettings(this.settings); } catch { /* saved with the next change */ } }
+    this.symbol = CLOCK_SYMBOL;
+    this.state = { running: false, accountId: null, openMeta: {},
                    tokenRejected: false, tokenError: 401, ...store.getState() };
     if (!this.state.openMeta || typeof this.state.openMeta !== "object") this.state.openMeta = {};
     // Scanner auto-trade: the UTC day, its trade count, and the setups already taken ({id, at, ok}).
@@ -179,20 +172,13 @@ export class TradingEngine {
     this.lastLogged = new Map();         // title -> time, for logOnce
     this.accounts = []; this.account = null; this.socket = null; this.trading = false; this.feed = "none";
     this.bars = []; this.forming = null; this.balance = NaN; this.currency = "USD";
-    this.multipliers = DEFAULT_MULTIPLIERS; this.minStake = 1; this.maxStake = Infinity;
     this.running = false; this.model = null; this.guard = null;
     this.markets = []; this.marketsAt = 0;  // Deriv's list of Multiplier markets (empty: the built-in list)
-    this.noMultipliers = false;          // contracts_for says this market has no Multipliers
-    this.pending = new PendingPlan();    // the one "Waiting for price" plan
-    this.pendingEnteredBar = 0;          // the candle a waiting plan was entered in
-    this.pendingStart = 0;               // the candle a waiting plan was made in (for the chart)
     this.contracts = new Map();          // contract_id -> {side, entryEpoch, horizon, profit, buyPrice, sub, opened}
     this.busy = false;                   // an order is in flight
     this.syncing = false;                // open trades not loaded yet after (re)connecting
     this.connection = "idle"; this.error = ""; this.needsToken = !!this.state.tokenRejected;
-    this.lastEval = null; this.lastCost = null; this.lastPriceAt = 0;
-    // The latest signal is kept in state.json, so the page still shows it after a restart.
-    this.lastSignal = this.state.lastSignal && typeof this.state.lastSignal === "object" ? this.state.lastSignal : null;
+    this.lastCost = null; this.lastPriceAt = 0;
     this.resumedAt = 0;
     this.marks = [];                     // the latest signals and trades, for arrows on the chart: {t, side, symbol}
     this.retryTimer = null; this.retryDelay = 5000; this.pfTimer = null;
@@ -215,6 +201,12 @@ export class TradingEngine {
     for (const e of this.store.readLog(LOG_KEEP)) { this.logs.push(e); this.seq = Math.max(this.seq, Number(e.seq) || 0); }
     const canTrade = !!this.secret && !this.state.tokenRejected;
     if (this.state.tokenRejected) { this.needsToken = true; this.error = TOKEN_MSG[this.state.tokenError] || TOKEN_MSG[401]; }
+    if (this.legacy) {
+      const l = this.legacy;
+      this.log("INFO", "The bot now trades only the scanner's setups",
+               `${l.symbol || l.strategy ? `Your old market and strategy (${[l.symbol, l.strategy].filter(Boolean).join(", ")}) are no longer used. ` : ""}` +
+               (l.scanAuto ? "Scanner auto-trade was on, so the mode is Auto trade (demo only)." : "Scanner auto-trade was off, so the mode is Signals only: the scanner shows setups and nothing is traded."));
+    }
     if (this.state.running) {
       if (this.settings.mode === "auto" && !canTrade) {
         this.#setRunning(false);
@@ -231,7 +223,7 @@ export class TradingEngine {
 
   #loadModel() {
     try { this.model = JSON.parse(readFileSync(this.modelPath, "utf8")); }
-    catch { this.model = null; this.log("INFO", "The AI model could not be loaded, so only the rules strategy works."); }
+    catch { this.model = null; this.log("INFO", "The AI model could not be loaded, so the scanner uses ICT and Rules only."); }
   }
 
   auth() { return { kind: "pat", token: this.secret?.token || "" }; }
@@ -332,12 +324,10 @@ export class TradingEngine {
     this.#makeSocket(() => getTradingSocketUrl(this.#derivCfg(), this.auth(), account.id));
   }
 
-  /** Fast mode is on (AI strategy only). Its preset replaces the AI values and the open-trade limit. */
-  fast() { return fastModeOn(this.settings); }
-
+  /** The risk guard's limits. Trades per day and open at once are the scanner's (one setting each). */
   limits() {
     const s = this.settings;
-    return { maxDailyLossPct: +s.maxDailyLossPct, maxOpen: this.fast() ? AI_FAST.maxOpen : +s.maxOpen, maxTradesPerDay: +s.maxTradesPerDay,
+    return { maxDailyLossPct: +s.maxDailyLossPct, maxOpen: +s.scanAutoMaxOpen, maxTradesPerDay: +s.scanAutoMaxDay,
              maxConsecLosses: +s.maxConsecLosses, cooldownMinutes: +s.cooldownMinutes };
   }
 
@@ -357,7 +347,7 @@ export class TradingEngine {
       onError: (e) => { if (this.socket === sock) this.#onSocketError(e); },
     });
     this.socket = sock;
-    sock.subscribe({ ticks_history: this.settings.symbol, style: "candles", granularity: this.tf(), count: this.historyBars(),
+    sock.subscribe({ ticks_history: this.symbol, style: "candles", granularity: 60, count: CLOCK_BARS,
                      end: "latest", adjust_start_time: 1 }, (msg) => this.onCandles(msg));
     if (this.trading) {
       sock.subscribe({ balance: 1 }, (msg) => {
@@ -385,18 +375,7 @@ export class TradingEngine {
   }
 
   async #onOnline(sock) {
-    try {
-      const r = await sock.send({ contracts_for: this.settings.symbol });
-      const items = r.contracts_for?.available || [];
-      const mult = items.find((a) => /MULT/.test(a.contract_type) || a.contract_category === "multiplier");
-      // Only a real list without Multipliers counts; an empty or odd answer keeps the defaults.
-      this.noMultipliers = items.length > 0 && !mult;
-      if (this.noMultipliers) this.logOnce("ERROR", `${this.marketName()} has no Multipliers on Deriv`, "Pick another market. The bot trades nothing here.");
-      if (mult?.multiplier_range?.length) this.multipliers = mult.multiplier_range.map(Number).sort((a, b) => a - b);
-      if (mult?.min_stake) this.minStake = Number(mult.min_stake);
-      if (mult?.max_stake) this.maxStake = Number(mult.max_stake);
-    } catch { /* defaults stay; the proposal will report any limit */ }
-    if (this.socket === sock) await this.loadMarkets(sock);
+    await this.loadMarkets(sock);
     if (this.trading && this.socket === sock) await this.#syncPortfolio(sock);
   }
 
@@ -475,20 +454,16 @@ export class TradingEngine {
       } catch { /* try without the filter, then give up */ }
     }
     if (this.closed || !list?.length) return;
-    const wasClosed = this.marketClosed();
     this.markets = list;
-    if (!findMarket(list, this.settings.symbol)) this.logOnce("ERROR", `${this.settings.symbol} is not in Deriv's list of Multiplier markets`, "Pick another market.");
-    if (this.marketClosed() && !wasClosed) this.log("INFO", `${this.marketName()} is closed now`, "The bot trades nothing until it opens again.");
-    else if (!this.marketClosed() && wasClosed) this.log("INFO", `${this.marketName()} is open again`);
   }
 
-  /** Market codes the settings may use: Deriv's list once loaded, else the built-in one (plus the current market). */
-  knownSymbols() { return marketsOrFallback(this.markets, this.settings.symbol).map((m) => m.symbol); }
-  marketName(symbol = this.settings.symbol) { return marketName(this.markets, symbol); }
-  marketClosed() { return isClosed(this.markets, this.settings.symbol); }
-  /** Seconds per candle of the strategy's feed. */
-  tf() { return botTfOf(this.settings); }
-  historyBars() { return historyCount(this.settings.strategy, this.tf()); }
+  /** Market codes the chart may show: Deriv's list once loaded, else the built-in one (plus the clock's). */
+  knownSymbols() { return marketsOrFallback(this.markets, this.symbol).map((m) => m.symbol); }
+  marketName(symbol = this.symbol) { return marketName(this.markets, symbol); }
+  /** The clock's market is closed (it normally never is: a synthetic index). */
+  marketClosed() { return isClosed(this.markets, this.symbol); }
+  /** Seconds per candle of the clock stream. */
+  tf() { return 60; }
 
   /** Deriv rejected the token: stop trading until the user adds a new one. */
   tokenRejected(e) {
@@ -518,12 +493,11 @@ export class TradingEngine {
       this.forming = all.pop() || null;
       this.bars = all;
       this.lastPriceAt = this.now();
-      this.evaluate(false);
     } else if (msg.msg_type === "ohlc") {
       const o = msg.ohlc;
       const bar = { epoch: Number(o.open_time), open: +o.open, high: +o.high, low: +o.low, close: +o.close };
       this.lastPriceAt = this.now();
-      const keep = Math.max(this.historyBars(), HISTORY_BARS);
+      const keep = HISTORY_BARS;
       if (!this.forming || bar.epoch > this.forming.epoch) {
         if (this.forming) {
           this.bars.push(this.forming);
@@ -532,156 +506,22 @@ export class TradingEngine {
           this.onBarClosed();
         } else this.forming = bar;
       } else if (bar.epoch === this.forming.epoch) this.forming = bar;
-      else return;
-      this.checkPending();
     }
-  }
-
-  // ------------------------------------------------------- waiting plans
-  /** A new price: a waiting plan may be entered or cancelled now, not only at the candle close. */
-  checkPending() {
-    if (!this.pending.plan || !this.running || !this.forming) return;
-    const ev = this.pending.price(this.forming.close, this.forming.epoch);
-    if (ev) this.#pendingEvent(ev);
-  }
-
-  #pendingEvent(ev) {
-    const s = this.settings, p = ev.plan;
-    if (ev.type === "new") {
-      this.pendingStart = this.forming?.epoch ?? this.bars.at(-1)?.epoch ?? 0;
-      if (ev.replaced) this.log("INFO", `Dropped the waiting ${ev.replaced.side} plan`, "A newer setup replaced it.");
-      this.log("INFO", `Waiting for price: ${p.side} ${s.symbol}`, `${describePending(p, fmtNum, (t) => new Date(t * 1000).toISOString().slice(11, 16) + " UTC")} ${p.reason}`);
-    } else if (ev.type === "cancel") {
-      this.log("INFO", `Cancelled the waiting ${p.side} plan`, `${ev.text.charAt(0).toUpperCase()}${ev.text.slice(1)}.`);
-    } else if (ev.type === "enter") {
-      this.pendingEnteredBar = this.forming.epoch;
-      this.handleSignal(ev.signal, { entry: ev.signal.entry, barEpoch: this.forming.epoch, fromPending: true })
-        .catch((e) => this.log("ERROR", "Signal handling failed", e.message));
-    }
-  }
-
-  /** Drops the waiting plan (stop, market, strategy or timeframe change), with a log line. */
-  cancelPending(text) {
-    const ev = this.pending.cancel("stopped", text);
-    if (ev) this.#pendingEvent(ev);
   }
 
   lastPrice() { return this.forming?.close ?? this.bars.at(-1)?.close ?? NaN; }
 
-  strategyParams() {
-    const s = this.settings;
-    return s.strategy === "ai" ? aiParams(s)
-      : s.strategy === "ict" ? ictParamsFor(this.tf(), { real: !isSynthetic(this.markets, s.symbol) }) : rulesParamsFor(this.tf());
-  }
-
-  evaluate(actOnSignal) {
-    if (!this.bars.length) return null;
-    const s = this.settings;
-    const res = s.strategy === "ai" ? evaluateAI(this.bars, this.model, this.strategyParams())
-              : s.strategy === "ict" ? evaluateICT(this.bars, this.strategyParams())
-              : evaluateRules(this.bars, this.strategyParams());
-    this.lastEval = { action: res.action || null, reason: res.reason || "", sees: this.#describe(res),
-                      at: this.now(), barEpoch: this.bars.at(-1).epoch, strategy: s.strategy };
-    if (!actOnSignal) return res;
-    // A closed-candle signal for a setup the bot already entered (or dropped) on a touch is not traded twice.
-    const lastBar = this.bars.at(-1);
-    if (res.action && !this.pending.used(res.setupId) && lastBar.epoch !== this.pendingEnteredBar)
-      this.handleSignal(res).catch((e) => this.log("ERROR", "Signal handling failed", e.message));
-    const ev = this.pending.offer(res, { strategy: s.strategy, symbol: s.symbol, barSec: this.tf(), horizonBars: res.horizonBars || 0 });
-    if (ev) this.#pendingEvent(ev);
-    return res;
-  }
-
-  #describe(res) {
-    const i = res.info || {};
-    if (i.note) return i.note === "loading history" ? "Loading price history" : i.note === "model not loaded" ? "AI model not loaded" : i.note;
-    if (this.settings.strategy === "ict")
-      return res.pending ? `Setup found, waiting for price: ${res.pending.reason}` : res.action ? res.reason
-        : `No setup right now${i.htfText ? ` (${i.htfText})` : ""}`;
-    return this.settings.strategy === "ai"
-      ? `up ${(i.pUp * 100).toFixed(0)}% · down ${(i.pDn * 100).toFixed(0)}% · flat ${(i.pNone * 100).toFixed(0)}%`
-      : `${i.regime} · ADX ${i.adx?.toFixed(0)} · RSI ${i.rsi?.toFixed(0)}`;
-  }
-
+  /** Every closed clock candle: time limits, the daily loss check (also a new day), and the halt's closes. */
   onBarClosed() {
     this.timeExits();
-    this.checkGuard();          // also starts a new day for the limits, even if nothing else changes
+    this.checkGuard();
     this.haltExits();
-    if (!this.running) { this.evaluate(false); return; }
-    this.evaluate(true);
-  }
-
-  // -------------------------------------------------------------- signals
-  chooseMultiplier() {
-    const m = +this.settings.multiplier;
-    return this.multipliers.includes(m) ? m : this.multipliers[0];
   }
 
   #money(v) { return Number.isFinite(v) ? `${v.toFixed(2)} ${this.currency}` : "–"; }
 
   /**
-   * A signal from a closed candle, or (opts.fromPending) a waiting plan that price just
-   * reached: then opts.entry is the price now and opts.barEpoch the candle it happened in.
-   */
-  async handleSignal(sig, opts = {}) {
-    const s = this.settings, barSec = this.tf();
-    const lastBar = this.bars.at(-1);
-    const entry = opts.entry ?? lastBar.close, barEpoch = opts.barEpoch ?? lastBar.epoch;
-    // the candle before the trade opens: time limits count candles from here
-    const signalEpoch = opts.fromPending ? barEpoch - barSec : lastBar.epoch;
-    const gapSec = s.mode === "signals" && !opts.fromPending ? Math.max(+s.signalGap * 60, (sig.horizonBars || 0) * barSec) : 0;
-    if (gapSec && barEpoch - (this.state.lastSignalEpoch || 0) < gapSec) return;
-
-    const mult = this.chooseMultiplier();
-    const size = Number.isFinite(this.balance)
-      ? sizeMultiplier({ balance: this.balance, riskPct: +s.riskPct, entry, slDist: sig.slDist, tpDist: sig.tpDist,
-                         multiplier: mult, minStake: this.minStake, maxStake: this.maxStake })
-      : null;
-    const up = sig.action === "BUY";
-    const sl = up ? entry - sig.slDist : entry + sig.slDist, tp = up ? entry + sig.tpDist : entry - sig.tpDist;
-    const sizeText = size?.ok ? `stake ${this.#money(size.stake)} at x${mult} · risk ${this.#money(size.stopLoss)} · target ${this.#money(size.takeProfit)}`
-                   : size ? size.reason : "add your Deriv token to see the stake for your balance";
-    const signal = { action: sig.action, symbol: s.symbol, entry, sl, tp, sizeText, reason: sig.reason || "", at: this.now(), barEpoch,
-                     ...(opts.fromPending && { fromPending: true }),
-                     // for the chart: the planned close, and the money at the stop and the target
-                     ...(sig.horizonBars && { end: signalEpoch + (sig.horizonBars + 1) * barSec }),
-                     ...(size?.ok && { slMoney: size.stopLoss, tpMoney: size.takeProfit }) };
-
-    if (s.mode === "signals") {
-      this.state.lastSignalEpoch = barEpoch;
-      this.lastSignal = this.state.lastSignal = { ...signal, traded: false };
-      this.#mark(barEpoch, sig.action);
-      this.#saveState();
-      this.log(sig.action, `${sig.action} ${s.symbol} @ ${fmtNum(entry)}`, `SL ${fmtNum(sl)} · TP ${fmtNum(tp)} · ${sizeText} · ${sig.reason}`);
-      return;
-    }
-
-    // ---- auto trade
-    if (!this.trading) { this.logOnce("ERROR", "Auto trade needs your Deriv account. Add your token under Deriv connection."); return; }
-    // Fast mode and ICT are demo only, whatever Allow real money says.
-    if (this.fast() && this.account?.type !== "demo") { this.logOnce("ERROR", `Skipped ${sig.action}: ${FAST_REAL_MSG}`, "Turn fast mode off, or use a demo account."); return; }
-    if (s.strategy === "ict" && this.account?.type !== "demo") { this.logOnce("ERROR", `Skipped ${sig.action}: ${ICT_REAL_MSG}`, "Use a demo account, or Signals only."); return; }
-    if (this.marketClosed()) { this.logOnce("INFO", `Skipped ${sig.action}: ${this.marketName()} is closed now`); return; }
-    if (this.noMultipliers) { this.logOnce("ERROR", `Skipped ${sig.action}: ${this.marketName()} has no Multipliers`); return; }
-    if (this.syncing) { this.log("INFO", `Skipped ${sig.action}: still checking your open trades`); return; }
-    if (barEpoch <= (this.state.lastTradeEpoch || 0)) return;   // already traded on this bar
-    const blocked = this.guard.blockReason(this.openCount(false), this.now());
-    if (blocked) { this.log("INFO", `Skipped ${sig.action}: ${blocked}`); return; }
-    if (!size?.ok) { this.log("INFO", `Skipped ${sig.action}`, size?.reason || "balance not known yet"); return; }
-    const meta = { side: sig.action, entryEpoch: signalEpoch, horizon: sig.horizonBars || 0, symbol: s.symbol, ...(barSec !== 60 && { barSec }) };
-    await this.#order({ side: sig.action, symbol: s.symbol, size, mult, meta, sizeText, reason: sig.reason,
-      onBought: () => {
-        this.state.lastSignalEpoch = barEpoch;
-        this.state.lastTradeEpoch = barEpoch;
-        this.lastSignal = this.state.lastSignal = { ...signal, traded: true };
-        this.#mark(this.forming?.epoch ?? signalEpoch + barSec, sig.action);   // the trade opens in the candle after the signal
-      },
-      onUnsure: () => { this.state.lastTradeEpoch = barEpoch; },   // never retry this bar
-    });
-  }
-
-  /**
-   * The order itself, for the bot's signals and for scanner setups: a proposal with the stop
+   * The order itself, for scanner setups: a proposal with the stop
    * loss and take profit as money, then the buy, then the trade is followed like any other.
    * `check(proposal)` may refuse the price Deriv quotes (a reason in words). Returns true when bought.
    */
@@ -746,11 +586,11 @@ export class TradingEngine {
   /** True when the scanner's setup with this id was traded. */
   scanTraded(id) { return this.state.scanAuto.taken.some((x) => x.id === id && x.ok); }
 
-  /** Open scanner trades (not counting closed ones the bot is only looking up). */
-  scanOpenCount() { let n = 0; for (const c of this.contracts.values()) if (!c.stale && c.source === "scanner") n++; return n; }
+  /** Open trades for the "open at once" limit: every open trade, also ones from before the update or opened by hand. */
+  scanOpenCount() { return this.openCount(); }
 
-  /** Scanner auto-trade is on, but the account is a real money one (it trades nothing there). */
-  scanAutoBlocked() { return !!this.settings.scanAuto && !!this.account && this.account.type !== "demo"; }
+  /** Auto trade is chosen, but the account is a real money one (it trades nothing there). */
+  scanAutoBlocked() { return this.settings.mode === "auto" && !!this.account && this.account.type !== "demo"; }
 
   /**
    * Why no scanner setup can be taken right now, or "" when one can. `quiet` reasons are
@@ -758,24 +598,24 @@ export class TradingEngine {
    */
   scanAutoBlock() {
     const s = this.settings;
-    if (!s.scanAuto) return { why: "scanner auto-trade is off", quiet: true };
-    if (!this.running) return { why: "the bot is stopped", quiet: true };
     if (s.mode !== "auto") return { why: "the bot is in Signals only mode", quiet: true };
+    if (!this.running) return { why: "the bot is stopped", quiet: true };
     if (!this.trading || !this.account) return { why: "the bot isn't connected to your Deriv account", quiet: true };
     if (this.account.type !== "demo") return { why: SCAN_REAL_MSG, real: true };
     if (this.syncing || this.busy || this.scanBusy || this.pendingBuy) return { why: "the bot is busy", quiet: true };
     const blocked = this.guard?.blockReason(0, this.now());   // the daily loss limit, the losing-streak pause, max trades per day
     if (blocked) return { why: blocked };
-    if (this.#scanDay().count >= +s.scanAutoMaxDay) return { why: `${s.scanAutoMaxDay} scanner trades today already (the most allowed)` };
-    if (this.scanOpenCount() >= +s.scanAutoMaxOpen) return { why: `${s.scanAutoMaxOpen} scanner trades open already (the most allowed)` };
+    const n = (k, w) => `${k} ${w}${+k === 1 ? "" : "s"}`;
+    if (this.#scanDay().count >= +s.scanAutoMaxDay) return { why: `${n(s.scanAutoMaxDay, "trade")} today already (the most allowed)` };
+    if (this.scanOpenCount() >= +s.scanAutoMaxOpen) return { why: `${n(s.scanAutoMaxOpen, "trade")} open already (the most allowed)` };
     return { why: "" };
   }
 
-  /** Why this one setup can't be taken (the bot-wide checks are in scanAutoBlock), or "". */
+  /**
+   * Why this one setup can't be taken (the bot-wide checks are in scanAutoBlock), or "".
+   * The scanner only hands over setups of the strategies and timeframes picked in its settings.
+   */
   scanSetupBlock(it) {
-    const s = this.settings;
-    if (!s.scanAutoStrategies.includes(it.strategy)) return { why: "its strategy is not picked for auto-trade", quiet: true };
-    if (!s.scanAutoTfs.includes(it.tf)) return { why: "its timeframe is not picked for auto-trade", quiet: true };
     if (this.state.scanAuto.taken.some((x) => x.id === it.id)) return { why: "already taken", quiet: true };
     const stale = staleReason(it, this.now());
     if (stale) return { why: stale };
@@ -792,7 +632,7 @@ export class TradingEngine {
   autoScan(items) {
     const all = this.scanAutoBlock();
     if (all.why) {
-      if (all.real) this.logOnce("ERROR", "Scanner auto-trade placed no trade: it is demo only", `Account ${this.account?.id} is a real money account. Switch to a demo account or turn scanner auto-trade off.`);
+      if (all.real) this.logOnce("ERROR", "Scanner auto-trade placed no trade: it is demo only", `Account ${this.account?.id} is a real money account. Switch to a demo account or use Signals only.`);
       else if (!all.quiet) for (const it of items) if (!this.scanSetupBlock(it).quiet) this.#scanSkip(it, all.why);
       return null;
     }
@@ -818,8 +658,6 @@ export class TradingEngine {
 
   /** A market's Multiplier range and stake limits (contracts_for), asked once an hour. */
   async #symbolLimits(symbol) {
-    if (symbol === this.settings.symbol && !this.noMultipliers)
-      return { multipliers: this.multipliers, minStake: this.minStake, maxStake: this.maxStake, none: false };
     const known = this.symbolInfo.get(symbol);
     if (known && this.now() - known.at < SYMBOL_INFO_MS) return known;
     const r = await this.socket.send({ contracts_for: symbol });
@@ -855,8 +693,8 @@ export class TradingEngine {
       if (lim.none) { this.#scanSkip(it, `${it.name || it.symbol} has no Multipliers`); return false; }
       if (!this.running) return false;
       if (this.busy || this.syncing) { this.#scanSkip(it, "the bot was busy with another order"); return false; }
-      const s = this.settings, m = +s.multiplier;
-      const mult = lim.multipliers.includes(m) ? m : lim.multipliers[0];
+      const s = this.settings;
+      const mult = lim.multipliers[0];   // the lowest Multiplier the market has
       const entry = Number.isFinite(it.price) ? it.price : it.entry;
       const size = Number.isFinite(this.balance)
         ? sizeMultiplier({ balance: this.balance, riskPct: +s.riskPct, entry, slDist: it.slDist, tpDist: it.tpDist,
@@ -888,9 +726,9 @@ export class TradingEngine {
   scanAutoView() {
     const s = this.settings, sa = this.#scanDay();
     const block = this.scanAutoBlock();
-    return { on: !!s.scanAuto, demoOnly: true, blocked: this.scanAutoBlocked(), today: sa.count, maxDay: +s.scanAutoMaxDay,
-             open: this.scanOpenCount(), maxOpen: +s.scanAutoMaxOpen, strategies: [...s.scanAutoStrategies], timeframes: [...s.scanAutoTfs],
-             waiting: s.scanAuto ? block.why : "" };
+    const on = s.mode === "auto";
+    return { on, demoOnly: true, blocked: this.scanAutoBlocked(), today: sa.count, maxDay: +s.scanAutoMaxDay,
+             open: this.scanOpenCount(), maxOpen: +s.scanAutoMaxOpen, waiting: on ? block.why : "" };
   }
 
   // ------------------------------------------------------------ contracts
@@ -901,11 +739,8 @@ export class TradingEngine {
     return e;
   }
 
-  /**
-   * Open trades (not counting closed ones the bot is only looking up). Without the scanner's
-   * trades for the bot's own limit: those have their own (scanAutoMaxOpen).
-   */
-  openCount(withScanner = true) { let n = 0; for (const c of this.contracts.values()) if (!c.stale && (withScanner || c.source !== "scanner")) n++; return n; }
+  /** Open trades (not counting closed ones the bot is only looking up). */
+  openCount() { let n = 0; for (const c of this.contracts.values()) if (!c.stale) n++; return n; }
 
   /**
    * Daily loss limit on equity. Skipped while an order is in flight, open trades are loading,
@@ -961,7 +796,7 @@ export class TradingEngine {
         this.#forget(id, c);
         const soldAt = Number(poc.sell_time) > 0 ? Math.min(Number(poc.sell_time) * 1000, this.now()) : this.now();
         this.guard?.recordClose(c.profit, soldAt);
-        this.log(c.profit >= 0 ? "WIN" : "LOSS", `Closed ${c.side} ${c.symbol || this.settings.symbol}: ${c.profit >= 0 ? "+" : ""}${this.#money(c.profit)}`,
+        this.log(c.profit >= 0 ? "WIN" : "LOSS", `Closed ${c.side}${c.symbol ? ` ${c.symbol}` : ""}: ${c.profit >= 0 ? "+" : ""}${this.#money(c.profit)}`,
                  [c.source === "scanner" ? "from the scanner" : "", c.stale ? "it closed while the bot wasn't watching" : "",
                   poc.exit_tick_display_value ? `exit ${poc.exit_tick_display_value}` : ""].filter(Boolean).join(" · "));
         // The payout may reach the balance stream after this message: wait for it before the loss check.
@@ -1016,9 +851,8 @@ export class TradingEngine {
 
   // ------------------------------------------------------------- run/stop
   #describeRun() {
-    const s = this.settings;
-    const strat = s.strategy === "ai" ? (this.fast() ? "AI model (fast mode)" : "AI model") : s.strategy === "ict" ? "ICT" : "rules";
-    return `${strat}, ${s.mode === "auto" ? "auto trade" : "signals only"}, ${this.marketName()}, ${TF_WORDS[this.tf()]} candles`;
+    return this.settings.mode === "auto" ? "Auto trade: the scanner's ready setups are traded (demo only)"
+                                         : "Signals only: the scanner shows setups, nothing is traded";
   }
 
   #setRunning(on) {
@@ -1028,37 +862,27 @@ export class TradingEngine {
     this.#saveState();
   }
 
+  /** Start: in Auto trade the scanner's ready setups are traded (demo only); in Signals only nothing is. */
   start() {
     if (this.running) return;
     const s = this.settings;
     if (s.mode === "auto") {
-      if (!this.secret) throw new UserError("Add your Deriv token first, so the bot can trade on your account.");
+      if (!this.secret) throw new UserError("Add your Deriv token first, so the bot can trade on your demo account.");
       if (this.needsToken) throw new UserError(this.error || TOKEN_MSG[401]);
       if (!this.trading || !this.account) throw new UserError("The bot isn't connected to your Deriv account yet. Please wait a moment and try again.");
-      if (this.account.type === "real" && !s.allowReal) throw new UserError("This is a real money account. Turn on Allow real money first.");
-      if (this.fast() && this.account.type !== "demo") {
-        this.log("ERROR", "Did not start: fast mode is demo only", "Turn fast mode off, or use a demo account.");
-        throw new UserError(`${FAST_REAL_MSG} Turn it off, or use a demo account.`, 403, "fast_demo_only");
-      }
-      if (s.strategy === "ict" && this.account.type !== "demo") {
-        this.log("ERROR", "Did not start: ICT is demo only for auto trade", "Use a demo account, or Signals only.");
-        throw new UserError(`${ICT_REAL_MSG} Use a demo account.`, 403, "ict_demo_only");
-      }
-      if (s.scanAuto && this.account.type !== "demo") {
-        this.log("ERROR", "Did not start: scanner auto-trade is demo only", "Turn scanner auto-trade off, or use a demo account.");
-        throw new UserError(`${SCAN_REAL_MSG} Turn it off under Settings > Scanner, or use a demo account.`, 403, "scanner_demo_only");
+      if (this.account.type !== "demo") {
+        this.log("ERROR", "Did not start: auto trade is demo only", "Switch to a demo account, or use Signals only.");
+        throw new UserError(`${SCAN_REAL_MSG} Switch to a demo account, or use Signals only.`, 403, "scanner_demo_only");
       }
     }
     this.#setRunning(true);
-    this.log("INFO", `Bot started: ${this.#describeRun()}`,
+    this.log("INFO", `Bot started. ${this.#describeRun()}`,
              this.account ? `${this.account.type === "demo" ? "Demo" : "REAL"} account ${this.account.id}` : "Prices only, no account");
-    if (this.bars.length < minBarsFor(s.strategy, this.tf())) this.log("INFO", "Waiting for enough price history");
-    if (this.marketClosed()) this.log("INFO", `${this.marketName()} is closed now`, "The bot trades nothing until it opens again.");
   }
 
+  /** Stop: no new trades. Open trades keep their stop loss and take profit (and are still watched). */
   stop() {
     if (!this.running) return;
-    this.cancelPending("the bot was stopped");
     this.#setRunning(false);
     this.resumedAt = 0;
     this.log("INFO", "Bot stopped. Open trades keep their stop loss and take profit.");
@@ -1068,32 +892,18 @@ export class TradingEngine {
   /** Applies an already cleaned partial settings object. */
   updateSettings(partial) {
     const prev = { ...this.settings };
-    if (partial.mode && partial.mode !== prev.mode && this.running) throw new UserError("Stop the bot before switching mode.");
     const next = { ...prev, ...partial };
-    if (fastModeOn(next) && !fastModeOn(prev) && this.account && this.account.type !== "demo") {
-      this.log("ERROR", "Fast mode was not turned on: it is demo only", `Account ${this.account.id} is a real money account.`);
-      throw new UserError(`${FAST_REAL_MSG} Switch to a demo account first.`, 403, "fast_demo_only");
-    }
-    if (next.strategy === "ict" && prev.strategy !== "ict" && this.running && next.mode === "auto" && this.account && this.account.type !== "demo") {
-      this.log("ERROR", "ICT was not turned on: it is demo only for auto trade", `Account ${this.account.id} is a real money account.`);
-      throw new UserError(`${ICT_REAL_MSG} Stop the bot or switch to a demo account first.`, 403, "ict_demo_only");
-    }
-    if (next.scanAuto && !prev.scanAuto && this.account && this.account.type !== "demo") {
-      this.log("ERROR", "Scanner auto-trade was not turned on: it is demo only", `Account ${this.account.id} is a real money account.`);
+    if (next.mode === "auto" && prev.mode !== "auto" && this.account && this.account.type !== "demo") {
+      this.log("ERROR", "Auto trade was not turned on: it is demo only", `Account ${this.account.id} is a real money account.`);
       throw new UserError(`${SCAN_REAL_MSG} Switch to a demo account first.`, 403, "scanner_demo_only");
     }
-    if (partial.symbol && this.markets.length && !findMarket(this.markets, partial.symbol))
-      throw new UserError("That market isn't in Deriv's list of Multiplier markets.", 400, "unknown_market");
-    Object.assign(this.settings, partial);
+    Object.assign(this.settings, partial, { v: SETTINGS_VERSION });
     this.store.saveSettings(this.settings);
     if (this.guard) this.guard.limits = this.limits();
-    if (fastModeOn(this.settings) !== fastModeOn(prev))
-      this.log("INFO", fastModeOn(this.settings) ? "Fast mode is on (demo only)" : "Fast mode is off",
-               fastModeOn(this.settings) ? `AI ${Math.round(AI_FAST.threshold * 100)}% confidence, stop and target ${AI_FAST.barrierATR}x ATR, closes after ${AI_FAST.horizonBars} min, up to ${AI_FAST.maxOpen} trades open`
-                                         : "Your own AI settings and open-trade limit apply again");
-    if (!!this.settings.scanAuto !== !!prev.scanAuto)
-      this.log("INFO", this.settings.scanAuto ? "Scanner auto-trade is on (demo only)" : "Scanner auto-trade is off",
-               this.settings.scanAuto ? `While the bot runs it takes "Ready now" setups (${this.settings.scanAutoStrategies.map((k) => SCAN_STRATEGY_NAMES[k]).join(", ")} on ${this.settings.scanAutoTfs.map((t) => SCAN_TF_NAMES[t]).join(", ")}), at most ${this.settings.scanAutoMaxDay} a day and ${this.settings.scanAutoMaxOpen} open at once.` : "");
+    if (next.mode !== prev.mode)
+      this.log("INFO", next.mode === "auto" ? "Mode: Auto trade (demo only)" : "Mode: Signals only",
+               next.mode === "auto" ? `${this.running ? "The bot" : "Once you press Start, the bot"} takes the scanner's "Ready now" setups, at most ${next.scanAutoMaxDay} a day and ${next.scanAutoMaxOpen} open at once.`
+                                    : "The scanner shows setups. Nothing new is traded; open trades keep their stop loss and take profit.");
     if (partial.allowReal === true && !prev.allowReal) this.log("INFO", "Real money trading is now allowed");
     if (partial.allowReal === false && prev.allowReal) {
       this.log("INFO", "Real money trading is now off");
@@ -1103,29 +913,6 @@ export class TradingEngine {
         if (demo) { this.log("INFO", `Switched to demo account ${demo.id}`); this.connectAccount(demo); }
         else this.connectPublic();
       }
-    }
-    const newMarket = partial.symbol && partial.symbol !== prev.symbol;
-    const newTf = partial.botTf !== undefined && +partial.botTf !== botTfOf(prev);
-    const newStrategy = partial.strategy && partial.strategy !== prev.strategy;
-    if (newMarket || newTf) {
-      this.cancelPending(newMarket ? "the market changed" : "the timeframe changed");
-      this.stop();
-      this.bars = []; this.forming = null; this.lastEval = null; this.lastSignal = null;
-      this.state.lastSignal = null;
-      this.#saveState();
-      this.noMultipliers = false;
-      if (newMarket) { this.multipliers = DEFAULT_MULTIPLIERS; this.minStake = 1; this.maxStake = Infinity; }
-      if (this.trading && this.account) this.connectAccount(this.account); else this.connectPublic();
-      if (newMarket) this.log("INFO", `Market changed to ${this.marketName(partial.symbol)}`,
-                              isClosed(this.markets, partial.symbol) ? "It is closed now. The bot trades nothing until it opens." : "");
-      if (newTf) this.log("INFO", `The bot now trades on ${TF_WORDS[this.tf()]} candles`,
-                          this.settings.strategy === "ai" && this.tf() !== 60 ? "The AI model was trained on 1-minute candles. On other timeframes it is untested." : "");
-    } else if (newStrategy) {
-      this.cancelPending("the strategy changed");
-      // the history needed depends on the strategy: ask again if it needs more candles
-      if (historyCount(partial.strategy, this.tf()) > historyCount(prev.strategy, this.tf()) && this.bars.length < minBarsFor(partial.strategy, this.tf())) {
-        if (this.trading && this.account) this.connectAccount(this.account); else this.connectPublic();
-      } else this.evaluate(false);
     }
     return this.settings;
   }
@@ -1253,12 +1040,8 @@ export class TradingEngine {
     const token = this.secret?.token || "";
     return {
       running: this.running,
-      mode: s.mode, strategy: s.strategy, symbol: s.symbol, symbolName: this.marketName(),
-      botTf: this.tf(),
-      marketOpen: !this.marketClosed(), synthetic: isSynthetic(this.markets, s.symbol), noMultipliers: this.noMultipliers,
+      mode: s.mode,
       marketsLoaded: this.markets.length > 0,
-      pending: this.pending.plan ? { ...this.pending.plan, text: describePending(this.pending.plan, fmtNum,
-        (t) => new Date(t * 1000).toISOString().slice(11, 16) + " UTC"), ...this.#pendingChart(this.pending.plan) } : null,
       connection: this.connection, feed: this.feed,
       account: this.publicAccount(),
       balance: Number.isFinite(this.balance) ? this.balance : null,
@@ -1268,16 +1051,11 @@ export class TradingEngine {
       tradesToday: g ? g.state.trades || 0 : 0,
       halted, haltReason: halted ? g.state.haltReason || "" : "",
       cooldownUntil,
-      blockReason: g && this.running && s.mode === "auto" ? g.blockReason(this.openCount(false), now) : "",
       syncing: this.syncing,
-      lastPrice: Number.isFinite(this.lastPrice()) ? this.lastPrice() : null,
-      lastPriceAt: this.lastPriceAt || null,
-      lastEval: this.lastEval,
-      lastSignal: this.lastSignal,
-      marks: this.marks.filter((m) => m.symbol === s.symbol).map(({ t, side }) => ({ t, side })),
+      marks: this.marks.map(({ t, side, symbol }) => ({ t, side, symbol })),
       lastCost: this.lastCost,
       open: [...this.contracts.entries()].filter(([, c]) => !c.stale).map(([id, c]) => ({
-        id, side: c.side, symbol: c.symbol || s.symbol, stake: Number.isFinite(c.buyPrice) ? c.buyPrice : null, profit: Number.isFinite(c.profit) ? c.profit : null,
+        id, side: c.side, symbol: c.symbol || null, name: c.symbol ? this.marketName(c.symbol) : "", stake: Number.isFinite(c.buyPrice) ? c.buyPrice : null, profit: Number.isFinite(c.profit) ? c.profit : null,
         opened: c.opened || null, horizon: c.horizon || 0, barSec: c.barSec || 60, closing: !!c.closing, plan: planView(c.plan),
         source: c.source === "scanner" ? "scanner" : "bot", ...(c.scan && { scan: { strategy: c.scan.strategy, tf: c.scan.tf, name: c.scan.name } }),
       })),
@@ -1287,18 +1065,10 @@ export class TradingEngine {
       appId: this.secret?.appId || "",
       error: this.error,
       modelLoaded: !!this.model,
-      multipliers: this.multipliers,
-      multiplierInUse: this.chooseMultiplier(),
       accounts: this.publicAccounts(),
-      symbols: marketsOrFallback(this.markets, s.symbol).map((m) => [m.symbol, m.name]),
-      marketGroups: groupMarkets(marketsOrFallback(this.markets, s.symbol)).map((g) => ({ name: g.name, items: g.items.map((m) => ({ symbol: m.symbol, name: m.name, open: m.open && !m.suspended })) })),
-      ictBlocked: s.strategy === "ict" && s.mode === "auto" && !!this.account && this.account.type !== "demo",
       scanAuto: this.scanAutoView(),
       scanAutoBlocked: this.scanAutoBlocked(),
       settings: { ...s },
-      fast: this.fast(),
-      fastPreset: AI_FAST,
-      fastBlocked: this.fast() && !!this.account && this.account.type !== "demo",
       limits: this.limits(),
       startedAt: this.running ? this.state.startedAt || null : null,
       resumedAt: this.running ? this.resumedAt || null : null,
@@ -1306,18 +1076,7 @@ export class TradingEngine {
     };
   }
 
-  #mark(t, side, symbol = this.settings.symbol) { this.marks = [...this.marks, { t: Math.floor(t), side, symbol }].slice(-50); }
-
-  /** The waiting plan on the chart: where its box starts, and the money at its stop and target for the balance now. */
-  #pendingChart(plan) {
-    const ref = firstTouch(plan), up = plan.side === "BUY";
-    const size = Number.isFinite(this.balance)
-      ? sizeMultiplier({ balance: this.balance, riskPct: +this.settings.riskPct, entry: ref, slDist: up ? ref - plan.sl : plan.sl - ref,
-                         tpDist: up ? plan.tp - ref : ref - plan.tp, multiplier: this.chooseMultiplier(), minStake: this.minStake, maxStake: this.maxStake })
-      : null;
-    return { start: plan.since ?? (this.pendingStart || null),
-             slMoney: size?.ok ? size.stopLoss : null, tpMoney: size?.ok ? size.takeProfit : null };
-  }
+  #mark(t, side, symbol) { this.marks = [...this.marks, { t: Math.floor(t), side, symbol }].slice(-50); }
 
   // ------------------------------------------------------------ watchdog
   /**

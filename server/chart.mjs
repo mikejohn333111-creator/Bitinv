@@ -1,12 +1,12 @@
 // The control page's chart data. The page never talks to Deriv (it has no token): it asks
 // GET /api/candles?tf=…&after=… and draws what comes back with the website's chart code.
 //
-// On the bot's own timeframe the candles are the engine's (the ones the strategy reads, plus
+// On the clock market's 1-minute candles they are the engine's own (its clock stream, plus
 // the forming one). Other timeframes are loaded on the engine's Deriv connection with a
 // one-off ticks_history, kept per timeframe and asked again at most every 15 seconds; between
-// loads the newest candle follows the bot's live price. With a symbol (a setup from the scanner)
-// the chart shows another market the same way, loaded on the same connection. The trade plans (open trades, the
-// latest signal, the waiting plan) come with /api/status.
+// loads the newest candle follows the clock's live price. With a symbol (a scanner setup or an
+// open trade) the chart shows that market the same way, loaded on the same connection. The open
+// trades' plans come with /api/status.
 import { planFromContract } from "../public/js/plan.js";
 
 /** The chart's timeframes in seconds, as on the website (1m, 5m, 15m, 1h, 4h, 1D). */
@@ -69,7 +69,7 @@ export class ChartFeed {
   async candles(tf, after, symbol) {
     tf = Number(tf);
     if (!CHART_TIMEFRAMES.includes(tf)) throw new RangeError("Unknown chart timeframe.");
-    const e = this.engine, own = e.settings.symbol, botTf = e.tf();
+    const e = this.engine, own = e.symbol, botTf = e.tf();
     symbol = symbol || own;
     let list, failed = false;
     if (symbol === own && tf === botTf) list = [...e.bars.slice(-(CHART_BARS - 1)), ...(e.forming ? [e.forming] : [])];

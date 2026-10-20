@@ -1,20 +1,20 @@
 // The server's trading engine with a fake Deriv socket, a fake clock and a stubbed REST API.
-// The AI model on the fixture bars gives real signals: SELL on bars 465 and 466.
+// The bot is scanner-only: every trade comes from a scanner setup (engine.autoScan), and a
+// 1-minute stream of R_75 is its clock (time exits, the daily loss check, the watchdog).
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, statSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TradingEngine, cleanSettings, UserError } from "../server/engine.mjs";
+import { TradingEngine, cleanSettings, loadSettings, DEFAULT_SETTINGS, SETTINGS_VERSION, CLOCK_SYMBOL, UserError } from "../server/engine.mjs";
+import { Scanner } from "../server/scanner.mjs";
 import { FileStore, LOG_MAX_LINES } from "../server/store.mjs";
-import { evaluateAI, AI_FAST } from "../public/js/strategy.js";
 
-const fx = JSON.parse(readFileSync(new URL("./fixture-ai.json", import.meta.url)));
-const model = JSON.parse(readFileSync(new URL("../public/model/tbotai-model.json", import.meta.url)));
-const SIG = 465;
 const PAT = "pat_test_TOKEN_abcd1234";
 const DEMO = { account_id: "DOT1", account_type: "demo", currency: "USD", balance: 10000, status: "active" };
 const REAL = { account_id: "ROT1", account_type: "real", currency: "USD", balance: 500, status: "active" };
+const NOW = Date.UTC(2026, 9, 2, 10);   // 10:00 UTC: the 9:45 15m candle has just closed
+const NOW_S = NOW / 1000;
 const flush = async (n = 6) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
 
 // ------------------------------------------------------------------ fakes
@@ -72,17 +72,17 @@ function stubDeriv(state = {}) {
   return state;
 }
 
-function setup({ settings = {}, state, secret = true, over = {}, deriv = {} } = {}) {
+function setup({ settings = {}, rawSettings, state, secret = true, over = {}, deriv = {} } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "tbot-engine-"));
   const store = new FileStore(dir);
-  store.saveSettings({ strategy: "ai", mode: "auto", ...settings });
+  store.saveSettings(rawSettings || { v: SETTINGS_VERSION, mode: "auto", ...settings });
   if (state) store.saveState(state);
   if (secret) store.saveSecret({ appId: "app42", token: PAT });
   return makeEngine(dir, { over, deriv });
 }
 
 function makeEngine(dir, { over = {}, deriv = {}, clock } = {}) {
-  const t = clock || { now: Date.UTC(2026, 9, 2, 10) };
+  const t = clock || { now: NOW };
   const sockets = [];
   const rest = stubDeriv(deriv);
   const store = new FileStore(dir);
@@ -97,12 +97,12 @@ function makeEngine(dir, { over = {}, deriv = {}, clock } = {}) {
 }
 
 const isHistory = (r) => r.ticks_history !== undefined;
-function history(sock, upto) { sock.push(isHistory, { msg_type: "candles", candles: fx.bars.slice(0, upto + 1) }); }
-/** Starts bar i, which closes bar i-1. */
-function openBar(sock, i) {
-  const b = fx.bars[i];
-  sock.push(isHistory, { msg_type: "ohlc", ohlc: { open_time: b.epoch, open: String(b.open), high: String(b.high), low: String(b.low), close: String(b.close) } });
+/** A clock candle opening at `epoch` (seconds): it closes the one before. */
+function clock(sock, epoch, close = 100) {
+  sock.push(isHistory, { msg_type: "ohlc", ohlc: { open_time: epoch, open: String(close), high: String(close + 1), low: String(close - 1), close: String(close) } });
 }
+/** The clock's minutes from `from` to `to` (seconds), one candle each. */
+function clockRun(sock, from, to) { for (let e = from; e <= to; e += 60) clock(sock, e); }
 const sentOf = (sock, key) => sock.sent.filter((r) => r[key] !== undefined);
 const logged = (engine, re) => engine.logs.filter((e) => re.test(e.title));
 
@@ -112,12 +112,20 @@ async function ready(ctx) {
   return ctx;
 }
 
-// ------------------------------------------------------------------ tests
-test("the fixture really gives AI signals on bars 465 and 466", () => {
-  for (const i of [SIG, SIG + 1]) assert.equal(evaluateAI(fx.bars.slice(0, i + 1), model, { threshold: 0.55, margin: 0.1, barrierATR: 3, horizonBars: 60 }).action, "SELL");
-});
+const CLOSED = Math.floor(NOW_S / 900) * 900 - 900;   // the newest closed 15m candle opened at 9:45
+/** A "Ready now" scanner setup: SELL R_100 at 1000, stop 1010, target 980. */
+const setupItem = (o = {}) => {
+  const it = { symbol: "R_100", name: "Volatility 100 Index", tf: 900, strategy: "rules", side: "SELL", status: "ready", at: NOW - 60000,
+               entry: 1000, sl: 1010, tp: 980, slDist: 10, tpDist: 20, price: 1000, horizonBars: 0, rr: 2, reason: "Pulled back", start: CLOSED, ...o };
+  return { ...it, id: o.id || `${it.symbol}:${it.tf}:${it.strategy}:${it.side}:${it.start}` };
+};
+/** Hands the engine one setup, as the scanner does after a scan, and waits for the order. */
+async function take(engine, o = {}) { await engine.autoScan([setupItem(o)]); await flush(); }
+const isBal = (r) => r.balance === 1, isPoc = (r) => r.proposal_open_contract === 1;
+const pocFor = (id) => (r) => r.proposal_open_contract === 1 && r.contract_id === id;
 
-test("connects with the token, subscribes like the browser, and a signal sends a proposal then a buy", async () => {
+// ------------------------------------------------------------------ tests
+test("connects with the token, follows the clock market, and a scanner setup sends a proposal then a buy", async () => {
   const ctx = await ready(setup());
   const { engine, sock, rest } = ctx;
   try {
@@ -126,102 +134,101 @@ test("connects with the token, subscribes like the browser, and a signal sends a
     assert.equal(rest.calls[0].opts.headers["Deriv-App-ID"], "app42");
     assert.match(rest.calls[1].url, /accounts\/DOT1\/otp$/, "a fresh OTP for the demo account");
     const hist = sock.streams.find((s) => isHistory(s.req)).req;
-    assert.deepEqual({ ...hist }, { ticks_history: "R_75", style: "candles", granularity: 60, count: 1200, end: "latest", adjust_start_time: 1 });
+    assert.deepEqual({ ...hist }, { ticks_history: CLOCK_SYMBOL, style: "candles", granularity: 60, count: 120, end: "latest", adjust_start_time: 1 });
     assert.ok(sock.streams.some((s) => s.req.balance === 1), "balance subscribed");
     assert.ok(sentOf(sock, "portfolio").length, "open trades looked up");
+    assert.equal(sentOf(sock, "contracts_for").length, 0, "no market of its own to ask about");
     assert.equal(engine.status().account.id, "DOT1");
 
+    await take(engine);
+    assert.equal(sentOf(sock, "proposal").length, 0, "stopped: nothing is traded");
     engine.start();
-    history(sock, SIG);
-    assert.equal(sentOf(sock, "proposal").length, 0, "no trade on history alone");
-    openBar(sock, SIG + 1);
-    await flush();
+    await take(engine);
     const [p] = sentOf(sock, "proposal");
     assert.ok(p, "proposal sent");
-    const keys = Object.keys(p).sort();
-    assert.deepEqual(keys, ["amount", "basis", "contract_type", "currency", "duration_unit", "limit_order", "multiplier", "proposal", "underlying_symbol"]);
+    assert.deepEqual(Object.keys(p).sort(), ["amount", "basis", "contract_type", "currency", "duration_unit", "limit_order", "multiplier", "proposal", "underlying_symbol"]);
     assert.equal(p.contract_type, "MULTDOWN");
-    assert.equal(p.underlying_symbol, "R_75");
-    assert.equal(p.multiplier, 50, "lowest offered multiplier");
-    assert.equal(p.basis, "stake");
+    assert.equal(p.underlying_symbol, "R_100", "on the setup's own market");
+    assert.equal(p.multiplier, 50, "the lowest multiplier the market offers");
     assert.ok(p.limit_order.stop_loss > 0 && p.limit_order.take_profit > 0 && p.amount <= 2000);
-    const [b] = sentOf(sock, "buy");
-    assert.deepEqual(b, { buy: "prop9000", price: p.amount });
+    assert.deepEqual(sentOf(sock, "buy"), [{ buy: "prop9000", price: p.amount }]);
     const st = engine.status();
     assert.equal(st.open.length, 1);
     assert.equal(st.open[0].side, "SELL");
+    assert.equal(st.open[0].source, "scanner");
     assert.equal(st.tradesToday, 1);
-    assert.ok(sock.streams.some((s) => s.req.proposal_open_contract === 1 && s.req.contract_id === 9000), "contract tracked");
-    assert.equal(logged(engine, /^Opened SELL R_75/).length, 1);
-    assert.equal(st.lastSignal.traded, true);
+    assert.equal(logged(engine, /^Opened SELL R_100 from the scanner/).length, 1);
     assert.ok(Math.abs(st.lastCost.commission - 0.25) < 1e-9);
-    // The chart: an arrow on the entry candle, and the trade's plan from Deriv's own numbers.
-    assert.deepEqual(st.marks, [{ t: fx.bars[SIG + 1].epoch, side: "SELL" }]);
-    assert.equal(st.open[0].plan, null, "no plan before Deriv tells the entry");
-    sock.push((r) => r.proposal_open_contract === 1, { msg_type: "proposal_open_contract", proposal_open_contract: {
-      contract_id: 9000, contract_type: "MULTDOWN", entry_spot: 100, buy_price: 10, multiplier: 50, date_start: fx.bars[SIG + 1].epoch + 5,
-      limit_order: { stop_loss: { order_amount: -2, value: "100.4" }, take_profit: { order_amount: 3, value: "99.4" } }, profit: 0 } });
-    const plan = engine.status().open[0].plan;
-    assert.deepEqual(plan, { side: "SELL", entry: 100, sl: 100.4, tp: 99.4, slMoney: 2, tpMoney: 3, start: fx.bars[SIG + 1].epoch,
-                             end: fx.bars[SIG].epoch + 61 * 60 });
+    assert.deepEqual(st.marks, [{ t: NOW_S, side: "SELL", symbol: "R_100" }]);
+    for (const k of ["strategy", "symbol", "lastSignal", "pending", "lastEval", "fast", "botTf"]) assert.equal(k in st, false, `no ${k} in the status`);
+    sock.push(isPoc, { msg_type: "proposal_open_contract", proposal_open_contract: {
+      contract_id: 9000, contract_type: "MULTDOWN", entry_spot: 1000, buy_price: 10, multiplier: 50, date_start: NOW_S + 5,
+      limit_order: { stop_loss: { order_amount: -2, value: "1010" }, take_profit: { order_amount: 4, value: "980" } }, profit: 0 } });
+    assert.deepEqual(engine.status().open[0].plan, { side: "SELL", entry: 1000, sl: 1010, tp: 980, slMoney: 2, tpMoney: 4, start: CLOSED + 900, end: null });
   } finally { ctx.cleanup(); }
 });
 
-test("signals mode logs one signal per gap and trades nothing", async () => {
-  const ctx = await ready(setup({ settings: { mode: "signals" } }));
+test("Start and Stop: Auto trade takes setups only while running; Signals only never trades; Stop leaves open trades alone", async () => {
+  const ctx = await ready(setup({ settings: { scanAutoMaxOpen: 3 } }));
   const { engine, sock } = ctx;
   try {
     engine.start();
-    history(sock, SIG);
-    openBar(sock, SIG + 1);   // SELL on 465
-    openBar(sock, SIG + 2);   // SELL on 466, inside the gap
-    await flush();
-    assert.equal(engine.logs.filter((e) => e.tag === "SELL").length, 1);
-    assert.equal(sentOf(sock, "proposal").length, 0);
-    const sig = engine.status().lastSignal;
-    assert.equal(sig.barEpoch, fx.bars[SIG].epoch);
-    assert.equal(engine.state.lastSignalEpoch, fx.bars[SIG].epoch);
-    // The chart draws every signal with its stop and target, up to the planned close.
-    assert.ok(sig.tp < sig.entry && sig.sl > sig.entry, "a SELL's target below and stop above");
-    assert.equal(sig.end, fx.bars[SIG].epoch + 61 * 60, "AI time limit of 60 candles");
-    assert.ok(sig.slMoney > 0 && sig.tpMoney > 0, "money at the stop and the target");
-    assert.deepEqual(engine.status().marks, [{ t: fx.bars[SIG].epoch, side: "SELL" }]);
+    assert.match(logged(engine, /^Bot started/)[0].title, /Auto trade/);
+    await take(engine);
+    assert.equal(sentOf(sock, "buy").length, 1);
+    engine.stop();
+    assert.equal(engine.running, false);
+    assert.equal(sentOf(sock, "sell").length, 0, "Stop closes nothing");
+    assert.equal(engine.status().open.length, 1, "the open trade is still watched");
+    await take(engine, { symbol: "R_50", name: "Volatility 50 Index" });
+    assert.equal(sentOf(sock, "proposal").length, 1, "stopped: no new trade");
+    // Signals only: running, nothing traded, the scanner just shows setups.
+    engine.updateSettings({ mode: "signals" });
+    engine.start();
+    assert.match(logged(engine, /^Bot started/).at(-1).title, /Signals only/);
+    await take(engine, { symbol: "R_50", name: "Volatility 50 Index" });
+    assert.equal(sentOf(sock, "proposal").length, 1);
+    assert.equal(engine.status().scanAuto.on, false);
+    // Back to Auto trade while running (demo): setups are taken again at once.
+    engine.updateSettings({ mode: "auto" });
+    assert.equal(logged(engine, /^Mode: Auto trade \(demo only\)$/).length, 1);
+    await take(engine, { symbol: "R_50", name: "Volatility 50 Index" });
+    assert.equal(sentOf(sock, "proposal").length, 2);
   } finally { ctx.cleanup(); }
 });
 
-test("the risk guard blocks a second trade, and nothing trades while stopped", async () => {
-  const ctx = await ready(setup());
+test("the caps: open at once and trades per day are one setting each, and they are the risk guard's limits", async () => {
+  const ctx = await ready(setup({ settings: { scanAutoMaxOpen: 1, scanAutoMaxDay: 2 } }));
   const { engine, sock } = ctx;
   try {
-    history(sock, SIG);
-    openBar(sock, SIG + 1);
-    await flush();
-    assert.equal(sentOf(sock, "proposal").length, 0, "stopped: no trade");
+    assert.equal(engine.guard.limits.maxOpen, 1);
+    assert.equal(engine.guard.limits.maxTradesPerDay, 2);
     engine.start();
-    openBar(sock, SIG + 2);   // signal on 466
-    await flush();
+    await take(engine);
+    await take(engine, { symbol: "R_50", name: "Volatility 50 Index" });
     assert.equal(sentOf(sock, "proposal").length, 1);
-    openBar(sock, SIG + 3);
-    openBar(sock, SIG + 4);   // SELL on 468: one trade is open already
-    await flush();
-    assert.equal(sentOf(sock, "proposal").length, 1);
-    assert.ok(logged(engine, /Skipped SELL: max open trades reached/).length >= 1);
+    assert.ok(logged(engine, /^Scanner setup not taken/).some((e) => /^1 trade open already/.test(e.detail)));
+    engine.updateSettings({ scanAutoMaxOpen: 3 });
+    assert.equal(engine.guard.limits.maxOpen, 3, "limits apply at once");
+    await take(engine, { symbol: "R_10", name: "Volatility 10 Index" });
+    assert.equal(sentOf(sock, "proposal").length, 2);
+    await take(engine, { symbol: "R_25", name: "Volatility 25 Index" });
+    assert.equal(sentOf(sock, "proposal").length, 2, "2 a day");
+    assert.equal(engine.status().scanAuto.today, 2);
   } finally { ctx.cleanup(); }
 });
 
 test("never sends a second order while one is in flight", async () => {
   let release;
-  const ctx = await ready(setup({ settings: { maxOpen: 3 }, over: {
+  const ctx = await ready(setup({ settings: { scanAutoMaxOpen: 3 }, over: {
     proposal: (req) => new Promise((r) => { release = () => r({ proposal: { id: "slow", ask_price: req.amount } }); }),
   } }));
   const { engine, sock } = ctx;
   try {
     engine.start();
-    history(sock, SIG);
-    openBar(sock, SIG + 1);
+    engine.autoScan([setupItem()]);
     await flush();
-    openBar(sock, SIG + 2);   // another signal while the first order waits
-    await flush();
+    assert.equal(engine.autoScan([setupItem({ symbol: "R_50" })]), null, "busy: nothing taken");
     assert.equal(sentOf(sock, "proposal").length, 1);
     release();
     await flush();
@@ -230,16 +237,13 @@ test("never sends a second order while one is in flight", async () => {
   } finally { ctx.cleanup(); }
 });
 
-test("the daily loss limit on equity halts trading and closes all trades", async () => {
+test("the daily loss limit on equity halts trading and closes all trades; the next day starts afresh", async () => {
   const ctx = await ready(setup());
   const { engine, sock } = ctx;
   try {
     engine.start();
-    history(sock, SIG);
-    openBar(sock, SIG + 1);
-    await flush();
+    await take(engine);
     const p = sentOf(sock, "proposal")[0];
-    const isBal = (r) => r.balance === 1, isPoc = (r) => r.proposal_open_contract === 1;
     sock.push(isBal, { balance: { balance: 10000 - p.amount, currency: "USD" } });
     sock.push(isPoc, { proposal_open_contract: { contract_id: 9000, contract_type: "MULTDOWN", buy_price: p.amount, profit: -120, is_sold: 0 } });
     assert.equal(engine.status().halted, false, "-1.2% is inside the 3% limit");
@@ -252,59 +256,49 @@ test("the daily loss limit on equity halts trading and closes all trades", async
     assert.deepEqual(sentOf(sock, "sell"), [{ sell: 9000, price: 0 }]);
     assert.equal(logged(engine, /^Stopped for today/).length, 1);
     assert.equal(st.running, true, "still running: it carries on tomorrow");
-    // Closed at a loss: no new trade today.
     sock.push(isPoc, { proposal_open_contract: { contract_id: 9000, buy_price: p.amount, profit: -350, is_sold: 1, status: "sold" } });
-    openBar(sock, SIG + 2);
-    await flush();
-    assert.equal(sentOf(sock, "proposal").length, 1);
-    assert.ok(logged(engine, /Skipped SELL: daily loss limit/).length >= 1);
-    // The next UTC day starts afresh.
+    await take(engine, { symbol: "R_50", name: "Volatility 50 Index" });
+    assert.equal(sentOf(sock, "proposal").length, 1, "no new trade today");
+    assert.match(engine.status().scanAuto.waiting, /daily loss limit/);
+    // The next UTC day starts afresh (a clock candle closes then).
     ctx.t.now += 86400e3;
-    openBar(sock, SIG + 3);
+    clock(sock, NOW_S + 86400); clock(sock, NOW_S + 86460);
     await flush();
     assert.equal(engine.status().halted, false);
   } finally { ctx.cleanup(); }
 });
 
-test("AI trades close after the time limit", async () => {
-  const ctx = await ready(setup({ settings: { aiHorizon: 5 } }));
+test("a setup's time limit closes the trade, counted in its own candles on the clock", async () => {
+  const ctx = await ready(setup());
   const { engine, sock } = ctx;
   try {
     engine.start();
-    history(sock, SIG);
-    openBar(sock, SIG + 1);
+    await take(engine, { horizonBars: 2 });   // two 15-minute candles after the 9:45 one: closes at 10:15
+    assert.equal(engine.status().open[0].horizon, 2);
+    clockRun(sock, NOW_S, NOW_S + 15 * 60);   // up to the candle that opens at 10:15 (10:14 closed)
     await flush();
-    assert.equal(engine.status().open[0].horizon, 5);
-    const entry = fx.bars[SIG].epoch;
-    let i = SIG + 2;              // opening bar i closes bar i-1
-    for (; fx.bars[i - 1].epoch - entry < 300; i++) {
-      openBar(sock, i);
-      await flush();
-      assert.equal(sentOf(sock, "sell").length, 0, `not closed yet after bar ${i - 1}`);
-    }
-    openBar(sock, i);             // closes the first bar 5 minutes after the entry bar
+    assert.equal(sentOf(sock, "sell").length, 0, "not yet");
+    clock(sock, NOW_S + 16 * 60);             // the 10:15 candle closes
     await flush();
     assert.deepEqual(sentOf(sock, "sell"), [{ sell: 9000, price: 0 }]);
-    assert.equal(logged(engine, /Closing trade \(5 min time limit\)/).length, 1);
-    openBar(sock, i + 1);
+    assert.equal(logged(engine, /Closing trade \(30 min time limit\)/).length, 1);
+    clock(sock, NOW_S + 17 * 60);
     await flush();
     assert.equal(sentOf(sock, "sell").length, 1, "asked once");
   } finally { ctx.cleanup(); }
 });
 
 test("after a restart the bot resumes by itself and picks up its open trades", async () => {
-  const first = await ready(setup({ settings: { aiHorizon: 30 } }));
+  const first = await ready(setup());
   first.engine.start();
-  history(first.sock, SIG);
-  openBar(first.sock, SIG + 1);
-  await flush();
+  await take(first.engine, { horizonBars: 4 });
   assert.equal(first.engine.status().open.length, 1);
   first.engine.shutdown();   // a crash, reboot or update
   assert.equal(JSON.parse(readFileSync(join(first.dir, "state.json"), "utf8")).running, true);
 
   const second = makeEngine(first.dir, { over: { portfolio: () => ({ portfolio: { contracts: [
-    { contract_id: 9000, contract_type: "MULTDOWN", underlying_symbol: "R_75" },
-    { contract_id: 9100, contract_type: "MULTUP", underlying_symbol: "R_50" },      // another market: watched too, so its stake isn't a loss
+    { contract_id: 9000, contract_type: "MULTDOWN", underlying_symbol: "R_100" },
+    { contract_id: 9100, contract_type: "MULTUP", underlying_symbol: "R_50" },      // opened by hand: watched too, so its stake isn't a loss
     { contract_id: 9200, contract_type: "CALL", underlying_symbol: "R_75" },        // not a Multiplier
   ] } }) } });
   try {
@@ -313,49 +307,40 @@ test("after a restart the bot resumes by itself and picks up its open trades", a
     const { engine, sock } = second;
     assert.equal(engine.running, true);
     assert.equal(logged(engine, /^Resumed after a restart$/).length, 1);
+    assert.equal(logged(engine, /trades only the scanner/).length, 0, "no update note for new settings");
     const st = engine.status();
     assert.deepEqual(st.open.map((o) => o.id), ["9000", "9100"]);
-    assert.equal(st.open[1].symbol, "R_50");
+    assert.equal(st.open[0].source, "scanner");
+    assert.equal(st.open[0].horizon, 4, "the time limit survives the restart");
     assert.equal(st.open[1].horizon, 0, "not the bot's trade: no time limit");
-    assert.equal(st.open[0].horizon, 30, "the time limit survives the restart");
-    assert.equal(st.open[0].side, "SELL");
-    assert.ok(sock.streams.some((s) => s.req.proposal_open_contract === 1 && s.req.contract_id === 9000));
-    assert.equal(st.account.id, "DOT1");
+    assert.ok(sock.streams.some((s) => pocFor(9000)(s.req)));
     assert.equal(st.resumedAt, second.t.now, "the page can say when it carried on by itself");
-    assert.equal(st.lastSignal?.action, "SELL", "the latest signal is still there after the restart");
-    assert.equal(st.lastSignal.traded, true);
-    // The same bar again (feed replayed after reconnect) and the next signal: no second trade.
-    history(sock, SIG);
-    openBar(sock, SIG + 1);
-    openBar(sock, SIG + 2);
-    await flush();
-    assert.equal(sentOf(sock, "proposal").length, 0);
-    assert.ok(engine.logs.some((e) => e.seq > 0) && engine.seq > first.engine.seq, "log numbering continues");
+    await take(engine);
+    assert.equal(sentOf(sock, "proposal").length, 0, "the same setup is never taken twice");
+    assert.ok(engine.seq > first.engine.seq, "log numbering continues");
   } finally { second.cleanup(); }
 });
 
 test("a buy that may have gone through is never repeated; open trades are reloaded first", async () => {
   let buys = 0;
   let portfolio = [];
-  const ctx = await ready(setup({ settings: { maxOpen: 3 }, over: {
-    buy: () => { buys++; portfolio = [{ contract_id: 7777, contract_type: "MULTDOWN", underlying_symbol: "R_75" }]; throw new Error("request timed out"); },
+  const ctx = await ready(setup({ settings: { scanAutoMaxOpen: 3 }, over: {
+    buy: () => { buys++; portfolio = [{ contract_id: 7777, contract_type: "MULTDOWN", underlying_symbol: "R_100" }]; throw new Error("request timed out"); },
     portfolio: () => ({ portfolio: { contracts: portfolio } }),
   } }));
   const { engine, sock } = ctx;
   try {
     engine.start();
-    history(sock, SIG);
-    openBar(sock, SIG + 1);
+    await take(engine);
     await flush(10);
     assert.equal(buys, 1);
     assert.deepEqual(engine.status().open.map((o) => o.id), ["7777"], "the trade Deriv opened is found");
+    assert.equal(engine.status().scanAuto.today, 1, "counted: it went through");
     // A dropped connection: nothing trades until the open trades are checked again.
     sock.drop();
     assert.equal(engine.status().syncing, true);
-    openBar(sock, SIG + 2);
-    await flush();
+    await take(engine, { symbol: "R_50" });
     assert.equal(sentOf(sock, "proposal").length, 1);
-    assert.ok(logged(engine, /still checking your open trades/).length >= 1);
     sock.online = true; sock.h.onStatus("online");
     await flush();
     assert.equal(engine.status().syncing, false);
@@ -414,7 +399,7 @@ test("network trouble at startup is retried, not treated as a bad token", async 
   } finally { ctx.cleanup(); }
 });
 
-test("real money accounts are refused unless Allow real money is on", async () => {
+test("real money accounts are refused unless Allow real money is on, and never auto trade", async () => {
   const ctx = await ready(setup({ state: { accountId: "ROT1" } }));
   const { engine } = ctx;
   try {
@@ -426,8 +411,15 @@ test("real money accounts are refused unless Allow real money is on", async () =
     assert.deepEqual(ok, { settings: { allowReal: true }, errors: [] });
     engine.updateSettings(ok.settings);
     assert.equal(engine.selectAccount("ROT1").type, "real");
+    // Auto trade is demo only: Start is refused with a clear message, and so is switching to it.
+    assert.throws(() => engine.start(), (e) => e instanceof UserError && e.code === "scanner_demo_only" && e.status === 403 && /demo only/.test(e.message));
+    assert.equal(engine.running, false);
+    assert.equal(engine.status().scanAutoBlocked, true);
+    engine.updateSettings({ mode: "signals" });
+    assert.throws(() => engine.updateSettings({ mode: "auto" }), (e) => e.code === "scanner_demo_only");
+    assert.equal(engine.settings.mode, "signals");
     engine.start();
-    assert.equal(engine.running, true);
+    assert.equal(engine.running, true, "Signals only works on a real account: nothing is traded");
     engine.updateSettings({ allowReal: false });
     assert.equal(engine.running, false, "turning real money off stops the bot");
     assert.equal(engine.status().account.id, "DOT1", "and goes back to demo");
@@ -471,22 +463,81 @@ test("setCredentials checks the token with Deriv before saving it; the token is 
   } finally { ctx.cleanup(); }
 });
 
-test("settings are validated and clamped; mode can't change while running", async () => {
-  assert.deepEqual(cleanSettings({ riskPct: 50, maxDailyLossPct: 0, maxOpen: 2.6, symbol: "R_10", junk: 1 }).settings,
-                   { riskPct: 5, maxDailyLossPct: 0.5, maxOpen: 3, symbol: "R_10" });
+test("settings: validated and clamped; the old market, strategy and multiplier keys are ignored; mode can change while running", async () => {
+  assert.deepEqual(cleanSettings({ riskPct: 50, maxDailyLossPct: 0, scanAutoMaxOpen: 2.6, scanAutoMaxDay: 99, symbol: "R_10", strategy: "ict", multiplier: 100,
+                                   maxOpen: 3, maxTradesPerDay: 9, aiFast: true, scanAuto: true, botTf: 900, junk: 1 }).settings,
+                   { riskPct: 5, maxDailyLossPct: 0.5, scanAutoMaxOpen: 3, scanAutoMaxDay: 10 });
   assert.equal(cleanSettings({ riskPct: "abc" }).errors.length, 1);
-  assert.equal(cleanSettings({ symbol: "EVIL" }).errors.length, 1);
   assert.equal(cleanSettings({ mode: "yolo" }).errors.length, 1);
   assert.equal(cleanSettings([1]).errors.length, 1);
   const ctx = await ready(setup());
   try {
     ctx.engine.start();
-    assert.throws(() => ctx.engine.updateSettings({ mode: "signals" }), /Stop the bot/);
-    ctx.engine.updateSettings({ maxOpen: 2 });
-    assert.equal(ctx.engine.guard.limits.maxOpen, 2, "limits apply at once");
-    ctx.engine.updateSettings({ symbol: "R_50" });
-    assert.equal(ctx.engine.running, false, "changing the market stops the bot, as in the browser");
-    assert.equal(ctx.sock.streams.find((s) => isHistory(s.req)).req.ticks_history, "R_50");
+    ctx.engine.updateSettings({ mode: "signals" });
+    assert.equal(ctx.engine.running, true, "switching mode doesn't stop the bot");
+    assert.equal(logged(ctx.engine, /^Mode: Signals only$/).length, 1);
+    assert.equal(JSON.parse(readFileSync(join(ctx.dir, "settings.json"), "utf8")).mode, "signals");
+  } finally { ctx.cleanup(); }
+});
+
+test("update from the single-market bot: scanner auto-trade on keeps Auto trade, off becomes Signals only; odd files don't crash", () => {
+  const fresh = loadSettings({});
+  assert.equal(fresh.legacy, null);
+  assert.deepEqual(fresh.settings, DEFAULT_SETTINGS, "a new install: Auto trade (Start still needs a demo account)");
+  const on = loadSettings({ symbol: "frxEURUSD", strategy: "ict", mode: "auto", scanAuto: true, scanAutoStrategies: ["ict"], scanAutoTfs: [3600],
+                            scanAutoMaxDay: 6, maxTradesPerDay: 3, riskPct: 2, multiplier: 100, aiFast: true, botTf: 900 });
+  assert.equal(on.settings.mode, "auto");
+  assert.equal(on.settings.v, SETTINGS_VERSION);
+  assert.equal(on.settings.scanAutoMaxDay, 3, "the smaller of the old daily limits");
+  assert.equal(on.settings.riskPct, 2);
+  for (const k of ["symbol", "strategy", "multiplier", "aiFast", "botTf", "scanAuto", "maxTradesPerDay", "scanAutoStrategies"]) assert.equal(k in on.settings, false, k);
+  assert.deepEqual(on.legacy, { scanAuto: true, strategies: ["ict"], timeframes: [3600], symbol: "frxEURUSD", strategy: "ict" });
+  assert.equal(loadSettings({ strategy: "rules", mode: "auto", scanAuto: false }).settings.mode, "signals", "scanner auto-trade was off: nothing trades after the update");
+  assert.equal(loadSettings({ strategy: "rules", mode: "auto" }).settings.mode, "signals", "from before scanner auto-trade existed");
+  assert.equal(loadSettings({ mode: "signals", scanAuto: true }).settings.mode, "signals", "it traded nothing in Signals only before either");
+  assert.equal(loadSettings({ v: SETTINGS_VERSION, mode: "signals" }).settings.mode, "signals", "after the update, the saved mode is kept");
+  for (const raw of [null, [], "x", { riskPct: "lots", mode: 7, scanAutoStrategies: "ict", scanAutoTfs: [1, 2] }, { v: 99 }])
+    assert.ok(["auto", "signals"].includes(loadSettings(raw).settings.mode), JSON.stringify(raw));
+});
+
+test("update from the single-market bot: the running bot carries on, its old trade is still watched and closed on time", async () => {
+  const meta = { side: "BUY", entryEpoch: NOW_S - 50 * 60, horizon: 60, symbol: "frxEURUSD" };   // the old AI's 60-minute limit
+  const ctx = setup({ rawSettings: { symbol: "frxEURUSD", strategy: "ai", mode: "auto", scanAuto: false, maxOpen: 1 },
+                      state: { running: true, lastSignal: { action: "BUY" }, openMeta: { 555: meta } },
+                      over: { portfolio: () => ({ portfolio: { contracts: [{ contract_id: 555, contract_type: "MULTUP", underlying_symbol: "frxEURUSD" }] } }) } });
+  await ready(ctx);
+  const { engine, sock } = ctx;
+  try {
+    assert.equal(engine.running, true, "it was running: it carries on");
+    assert.equal(engine.settings.mode, "signals");
+    const note = logged(engine, /^The bot now trades only the scanner's setups$/);
+    assert.equal(note.length, 1);
+    assert.match(note[0].detail, /frxEURUSD, ai\) are no longer used.*Signals only/);
+    const saved = JSON.parse(readFileSync(join(ctx.dir, "settings.json"), "utf8"));
+    assert.equal(saved.v, SETTINGS_VERSION, "moved over once");
+    assert.equal(saved.symbol, undefined);
+    const st = engine.status();
+    assert.deepEqual(st.open.map((o) => [o.id, o.source, o.horizon]), [["555", "bot", 60]]);
+    await take(engine);
+    assert.equal(sentOf(sock, "proposal").length, 0, "Signals only: nothing traded");
+    clockRun(sock, NOW_S, NOW_S + 11 * 60);
+    await flush();
+    assert.deepEqual(sentOf(sock, "sell"), [{ sell: 555, price: 0 }], "closed at its time limit");
+    const again = makeEngine(ctx.dir);
+    assert.equal(again.engine.legacy, null, "the note is written once");
+    again.engine.shutdown();
+  } finally { ctx.cleanup(); }
+});
+
+test("update from the single-market bot with scanner auto-trade on: Auto trade, and the scanner keeps what it traded", async () => {
+  const ctx = setup({ rawSettings: { symbol: "R_50", strategy: "rules", mode: "auto", scanAuto: true, scanAutoStrategies: ["rules"], scanAutoTfs: [900] } });
+  ctx.store.saveScanner({ on: false, synthetics: true, timeframes: [900, 3600] });
+  await ready(ctx);
+  try {
+    assert.equal(ctx.engine.settings.mode, "auto");
+    const scanner = new Scanner(ctx.engine, { store: ctx.store });
+    assert.deepEqual(scanner.settings, { on: true, synthetics: true, timeframes: [900], strategies: ["rules"] });
+    assert.deepEqual(ctx.store.getScanner(), scanner.settings, "saved");
   } finally { ctx.cleanup(); }
 });
 
@@ -512,65 +563,19 @@ test("store: private files, atomic JSON and a trimmed log", () => {
 });
 
 // ------------------------------------------------------- review fixes
-const isBal = (r) => r.balance === 1, isPoc = (r) => r.proposal_open_contract === 1;
-const pocFor = (id) => (r) => r.proposal_open_contract === 1 && r.contract_id === id;
-
-test("changing market keeps watching the open trade, so its stake is not a loss (and a hand-opened trade is found)", async () => {
-  let portfolio = [];
-  const ctx = await ready(setup({ settings: { maxOpen: 3 }, over: { portfolio: () => ({ portfolio: { contracts: portfolio } }) } }));
-  const { engine } = ctx;
-  try {
-    engine.start();
-    history(ctx.sock, SIG);
-    openBar(ctx.sock, SIG + 1);
-    await flush();
-    const p = sentOf(ctx.sock, "proposal")[0];
-    portfolio = [{ contract_id: 9000, contract_type: "MULTDOWN", underlying_symbol: "R_75" }];
-    ctx.sock.push(isBal, { balance: { balance: 10000 - p.amount, currency: "USD" } });
-    ctx.sock.push(isPoc, { proposal_open_contract: { contract_id: 9000, contract_type: "MULTDOWN", buy_price: p.amount, profit: -1, is_sold: 0 } });
-    await flush();
-    engine.updateSettings({ symbol: "R_50" });
-    await flush();
-    const sock = ctx.sock;
-    assert.ok(sock.streams.some((s) => pocFor(9000)(s.req)), "the R_75 trade is still watched on the new connection");
-    sock.push(pocFor(9000), { proposal_open_contract: { contract_id: 9000, contract_type: "MULTDOWN", buy_price: p.amount, profit: -1, is_sold: 0 } });
-    await flush();
-    let st = engine.status();
-    assert.equal(st.halted, false, "no false daily-loss halt");
-    assert.ok(Math.abs(st.dayPL + 0.01) < 1e-9, `day P/L counts the open stake (${st.dayPL})`);
-    assert.deepEqual({ ...engine.state.openMeta["9000"] }, { side: "SELL", entryEpoch: fx.bars[SIG].epoch, horizon: 60, symbol: "R_75" });
-    assert.equal(st.open[0].symbol, "R_75");
-    assert.equal(st.open[0].horizon, 60, "the AI time limit is kept");
-
-    // A trade opened by hand on Deriv: the balance drops, the bot looks again before the loss check.
-    portfolio = [...portfolio, { contract_id: 5555, contract_type: "MULTUP", underlying_symbol: "R_10" }];
-    sock.push(isBal, { balance: { balance: 10000 - p.amount - 500, currency: "USD" } });
-    await flush();
-    assert.ok(sock.streams.some((s) => pocFor(5555)(s.req)), "the hand-opened trade is watched");
-    sock.push(pocFor(5555), { proposal_open_contract: { contract_id: 5555, contract_type: "MULTUP", buy_price: 500, profit: 0, is_sold: 0 } });
-    await flush();
-    st = engine.status();
-    assert.equal(st.halted, false);
-    assert.equal(st.open.length, 2);
-  } finally { ctx.cleanup(); }
-});
-
 test("a win reported before the new balance does not trip the daily loss limit", async () => {
   const ctx = await ready(setup({ settings: { maxDailyLossPct: 0.5 } }));
   const { engine, sock } = ctx;
   try {
     engine.start();
-    history(sock, SIG);
-    openBar(sock, SIG + 1);
-    await flush();
+    await take(engine);
     const p = sentOf(sock, "proposal")[0];
     assert.ok(p.amount / 10000 > 0.005, "the stake is bigger than the limit, so the race matters");
     sock.push(isBal, { balance: { balance: 10000 - p.amount, currency: "USD" } });
     await flush();
     sock.push(isPoc, { proposal_open_contract: { contract_id: 9000, contract_type: "MULTDOWN", buy_price: p.amount, profit: 40, is_sold: 0 } });
     sock.push(isPoc, { proposal_open_contract: { contract_id: 9000, contract_type: "MULTDOWN", buy_price: p.amount, profit: 40, is_sold: 1, status: "sold" } });
-    engine.stop();            // so the next bar only runs the checks, not a new trade
-    openBar(sock, SIG + 2);   // a bar closes inside the gap too
+    clock(sock, NOW_S); clock(sock, NOW_S + 60);   // a clock candle closes inside the gap too
     await flush();
     assert.equal(engine.status().halted, false, "waits for the new balance");
     sock.push(isBal, { balance: { balance: 10040, currency: "USD" } });
@@ -582,15 +587,31 @@ test("a win reported before the new balance does not trip the daily loss limit",
   } finally { ctx.cleanup(); }
 });
 
-test("a failed close after the daily loss halt is tried again on the next bar", async () => {
+test("a hand-opened trade found when the balance drops is watched, so its stake is not a loss", async () => {
+  let portfolio = [];
+  const ctx = await ready(setup({ over: { portfolio: () => ({ portfolio: { contracts: portfolio } }) } }));
+  const { engine, sock } = ctx;
+  try {
+    portfolio = [{ contract_id: 5555, contract_type: "MULTUP", underlying_symbol: "R_10" }];
+    sock.push(isBal, { balance: { balance: 9500, currency: "USD" } });
+    await flush();
+    assert.ok(sock.streams.some((s) => pocFor(5555)(s.req)), "the hand-opened trade is watched");
+    sock.push(pocFor(5555), { proposal_open_contract: { contract_id: 5555, contract_type: "MULTUP", buy_price: 500, profit: 0, is_sold: 0 } });
+    await flush();
+    const st = engine.status();
+    assert.equal(st.halted, false);
+    assert.equal(st.open.length, 1);
+    assert.equal(st.open[0].source, "bot");
+  } finally { ctx.cleanup(); }
+});
+
+test("a failed close after the daily loss halt is tried again on the next clock candle", async () => {
   let sells = 0;
   const ctx = await ready(setup({ over: { sell: () => { if (++sells === 1) throw new Error("request timed out"); return { sell: { sold_for: 1 } }; } } }));
   const { engine, sock } = ctx;
   try {
     engine.start();
-    history(sock, SIG);
-    openBar(sock, SIG + 1);
-    await flush();
+    await take(engine);
     const p = sentOf(sock, "proposal")[0];
     sock.push(isBal, { balance: { balance: 10000 - p.amount, currency: "USD" } });
     await flush();
@@ -599,10 +620,10 @@ test("a failed close after the daily loss halt is tried again on the next bar", 
     assert.equal(engine.status().halted, true);
     assert.equal(sells, 1);
     assert.equal(engine.status().open[0].closing, false, "ready to try again");
-    openBar(sock, SIG + 2);
+    clock(sock, NOW_S); clock(sock, NOW_S + 60);
     await flush();
-    assert.equal(sells, 2, "tried again on the next bar");
-    openBar(sock, SIG + 3);
+    assert.equal(sells, 2, "tried again on the next candle");
+    clock(sock, NOW_S + 120);
     await flush();
     assert.equal(sells, 2, "not sent again once Deriv took it");
   } finally { ctx.cleanup(); }
@@ -618,20 +639,18 @@ test("an uncertain buy is looked for again, and a late-booked trade is found wit
   t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
     engine.start();
-    history(sock, SIG);
-    openBar(sock, SIG + 1);
+    await take(engine, { horizonBars: 3 });
     await flush(10);
     assert.equal(engine.status().open.length, 0);
     assert.equal(engine.status().syncing, true, "nothing trades while the order is unclear");
-    portfolio = [{ contract_id: 4242, contract_type: "MULTDOWN", underlying_symbol: "R_75" }];   // Deriv booked it late
-    openBar(sock, SIG + 2);
-    await flush();
+    portfolio = [{ contract_id: 4242, contract_type: "MULTDOWN", underlying_symbol: "R_100" }];   // Deriv booked it late
+    await take(engine, { symbol: "R_50" });
     assert.equal(sentOf(sock, "proposal").length, 1, "no second order");
     t.mock.timers.tick(5000);
     await flush(10);
     const st = engine.status();
     assert.equal(st.syncing, false);
-    assert.deepEqual(st.open.map((o) => [o.id, o.side, o.horizon]), [["4242", "SELL", 60]]);
+    assert.deepEqual(st.open.map((o) => [o.id, o.side, o.horizon, o.source]), [["4242", "SELL", 3, "scanner"]]);
     assert.equal(st.tradesToday, 1);
     assert.equal(logged(engine, /did go through/).length, 1);
   } finally { t.mock.timers.reset(); ctx.cleanup(); }
@@ -643,8 +662,7 @@ test("an uncertain buy that never shows up frees the bot after the last look", a
   t.mock.timers.enable({ apis: ["setTimeout"] });
   try {
     engine.start();
-    history(sock, SIG);
-    openBar(sock, SIG + 1);
+    await take(engine);
     await flush(10);
     for (const ms of [5000, 15000, 45000, 90000]) { assert.equal(engine.syncing, true); t.mock.timers.tick(ms); await flush(10); }
     assert.equal(engine.syncing, false);
@@ -653,16 +671,15 @@ test("an uncertain buy that never shows up frees the bot after the last look", a
   } finally { t.mock.timers.reset(); ctx.cleanup(); }
 });
 
-test("a price feed that goes quiet makes the bot reconnect and watch its trades again", async () => {
+test("a clock feed that goes quiet makes the bot reconnect and watch its trades again", async () => {
   let portfolio = [];
   const ctx = await ready(setup({ over: { portfolio: () => ({ portfolio: { contracts: portfolio } }) } }));
   const { engine } = ctx;
   try {
     engine.start();
-    history(ctx.sock, SIG);
-    openBar(ctx.sock, SIG + 1);
-    await flush();
-    portfolio = [{ contract_id: 9000, contract_type: "MULTDOWN", underlying_symbol: "R_75" }];
+    await take(engine, { horizonBars: 4 });
+    portfolio = [{ contract_id: 9000, contract_type: "MULTDOWN", underlying_symbol: "R_100" }];
+    clock(ctx.sock, NOW_S);
     const n = ctx.sockets.length;
     ctx.t.now += 2 * 60000;
     engine.watchdog();
@@ -673,7 +690,7 @@ test("a price feed that goes quiet makes the bot reconnect and watch its trades 
     assert.equal(ctx.sockets.length, n + 1, "a new connection");
     assert.ok(ctx.sockets[n - 1].closed, "the stuck one is closed");
     assert.ok(ctx.sock.streams.some((s) => pocFor(9000)(s.req)), "the open trade is watched on the new connection");
-    assert.equal(engine.status().open[0].horizon, 60);
+    assert.equal(engine.status().open[0].horizon, 4);
     assert.equal(logged(engine, /price feed went quiet/).length, 1);
     engine.watchdog();
     assert.equal(ctx.sockets.length, n + 1, "not again straight away");
@@ -686,11 +703,11 @@ test("pressing Stop while a proposal is out sends no buy", async () => {
   const { engine, sock } = ctx;
   try {
     engine.start();
-    history(sock, SIG);
-    openBar(sock, SIG + 1);
+    const run = engine.autoScan([setupItem()]);
     await flush();
     engine.stop();
     release();
+    await run;
     await flush();
     assert.equal(sentOf(sock, "buy").length, 0);
     assert.equal(logged(engine, /Skipped SELL: the bot was stopped/).length, 1);
@@ -741,353 +758,3 @@ test("removing the token while Deriv is still answering does not mark it rejecte
   } finally { globalThis.fetch = realFetch; ctx.cleanup(); }
 });
 
-// ------------------------------------------------------------- fast mode
-// With the fast preset the fixture gives a SELL on every bar from 463 to 478.
-const FAST_SIG = 463;
-
-test("fast mode uses the AI_FAST preset and allows up to 3 open trades, then keeps the user's own settings when off", async () => {
-  const ctx = await ready(setup({ settings: { aiFast: true, maxOpen: 1, aiThreshold: 0.6, aiBarrier: 3, aiHorizon: 60 } }));
-  const { engine, sock } = ctx;
-  try {
-    assert.deepEqual(engine.strategyParams(), { threshold: 0.45, margin: 0.05, barrierATR: 1, horizonBars: 10 });
-    assert.equal(engine.limits().maxOpen, 3);
-    assert.equal(engine.guard.limits.maxOpen, 3, "the risk guard uses the fast limit");
-    assert.equal(engine.status().fast, true);
-    engine.start();
-    history(sock, FAST_SIG);
-    for (let i = FAST_SIG + 1; i <= FAST_SIG + 4; i++) { openBar(sock, i); await flush(); }   // SELL on 463, 464, 465, 466
-    const props = sentOf(sock, "proposal");
-    assert.equal(props.length, 3, "three trades, then the open-trade limit");
-    assert.ok(logged(engine, /Skipped SELL: max open trades reached/).length >= 1);
-    const st = engine.status();
-    assert.equal(st.open.length, 3);
-    assert.ok(st.open.every((t) => t.horizon === 10), "fast trades close after 10 min");
-    // Stop and target are 1x ATR: the same distance as the AI gives with the preset.
-    const res = evaluateAI(fx.bars.slice(0, FAST_SIG + 1), model, engine.strategyParams());
-    assert.equal(res.action, "SELL");
-    assert.ok(Math.abs(res.slDist - AI_FAST.barrierATR * res.atr) < 1e-12 && res.tpDist === res.slDist);
-    assert.ok(Math.abs(props[0].limit_order.take_profit - props[0].limit_order.stop_loss) < 0.02, "target equals stop at 1x ATR");
-    // Off again: the user's own values are back, and the guard limit too.
-    engine.updateSettings({ aiFast: false });
-    assert.deepEqual(engine.strategyParams(), { threshold: 0.6, margin: 0.1, barrierATR: 3, horizonBars: 60 });
-    assert.equal(engine.guard.limits.maxOpen, 1);
-    assert.equal(engine.settings.maxOpen, 1, "the saved limit was never changed");
-    // Fast mode does not apply to the rules strategy.
-    engine.updateSettings({ aiFast: true, strategy: "rules" });
-    assert.equal(engine.fast(), false);
-    assert.equal(engine.limits().maxOpen, 1);
-  } finally { ctx.cleanup(); }
-});
-
-test("fast mode never trades on a real account, even with Allow real money on", async () => {
-  const ctx = await ready(setup({ settings: { aiFast: true, allowReal: true }, state: { accountId: "ROT1" } }));
-  const { engine, sock } = ctx;
-  try {
-    assert.equal(engine.status().account.type, "real");
-    assert.equal(engine.status().fastBlocked, true);
-    assert.throws(() => engine.start(), (e) => e instanceof UserError && e.code === "fast_demo_only");
-    assert.equal(engine.running, false);
-    assert.equal(logged(engine, /^Did not start: fast mode is demo only/).length, 1);
-    // Running already (e.g. resumed after a restart): every signal is refused, with a log line.
-    engine.running = true;
-    history(sock, FAST_SIG);
-    openBar(sock, FAST_SIG + 1);
-    openBar(sock, FAST_SIG + 2);
-    await flush();
-    assert.equal(sentOf(sock, "proposal").length, 0, "no order on the real account");
-    assert.equal(logged(engine, /Skipped SELL: Fast mode is demo only/).length, 1, "logged once, not every bar");
-    engine.running = false;
-    // Turning it on while a real account is in use is refused too.
-    engine.updateSettings({ aiFast: false });
-    assert.throws(() => engine.updateSettings({ aiFast: true }), (e) => e.code === "fast_demo_only");
-    assert.equal(engine.settings.aiFast, false);
-    // On the demo account it trades.
-    engine.selectAccount("DOT1");
-    await flush();
-    engine.updateSettings({ aiFast: true });
-    engine.start();
-    history(ctx.sock, FAST_SIG);
-    openBar(ctx.sock, FAST_SIG + 1);
-    await flush();
-    assert.equal(sentOf(ctx.sock, "proposal").length, 1);
-  } finally { ctx.cleanup(); }
-});
-
-test("fast mode setting is validated and kept across restarts", async () => {
-  assert.deepEqual(cleanSettings({ aiFast: true }).settings, { aiFast: true });
-  assert.equal(cleanSettings({ aiFast: "yes" }).errors.length, 1);
-  const ctx = await ready(setup({ settings: { aiFast: true } }));
-  try {
-    assert.equal(ctx.engine.settings.aiFast, true);
-    ctx.engine.shutdown();
-    const again = makeEngine(ctx.dir);
-    assert.equal(again.engine.settings.aiFast, true);
-    again.engine.shutdown();
-  } finally { ctx.cleanup(); }
-});
-
-// ------------------------------------------------- ICT, waiting plans, timeframe, markets
-// The ICT setup of test/ict.test.mjs at a price level the Multiplier sizing accepts:
-// price = 10000 + (unit - 100) x 10. The gap is 9990 to 10012; the sweep's low is 9965.
-import { ictMinBars, historyCount } from "../public/js/strategy.js";
-import { sizeMultiplier } from "../public/js/risk.js";
-const U = (v) => 10000 + (v - 100) * 10;
-const ICT_ROWS = [
-  ...Array.from({ length: ictMinBars() + 20 }, () => [100, 100.5, 99.5, 100]),
-  [100, 100.5, 99, 99.2], [99.2, 99.4, 98, 98.2], [98.2, 98.5, 97, 97.8], [97.8, 99, 97.6, 98.8], [98.8, 100, 98.5, 99.8],
-  [99.8, 101, 99.5, 100.2], [100.2, 100.4, 99, 99.2], [99.2, 99.5, 98, 98.2], [98.2, 98.4, 96.5, 97.5], [97.5, 99, 97.3, 98.8],
-  [98.8, 101.8, 98.7, 101.6], [101.6, 102.5, 101.2, 102.2],
-];
-const ICT_T0 = Date.UTC(2026, 9, 2, 6) / 1000;
-const ictBar = (k, [o, h, l, c] = [101.8, 102.0, 101.6, 101.8], sec = 60) =>
-  ({ epoch: ICT_T0 + k * sec, open: U(o), high: U(h), low: U(l), close: U(c) });
-const ICT_LAST = ICT_ROWS.length - 1;     // the candle that completes the gap
-/** History up to the gap's candle (still forming), then a new candle closes it: the plan is made. */
-function ictSetup(sock) {
-  sock.push(isHistory, { msg_type: "candles", candles: ICT_ROWS.map((r, k) => ictBar(k, r)) });
-  tick(sock, ictBar(ICT_LAST + 1));
-}
-const tick = (sock, b) => sock.push(isHistory, { msg_type: "ohlc", ohlc: { open_time: b.epoch, open: String(b.open), high: String(b.high), low: String(b.low), close: String(b.close) } });
-/** A tick at `price` inside candle k (which may already be forming). */
-const tickAt = (sock, k, price) => tick(sock, { ...ictBar(k), close: price, low: Math.min(U(101.6), price) });
-
-test("ICT: a waiting plan is made at the candle close and entered on the tick that reaches the zone, with the drawn stop and target", async () => {
-  const ctx = await ready(setup({ settings: { strategy: "ict", mode: "auto" } }));
-  const { engine, sock } = ctx;
-  try {
-    engine.start();
-    ictSetup(sock);
-    await flush();
-    const plan = engine.status().pending;
-    assert.ok(plan, "a waiting plan");
-    assert.equal(plan.side, "BUY");
-    assert.deepEqual(plan.zone, [U(99), U(101.2)]);
-    assert.equal(plan.invalidateAt, U(96.5));
-    assert.match(plan.text, /^Buy if price comes back to 9990\.0+ to 10012\.0+\. Stop loss .*, take profit .*\. Cancelled at \d\d:\d\d UTC or if price goes below 9965/);
-    assert.equal(logged(engine, /^Waiting for price: BUY R_75/).length, 1);
-    assert.equal(sentOf(sock, "proposal").length, 0, "nothing traded yet");
-    assert.ok(plan.start > 0 && plan.start < plan.expiresAt, "the chart's box starts at the setup");
-    assert.ok(plan.slMoney > 0 && plan.tpMoney > 0, "money at the stop and the target for the balance now");
-    tickAt(sock, ICT_LAST + 1, U(101.5));     // still above the zone
-    await flush();
-    assert.equal(sentOf(sock, "proposal").length, 0);
-    tickAt(sock, ICT_LAST + 1, U(101.05));    // inside: enter now, not at the candle close
-    await flush();
-    const [p] = sentOf(sock, "proposal");
-    assert.ok(p, "proposal on the touch");
-    assert.equal(p.contract_type, "MULTUP");
-    const entry = U(101.05);
-    const size = sizeMultiplier({ balance: 10000, riskPct: 1, entry, slDist: entry - plan.sl, tpDist: plan.tp - entry, multiplier: 50, minStake: 1, maxStake: 2000 });
-    assert.deepEqual(p.limit_order, { stop_loss: size.stopLoss, take_profit: size.takeProfit }, "the money of the drawn stop loss and take profit");
-    assert.equal(sentOf(sock, "buy").length, 1);
-    assert.equal(engine.status().pending, null, "the plan became the trade");
-    assert.equal(engine.status().open[0].horizon, 30);
-    assert.equal(engine.lastSignal.fromPending, true);
-    assert.ok(Math.abs(engine.lastSignal.sl - plan.sl) < 1e-9 && Math.abs(engine.lastSignal.tp - plan.tp) < 1e-9, "same levels as the plan");
-    // The touch candle closes: the closed-candle ICT signal of the same setup is not traded again.
-    tick(sock, ictBar(ICT_LAST + 2));
-    tick(sock, ictBar(ICT_LAST + 3));
-    await flush();
-    assert.equal(sentOf(sock, "proposal").length, 1, "one trade for one setup");
-  } finally { ctx.cleanup(); }
-});
-
-test("ICT: a waiting plan is cancelled when it expires, when price breaks the sweep's low, and when the bot stops", async () => {
-  const ctx = await ready(setup({ settings: { strategy: "ict", mode: "auto" } }));
-  const { engine, sock } = ctx;
-  try {
-    engine.start();
-    ictSetup(sock);
-    await flush();
-    const plan = engine.status().pending;
-    // 30 candles after the gap's candle, still above the zone: expired
-    let k = ICT_LAST + 2;
-    for (; ictBar(k).epoch < plan.expiresAt; k++) { tick(sock, ictBar(k)); await flush(); assert.ok(engine.status().pending, `still waiting at candle ${k}`); }
-    tick(sock, ictBar(k));
-    await flush();
-    assert.equal(engine.status().pending, null);
-    assert.equal(logged(engine, /^Cancelled the waiting BUY plan/).length, 1);
-    assert.match(engine.logs.at(-1).detail, /did not come back in time/);
-    assert.equal(sentOf(sock, "proposal").length, 0);
-  } finally { ctx.cleanup(); }
-
-  const again = await ready(setup({ settings: { strategy: "ict", mode: "auto" } }));
-  try {
-    again.engine.start();
-    ictSetup(again.sock);
-    await flush();
-    tickAt(again.sock, ICT_LAST + 1, U(96.4));   // below the sweep's low (9965) without a tick in the zone
-    await flush();
-    assert.equal(again.engine.status().pending, null);
-    assert.match(logged(again.engine, /^Cancelled the waiting BUY plan/)[0].detail, /below the low the setup was built on/);
-    assert.equal(sentOf(again.sock, "proposal").length, 0);
-    // a new plan, then Stop
-    again.engine.stop();
-    again.engine.start();
-    ictSetup(again.sock);
-    await flush();
-    assert.ok(again.engine.status().pending === null, "a used setup is not offered again");
-  } finally { again.cleanup(); }
-
-  const third = await ready(setup({ settings: { strategy: "ict", mode: "signals" } }));
-  try {
-    third.engine.start();
-    ictSetup(third.sock);
-    await flush();
-    assert.ok(third.engine.status().pending);
-    third.engine.stop();
-    assert.equal(third.engine.status().pending, null);
-    assert.match(logged(third.engine, /^Cancelled the waiting BUY plan/)[0].detail, /The bot was stopped/);
-  } finally { third.cleanup(); }
-});
-
-test("ICT in signals mode: the touch sends the signal at the price then, nothing is traded", async () => {
-  const ctx = await ready(setup({ settings: { strategy: "ict", mode: "signals" } }));
-  const { engine, sock } = ctx;
-  try {
-    engine.start();
-    ictSetup(sock);
-    await flush();
-    const plan = engine.status().pending;
-    tickAt(sock, ICT_LAST + 1, U(100.5));
-    await flush();
-    assert.equal(sentOf(sock, "proposal").length, 0);
-    assert.equal(logged(engine, /^BUY R_75 @ 10005/).length, 1);
-    assert.equal(engine.lastSignal.traded, false);
-    assert.ok(Math.abs(engine.lastSignal.sl - plan.sl) < 1e-9);
-  } finally { ctx.cleanup(); }
-});
-
-test("ICT is demo only for auto trade: refused on a real account, signals still work there", async () => {
-  const ctx = await ready(setup({ settings: { strategy: "ict", mode: "auto", allowReal: true }, state: { accountId: "ROT1" } }));
-  const { engine, sock } = ctx;
-  try {
-    assert.equal(engine.status().account.type, "real");
-    assert.equal(engine.status().ictBlocked, true);
-    assert.throws(() => engine.start(), (e) => e instanceof UserError && e.code === "ict_demo_only" && e.status === 403);
-    assert.equal(engine.running, false);
-    assert.equal(logged(engine, /^Did not start: ICT is demo only for auto trade/).length, 1);
-    // Running already (resumed after a restart): the touch is refused, with one log line.
-    engine.running = true;
-    ictSetup(sock);
-    await flush();
-    tickAt(sock, ICT_LAST + 1, U(101.0));
-    await flush();
-    assert.equal(sentOf(sock, "proposal").length, 0, "no order on the real account");
-    assert.equal(logged(engine, /^Skipped BUY: ICT is demo only for auto trade/).length, 1);
-    engine.running = false;
-    // Switching to ICT while auto trading a real account is refused.
-    engine.updateSettings({ strategy: "rules" });
-    engine.start();
-    assert.throws(() => engine.updateSettings({ strategy: "ict" }), (e) => e.code === "ict_demo_only");
-    engine.stop();
-    // Signals only works on the real account.
-    engine.updateSettings({ mode: "signals", strategy: "ict" });
-    engine.start();
-    assert.equal(engine.running, true);
-    assert.equal(engine.status().ictBlocked, false);
-  } finally { ctx.cleanup(); }
-});
-
-test("strategy timeframe: 1-hour candles are subscribed with enough history, and time limits count hours", async () => {
-  assert.deepEqual(cleanSettings({ botTf: 3600 }).settings, { botTf: 3600 });
-  assert.deepEqual(cleanSettings({ botTf: "900" }).settings, { botTf: 900 });
-  assert.equal(cleanSettings({ botTf: 300 }).errors.length, 1);
-  const ctx = await ready(setup({ settings: { strategy: "ict", mode: "auto", botTf: 3600 } }));
-  const { engine, sock } = ctx;
-  try {
-    const hist = sock.streams.find((s) => isHistory(s.req)).req;
-    assert.equal(hist.granularity, 3600);
-    assert.equal(hist.count, historyCount("ict", 3600));
-    assert.equal(engine.status().botTf, 3600);
-    engine.start();
-    sock.push(isHistory, { msg_type: "candles", candles: ICT_ROWS.map((r, k) => ictBar(k, r, 3600)) });
-    tick(sock, ictBar(ICT_LAST + 1, undefined, 3600));
-    await flush();
-    const plan = engine.status().pending;
-    assert.ok(plan);
-    assert.equal(plan.expiresAt, ictBar(ICT_LAST, undefined, 3600).epoch + 31 * 3600, "30 one-hour candles");
-    tick(sock, { ...ictBar(ICT_LAST + 1, undefined, 3600), close: U(101.0) });
-    await flush();
-    assert.equal(sentOf(sock, "buy").length, 1);
-    assert.equal(engine.state.openMeta["9000"].barSec, 3600);
-    // the 30-candle time limit is 30 hours
-    let k = ICT_LAST + 2;
-    for (; k < ICT_LAST + 31; k++) { tick(sock, ictBar(k, undefined, 3600)); await flush(); }
-    assert.equal(sentOf(sock, "sell").length, 0, "not closed after 29 hours");
-    tick(sock, ictBar(k, undefined, 3600)); tick(sock, ictBar(k + 1, undefined, 3600));
-    await flush();
-    assert.equal(sentOf(sock, "sell").length, 1);
-    assert.equal(logged(engine, /Closing trade \(30 hours time limit\)/).length, 1);
-    // changing the timeframe stops the bot and asks for the new candles
-    engine.updateSettings({ botTf: 900 });
-    assert.equal(engine.running, false);
-    const h15 = ctx.sock.streams.find((s) => isHistory(s.req)).req;
-    assert.equal(h15.granularity, 900);
-    assert.equal(logged(engine, /The bot now trades on 15-minute candles/).length, 1);
-  } finally { ctx.cleanup(); }
-});
-
-const ACTIVE_SYMBOLS = [
-  { underlying_symbol: "R_75", display_name: "Volatility 75 Index", market: "synthetic_index", market_display_name: "Derived", submarket: "random_index", exchange_is_open: 1, is_trading_suspended: 0 },
-  { underlying_symbol: "frxEURUSD", display_name: "EUR/USD", market: "forex", market_display_name: "Forex", submarket: "major_pairs", exchange_is_open: 1, is_trading_suspended: 0 },
-  { underlying_symbol: "frxXAUUSD", display_name: "Gold/USD", market: "commodities", market_display_name: "Commodities", submarket: "metals", exchange_is_open: 0, is_trading_suspended: 0 },
-];
-
-test("markets: Deriv's list (Multipliers only) feeds the picker, unknown markets are refused, a closed market trades nothing", async () => {
-  let asked = [];
-  const ctx = await ready(setup({ settings: { strategy: "ict", mode: "auto" }, over: { active_symbols: (req) => { asked.push(req); return { active_symbols: ACTIVE_SYMBOLS }; } } }));
-  const { engine } = ctx;
-  try {
-    assert.deepEqual({ ...asked[0], contract_type: [...asked[0].contract_type] }, { active_symbols: "brief", contract_type: ["MULTUP", "MULTDOWN"] });
-    const st = engine.status();
-    assert.deepEqual(st.marketGroups.map((g) => g.name), ["Synthetic indices", "Forex", "Commodities"]);
-    assert.deepEqual(st.marketGroups[2].items, [{ symbol: "frxXAUUSD", name: "Gold/USD", open: false }]);
-    assert.equal(st.marketOpen, true);
-    assert.equal(cleanSettings({ symbol: "frxEURUSD" }, engine.settings, engine.knownSymbols()).errors.length, 0);
-    assert.equal(cleanSettings({ symbol: "R_10" }, engine.settings, engine.knownSymbols()).errors.length, 1, "not in Deriv's list now");
-    engine.updateSettings({ symbol: "frxXAUUSD" });
-    await flush();
-    assert.equal(engine.status().marketOpen, false);
-    assert.equal(engine.status().synthetic, false);
-    assert.equal(engine.status().symbolName, "Gold/USD");
-    assert.match(logged(engine, /^Market changed to Gold\/USD/)[0].detail, /closed now/);
-    engine.start();
-    assert.equal(logged(engine, /^Gold\/USD is closed now/).length, 1);
-    ictSetup(ctx.sock);
-    await flush();
-    tickAt(ctx.sock, ICT_LAST + 1, U(101.0));
-    await flush();
-    assert.equal(sentOf(ctx.sock, "proposal").length, 0, "no order while closed");
-    assert.equal(logged(engine, /^Skipped BUY: Gold\/USD is closed now/).length, 1);
-  } finally { ctx.cleanup(); }
-});
-
-test("markets: when Deriv refuses the Multipliers filter, the plain list is used without non-Multiplier groups", async () => {
-  const ctx = await ready(setup({ over: { active_symbols: (req) => {
-    if (req.contract_type) throw new Error("Input validation failed: contract_type");
-    return { active_symbols: [...ACTIVE_SYMBOLS, { underlying_symbol: "OTC_DJI", display_name: "Wall Street 30", market: "indices", exchange_is_open: 1 }] };
-  } } }));
-  try {
-    const names = ctx.engine.status().symbols.map(([v]) => v);
-    assert.deepEqual(names, ["R_75", "frxEURUSD", "frxXAUUSD"]);
-  } finally { ctx.cleanup(); }
-});
-
-test("ICT settings follow the market and timeframe: 4h trend filter on 1-hour real markets, none on synthetics", async () => {
-  const ctx = await ready(setup({ settings: { strategy: "ict", botTf: 3600 }, over: { active_symbols: () => ({ active_symbols: ACTIVE_SYMBOLS }) } }));
-  const { engine } = ctx;
-  try {
-    assert.equal(engine.tf(), 3600);
-    assert.equal(engine.strategyParams().htfBias, "off", "R_75 is a random number generator");
-    assert.equal(engine.strategyParams().barMinutes, 60);
-    engine.updateSettings({ symbol: "frxEURUSD" });
-    await flush();
-    assert.equal(engine.strategyParams().htfBias, "ema");
-    assert.equal(engine.strategyParams().htfMinutes, 240);
-    engine.updateSettings({ botTf: 900 });
-    await flush();
-    assert.equal(engine.strategyParams().killZone, true);
-    assert.equal(engine.strategyParams().htfBias, "off");
-  } finally { ctx.cleanup(); }
-});

@@ -10,7 +10,7 @@ const bars = (from, n, tf, base = 100) => Array.from({ length: n }, (_, i) => ({
 /** Just what ChartFeed reads from the engine, with a socket that answers ticks_history by hand. */
 function fakeEngine({ botTf = 60, symbol = "R_75", connection = "online" } = {}) {
   const e = {
-    settings: { symbol }, botTf, bars: [], forming: null, connection, sent: [], answers: [],
+    symbol, botTf, bars: [], forming: null, connection, sent: [], answers: [],
     tf() { return this.botTf; },
     socket: {
       send(req) {
@@ -147,7 +147,7 @@ test("ChartFeed: not connected, a failed or slow request, and a market change gi
 
   // The market changed: the old candles are dropped, and a late answer for the old market is ignored.
   t.now += 15000;
-  e.settings.symbol = "R_100";
+  e.symbol = "R_100";
   r = await feed.candles(900, 900);
   assert.equal(r.symbol, "R_100");
   assert.deepEqual(r.candles, []);

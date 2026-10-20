@@ -1,4 +1,4 @@
-// End-to-end check of the server bot in a real browser (Playwright + Chromium), scanner auto-trade included:
+// End-to-end check of the scanner-only server bot in a real browser (Playwright + Chromium), auto trade included:
 // the mock Deriv runs inside this process, the server runs as a child process.
 //
 //   node tools/e2e-server.mjs [--shots dir]
@@ -109,7 +109,14 @@ try {
       assert.match(await page.getAttribute("#tokenInput", "placeholder"), /ends in aa77/);
       assert.equal((await page.textContent("#sumDeriv")).trim(), "Connected");
 
-      step = "start";
+      step = "start (Auto trade is the default)";
+      assert.equal(await page.$eval('#modeSeg input[value="auto"]', (i) => i.checked), true);
+      assert.match(await page.textContent("#stateDetail"), /Press Start to trade the scanner's ready setups/);
+      for (const gone of ["#secMarket", "#signalBox", "#seesText", "#pendingBox", "#scanAutoInput", "#scanOn", "#secMode"])
+        assert.equal(await page.$(gone), null, `${gone} is gone`);
+      // Signals only until the scanner's fixed setups are on, so a random setup on the mock's forex is never traded.
+      await page.click('#modeSeg label:has(input[value="signals"])');
+      await page.waitForFunction(() => /Signals only/.test(document.getElementById("stateDetail").textContent));
       await page.click("#runBtn");
       await page.waitForFunction(() => document.getElementById("stateLabel").textContent === "Running");
       assert.equal((await page.textContent("#runBtn")).trim(), "Stop the bot");
@@ -123,154 +130,142 @@ try {
       await page.waitForFunction(() => document.getElementById("stateLabel").textContent === "Running");
       await page.waitForFunction(() => [...document.querySelectorAll("#logList .title")].some((e) => e.textContent === "Resumed after a restart"));
       await page.waitForFunction((tid) => /\d/.test(document.querySelector(`#openList li[data-id="${tid}"] .profit`).textContent), id);
+      step = "the chart shows the open trade's market by default";
+      await page.waitForFunction(() => document.getElementById("chart").dataset.symbol === "R_75" && Number(document.getElementById("chart").dataset.candles) > 50, null, { timeout: 15000 });
+      assert.match(await page.textContent("#focusText"), /Open trade/);
       await shot("open-trade");
 
       step = "close the trade";
-      await page.click(`#openList li[data-id="${id}"] button`);
+      await page.click(`#openList li[data-id="${id}"] [data-close]`);
       await page.waitForSelector(`#openList li[data-id="${id}"]`, { state: "detached", timeout: 15000 });
       await page.waitForFunction(() => [...document.querySelectorAll("#logList .title")].some((e) => /^Closed BUY R_75/.test(e.textContent)));
 
       step = "risk limits are clamped";
       await page.click("#secRisk summary");
       await page.fill('#riskForm input[name="riskPct"]', "99");
+      await page.fill('#riskForm input[name="scanAutoMaxDay"]', "50");
       await page.click('#riskForm button[type="submit"]');
       await page.waitForFunction(() => /adjusted/.test(document.getElementById("riskMsg").textContent));
       assert.equal(await page.inputValue('#riskForm input[name="riskPct"]'), "5");
+      assert.equal(await page.inputValue('#riskForm input[name="scanAutoMaxDay"]'), "10");
+      await page.fill('#riskForm input[name="scanAutoMaxDay"]', "4");
+      await page.click('#riskForm button[type="submit"]');
+      await page.waitForFunction(() => /Saved/.test(document.getElementById("riskMsg").textContent) && document.getElementById("tradesToday").textContent.endsWith("/ 4"));
+      await page.click("#secRisk summary");
 
-      step = "mode can't change while running";
-      await page.click("#secMode summary");
+      step = "the mode switches while running";
+      assert.match(await page.textContent("#scanAuto"), /Signals only/);
+      await page.click('#modeSeg label:has(input[value="auto"])');
+      await page.waitForFunction(() => /Auto trade \(demo\)/.test(document.getElementById("scanAuto").textContent) && /Trading the scanner/.test(document.getElementById("stateDetail").textContent));
+      assert.equal((await page.textContent("#stateLabel")), "Running");
       await page.click('#modeSeg label:has(input[value="signals"])');
-      await page.waitForFunction(() => /Stop the bot/.test(document.getElementById("modeMsg").textContent));
-      assert.equal(await page.$eval('#modeSeg input[value="auto"]', (i) => i.checked), true);
+      await page.waitForFunction(() => /Signals only/.test(document.getElementById("scanAuto").textContent));
 
-      step = "allow real money";
-      await page.click("#secReal summary");
+      step = "allow real money (in Account)";
+      await page.click("#secAccount summary");
       await page.fill("#realConfirm", "real");
       await page.click("#realOnBtn");
       await page.waitForFunction(() => /capital letters/.test(document.getElementById("realMsg").textContent));
       await page.fill("#realConfirm", "REAL");
       await page.click("#realOnBtn");
       await page.waitForSelector("#realOn:not([hidden])");
-      await page.click("#secAccount summary");
       assert.equal(await page.$eval('#accountList input[value="ROT10000001"]', (i) => i.disabled), false);
       await page.click("#realOffBtn");
       await page.waitForSelector("#realOff:not([hidden])");
       await page.waitForFunction(() => document.querySelector('#accountList input[value="ROT10000001"]')?.disabled === true);
+      await page.click("#secAccount summary");
 
       step = "stop";
       await page.click("#runBtn");
       await page.waitForFunction(() => document.getElementById("stateLabel").textContent === "Stopped");
 
-      step = "signals only: the signal on the chart with its stop loss and take profit";
-      await page.click('#modeSeg label:has(input[value="signals"])');
-      await page.waitForFunction(() => document.getElementById("runBtn").textContent.trim() === "Start signals");
-      await mockClock(200);   // fast candles, so the rules strategy finds a setup soon
-      await page.click("#runBtn");
-      await page.waitForFunction(() => document.getElementById("chart").dataset.plans?.split(" ").includes("signal"), null, { timeout: 120000 });
-      await mockClock(1000);
-      assert.match(await page.textContent("#signalBox"), /signal only/);
-      await shot("signal");
-      await page.click("#runBtn");
-      await page.waitForFunction(() => document.getElementById("stateLabel").textContent === "Stopped");
+      step = "scanner";
+      // Real markets only at first; the mock's fixed setups are on two synthetic indices.
+      await page.waitForFunction(() => /Checked/.test(document.getElementById("scanWhen").textContent), null, { timeout: 30000 });
+      await page.click("#secScanner summary");
+      assert.equal(await page.isChecked("#scanSynth"), false, "real markets only by default");
+      assert.deepEqual(await page.$$eval('#scanStratSeg input:checked', (els) => els.map((e) => e.value)), ["ict", "rules"]);
+      await page.click('label[for="scanSynth"]');
+      await page.waitForFunction(() => /Saved/.test(document.getElementById("scanSetMsg").textContent));
+      assert.match(await page.textContent("#sumScanner"), /synthetics/);
+      await page.click("#secScanner summary");
     } else {
       await page.waitForFunction(() => /10,000|USD/.test(document.getElementById("balance").textContent));
     }
 
-    step = "chart";
-    await page.waitForFunction(() => Number(document.getElementById("chart").dataset.candles) > 50, null, { timeout: 15000 });
-    await page.click('[data-tf="300"]');
-    await page.waitForFunction(() => document.getElementById("chart").getAttribute("aria-label").startsWith("5m") &&
-                                     Number(document.getElementById("chart").dataset.candles) > 5, null, { timeout: 15000 });
-    assert.equal(await page.textContent("#tfNote"), "The bot trades on 1-minute candles; this only changes the chart.");
-    await page.click('[data-tf="60"]');
-    await page.waitForFunction(() => document.getElementById("tfNote").hidden);
-
-    step = "scanner";
-    if (scheme === "light") {
-      // Real markets only at first; the mock's fixed setups are on two synthetic indices.
-      await page.waitForFunction(() => /Checked/.test(document.getElementById("scanWhen").textContent), null, { timeout: 30000 });
-      await page.click("#secScanner summary");
-      assert.equal(await page.isChecked("#scanOn"), true, "on by default");
-      assert.equal(await page.isChecked("#scanSynth"), false, "real markets only by default");
-      await page.click('label[for="scanSynth"]');
-      await page.waitForFunction(() => /Saved/.test(document.getElementById("scanSetMsg").textContent));
-      assert.match(await page.textContent("#sumScanner"), /with synthetics/);
-      await page.click("#secScanner summary");
-    }
+    step = "scanner list and the default chart";
     await page.waitForFunction(() => document.querySelectorAll("#scanList .scan-item").length >= 2 &&
       [...document.querySelectorAll("#scanList .scan-name")].some((e) => e.textContent === "Volatility 50 Index"), null, { timeout: 60000 });
     assert.equal(await page.$eval("#scanList .scan-item", (b) => b.classList.contains("ready")), true, "ready now comes first");
-    assert.match(await page.textContent("#scanList"), /Waiting for price/);
+    assert.match(await page.textContent("#scanList"), /Waiting/);
     assert.match(await page.textContent("#scanCard"), /no proven edge/);
     assert.ok(!/%/.test(await page.textContent("#scanList")), "no percentages on the cards");
+    assert.equal(await page.$$eval(".scan-more", (els) => els.length), 0, "reasons are folded");
+    const top = await page.$eval("#scanList .scan-item", (b) => b.dataset.id.split(":")[0]);
+    await page.waitForFunction((sym) => document.getElementById("chart").dataset.symbol === sym && Number(document.getElementById("chart").dataset.candles) > 50, top, { timeout: 15000 });
+    // The home screen as it looks on arrival: every settings group folded, no toast.
+    await page.evaluate(() => { for (const d of document.querySelectorAll("details")) d.open = false; document.getElementById("toast").hidden = true; window.scrollTo(0, 0); });
+    await shot("home");
     await page.$eval("#scanCard", (e) => e.scrollIntoView());
     if (SHOTS) await page.locator("#scanCard").screenshot({ path: join(SHOTS, `scanner-card-${scheme}.png`) });
+
+    step = "a tapped setup: its reason and its chart";
     await page.click('#scanList .scan-item:has(.scan-name:text-is("Volatility 50 Index"))');
+    await page.waitForSelector(".scan-more .scan-reason");
     await page.waitForFunction(() => document.getElementById("chart").dataset.symbol === "R_50" &&
       document.getElementById("chart").dataset.plans?.split(" ").includes("scan") && Number(document.getElementById("chart").dataset.candles) > 50, null, { timeout: 15000 });
-    assert.equal(await page.isVisible("#chartFocus"), true);
     assert.match(await page.textContent("#chartMarket"), /Volatility 50/);
     assert.match(await page.textContent("#focusText"), /Waiting for price/);
-    assert.equal(await page.isVisible("#tfNote"), false);
+    await page.click('[data-tf="300"]');
+    await page.waitForFunction(() => document.getElementById("chart").getAttribute("aria-label").startsWith("5m") &&
+                                     Number(document.getElementById("chart").dataset.candles) > 5, null, { timeout: 15000 });
     if (SHOTS) await page.locator("#chartCard").screenshot({ path: join(SHOTS, `scanner-chart-${scheme}.png`) });
-    await page.click("#focusBack");
-    await page.waitForFunction(() => document.getElementById("chart").dataset.symbol === "R_75" && document.getElementById("chartFocus").hidden &&
-      !document.getElementById("chart").dataset.plans?.split(" ").includes("scan"), null, { timeout: 15000 });
     if (scheme === "light") {
-      step = "scanner auto-trade (demo): turned on, the bot started, Scan now";
+      step = "auto trade (demo): Start, Scan now";
       await mockClock(6000);   // slower prices, so the trade stays open long enough to look at
       await page.click('#modeSeg label:has(input[value="auto"])');
-      await page.waitForFunction(() => document.getElementById("runBtn").textContent.trim() === "Start the bot");
-      await page.click("#secScanner summary");
-      assert.equal(await page.isChecked("#scanAutoInput"), false, "off by default");
-      assert.deepEqual(await page.$$eval('input[name="scanAutoStrategy"]:checked', (els) => els.map((e) => e.value)), ["ict", "rules"]);
-      await page.click('label[for="scanAutoInput"]');
-      await page.waitForFunction(() => /Auto-trade is on/.test(document.getElementById("scanAutoMsg").textContent));
-      await page.waitForFunction(() => /Auto-trade: on \(demo\) · 0 of 4 today/.test(document.getElementById("scanAuto").textContent) &&
+      await page.waitForFunction(() => /Auto trade \(demo\) · 0 of 4 today/.test(document.getElementById("scanAuto").textContent) &&
                                        /press Start/.test(document.getElementById("scanAuto").textContent));
-      await page.click("#secScanner summary");
       await page.click("#runBtn");
       await page.waitForFunction(() => document.getElementById("stateLabel").textContent === "Running");
       await page.click("#scanBtn");
       await page.waitForFunction(() => /Scan again in|Scanning/.test(document.getElementById("scanBtn").textContent));
       assert.equal(await page.isDisabled("#scanBtn"), true, "cooldown");
 
-      step = "scanner auto-trade (demo): the trade, its tag and the Traded badge";
+      step = "auto trade (demo): the trade, its tag and the Traded badge";
       await page.waitForFunction(() => [...document.querySelectorAll("#openList .from")].some((e) => /^from Scanner · ICT (15m|1h) Volatility 100 Index$/.test(e.textContent)),
                                  null, { timeout: 60000 });
-      await page.waitForFunction(() => /Auto-trade: on \(demo\) · 1 of 4 today/.test(document.getElementById("scanAuto").textContent), null, { timeout: 20000 });
+      await page.waitForFunction(() => /Auto trade \(demo\) · 1 of 4 today/.test(document.getElementById("scanAuto").textContent), null, { timeout: 20000 });
       await page.waitForFunction(() => [...document.querySelectorAll("#scanList .scan-item")].some((b) =>
         b.querySelector(".scan-name")?.textContent === "Volatility 100 Index" && b.querySelector(".scan-traded")), null, { timeout: 30000 });
       assert.ok([...(await page.$$eval("#logList .title", (els) => els.map((e) => e.textContent)))].some((t) => /^Opened BUY R_100 from the scanner/.test(t)));
-      await page.$eval("#scanCard", (e) => e.scrollIntoView());
-      if (SHOTS) await page.locator("#scanCard").screenshot({ path: join(SHOTS, "auto-scanner-card-light.png") });
       const tradeId = await page.$eval("#openList li:has(.from)", (li) => li.dataset.id);
+      await page.evaluate(() => { document.getElementById("toast").hidden = true; window.scrollTo(0, 0); });
+      await shot("home-trading");
       if (SHOTS) await page.locator("#openList").screenshot({ path: join(SHOTS, "auto-open-trade-light.png") });
 
-      step = "scanner auto-trade (demo): the trade's plan on its market's chart";
+      step = "auto trade (demo): the trade's plan on its market's chart";
       await page.click(`#openList li[data-id="${tradeId}"] [data-chart]`);
       await page.waitForFunction((id) => document.getElementById("chart").dataset.symbol === "R_100" &&
         document.getElementById("chart").dataset.plans?.split(" ").includes(id) && Number(document.getElementById("chart").dataset.candles) > 50, tradeId, { timeout: 20000 });
-      assert.match(await page.textContent("#focusText"), /Volatility 100 Index · ICT on (15m|1h) · Open trade from the scanner/);
+      assert.match(await page.textContent("#focusText"), /ICT on (15m|1h) · Open trade/);
       if (SHOTS) await page.locator("#chartCard").screenshot({ path: join(SHOTS, "auto-trade-chart-light.png") });
-      await page.click("#focusBack");
-      await page.waitForFunction(() => document.getElementById("chart").dataset.symbol === "R_75", null, { timeout: 15000 });
 
-      step = "scanner auto-trade (demo): stop, close the trade";
+      step = "auto trade (demo): Stop leaves the trade open; then close it";
       await page.click("#runBtn");
       await page.waitForFunction(() => document.getElementById("stateLabel").textContent === "Stopped");
+      assert.ok(await page.$(`#openList li[data-id="${tradeId}"]`), "Stop closes nothing");
       await page.click(`#openList li[data-id="${tradeId}"] [data-close]`);
       await page.waitForSelector(`#openList li[data-id="${tradeId}"]`, { state: "detached", timeout: 15000 });
       await mockClock(1000);
     } else {
-      step = "scanner auto-trade (demo): shown while the bot is stopped";
-      await page.waitForFunction(() => /Auto-trade: on \(demo\) · 1 of 4 today/.test(document.getElementById("scanAuto").textContent), null, { timeout: 20000 });
-      await page.$eval("#scanCard", (e) => e.scrollIntoView());
-      if (SHOTS) await page.locator("#scanCard").screenshot({ path: join(SHOTS, "auto-scanner-card-dark.png") });
+      step = "auto trade (demo): shown while the bot is stopped";
+      await page.waitForFunction(() => /Auto trade \(demo\) · 1 of 4 today/.test(document.getElementById("scanAuto").textContent), null, { timeout: 20000 });
     }
 
     step = "page checks";
     assert.ok(!(await page.content()).includes(PAT), "the token never reaches the page");
+    await page.evaluate(() => { for (const d of document.querySelectorAll("details")) d.open = true; });
     const small = await page.$$eval("button:not([hidden]), summary, .seg span, .choice", (els) => els
       .filter((e) => e.offsetParent !== null && getComputedStyle(e).display !== "none")
       .map((e) => [e.id || e.textContent.trim().slice(0, 30), e.getBoundingClientRect().height])
@@ -282,8 +277,7 @@ try {
     assert.deepEqual(unlabeled.filter((n) => n !== "username"), [], "every field has a label");
     const wide = await page.evaluate(() => document.documentElement.scrollWidth - document.documentElement.clientWidth);
     assert.ok(wide <= 0, `no sideways scrolling (${wide}px)`);
-    await page.evaluate(() => { for (const d of document.querySelectorAll("details.set")) d.open = true; });
-    await shot("main");
+    await shot("settings");
 
     step = "log out";
     await page.click("#logoutBtn");

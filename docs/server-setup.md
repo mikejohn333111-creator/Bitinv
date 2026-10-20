@@ -128,13 +128,13 @@ The token is kept only on your server, in a private file. The page never shows i
 ## First run: use the demo account
 
 1. Under **Account**, pick your **Demo** account.
-2. Leave **Trading mode** on **Auto trade**. (Signals only trades nothing and just lists setups.)
-3. Pick a market and a strategy. Check the **Risk limits**.
-4. Tap **Start the bot**.
+2. Next to the Start button, leave the mode on **Auto trade (demo)**. (**Signals only** trades nothing: the scanner just lists setups.)
+3. There is no market or strategy to pick: the **Scanner** checks many markets and trades its ready setups on their own market. Check **Settings > Risk** (risk per trade, daily loss limit, trades per day, open at once).
+4. Tap **Start the bot**. **Stop** stops new trades; open trades keep their stop loss and take profit.
 5. Close the page. The bot keeps going. Come back later and look at **Activity**.
 6. Tap **Stop the bot** to stop it. Open trades keep their stop loss and take profit at Deriv.
 
-Real money is off. The bot refuses real accounts until you type REAL under **Allow real money**. We suggest you leave it off. No strategy here has a proven edge.
+Auto trade is demo only: it never trades real money. Real accounts can only be picked (for Signals only) after you type REAL under **Account**. No strategy here has a proven edge.
 
 ## Update
 

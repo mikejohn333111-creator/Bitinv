@@ -1,4 +1,4 @@
-// Scanner auto-trade (server/engine.mjs autoScan, server/scanner.mjs staleReason): demo only,
+// Auto trade of scanner setups (server/engine.mjs autoScan, server/scanner.mjs staleReason): demo only,
 // the caps (per day, open at once, one per market), each setup taken once (also after a
 // restart), fresh setups only, the order on the setup's own market, and the Scanner hook.
 import test from "node:test";
@@ -6,8 +6,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { TradingEngine, cleanSettings, DEFAULT_SETTINGS, UserError } from "../server/engine.mjs";
-import { Scanner, scanSeries, staleReason, FRESH_R } from "../server/scanner.mjs";
+import { TradingEngine, cleanSettings, DEFAULT_SETTINGS, SETTINGS_VERSION, UserError } from "../server/engine.mjs";
+import { Scanner, scanSeries, staleReason, FRESH_R, SCANNER_DEFAULTS } from "../server/scanner.mjs";
 import { FileStore } from "../server/store.mjs";
 import { ictMinBars, ictParamsFor } from "../public/js/strategy.js";
 
@@ -67,7 +67,7 @@ function makeEngine(dir, { over = {}, accounts = [DEMO, REAL], portfolio = [], t
 async function setup({ settings = {}, state, ...o } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "tbot-scanauto-"));
   const store = new FileStore(dir);
-  store.saveSettings({ strategy: "rules", mode: "auto", scanAuto: true, ...settings });
+  store.saveSettings({ v: SETTINGS_VERSION, mode: "auto", ...settings });
   if (state) store.saveState(state);
   store.saveSecret({ appId: "app42", token: PAT });
   const ctx = makeEngine(dir, o);
@@ -122,33 +122,32 @@ test("the scanner's ready setups carry what an order needs: id, side, entry, sto
   assert.equal(staleReason(it, nowMs), "", "0.8 of a 4.65 stop away from the entry: fresh");
 });
 
-test("settings: off by default, ICT and Rules on 15m and 1h, 4 a day, 2 open; bad values refused, numbers clamped", () => {
-  assert.equal(DEFAULT_SETTINGS.scanAuto, false);
-  assert.deepEqual([DEFAULT_SETTINGS.scanAutoStrategies, DEFAULT_SETTINGS.scanAutoTfs, DEFAULT_SETTINGS.scanAutoMaxDay, DEFAULT_SETTINGS.scanAutoMaxOpen],
-                   [["ict", "rules"], [900, 3600], 4, 2]);
-  assert.deepEqual(cleanSettings({ scanAuto: true, scanAutoStrategies: ["rules", "ai", "rules"], scanAutoTfs: ["3600"], scanAutoMaxDay: 99, scanAutoMaxOpen: 0 }),
-                   { settings: { scanAuto: true, scanAutoStrategies: ["rules", "ai"], scanAutoTfs: [3600], scanAutoMaxDay: 10, scanAutoMaxOpen: 1 }, errors: [] });
-  for (const bad of [{ scanAuto: "on" }, { scanAutoStrategies: [] }, { scanAutoStrategies: ["magic"] }, { scanAutoStrategies: "ict" },
-                     { scanAutoTfs: [60] }, { scanAutoTfs: [] }, { scanAutoMaxDay: "x" }])
+test("settings: Auto trade by default, 4 a day, 2 open; the scanner looks for ICT and Rules on 15m and 1h; bad values refused, numbers clamped", () => {
+  assert.equal(DEFAULT_SETTINGS.mode, "auto");
+  assert.deepEqual([DEFAULT_SETTINGS.scanAutoMaxDay, DEFAULT_SETTINGS.scanAutoMaxOpen], [4, 2]);
+  assert.deepEqual([SCANNER_DEFAULTS.strategies, SCANNER_DEFAULTS.timeframes], [["ict", "rules"], [900, 3600]]);
+  assert.deepEqual(cleanSettings({ mode: "signals", scanAutoMaxDay: 99, scanAutoMaxOpen: 0, scanAuto: true }),
+                   { settings: { mode: "signals", scanAutoMaxDay: 10, scanAutoMaxOpen: 1 }, errors: [] }, "the old on/off switch is ignored: the mode says it");
+  for (const bad of [{ mode: "on" }, { mode: true }, { scanAutoMaxDay: "x" }, { scanAutoMaxOpen: null }])
     assert.equal(cleanSettings(bad).errors.length, 1, JSON.stringify(bad));
 });
 
 // ------------------------------------------------------------------ demo only
-test("demo only: not turned on, not started, and no order on a real account; the status says so", async () => {
-  const ctx = await setup({ settings: { scanAuto: false, allowReal: true }, state: { accountId: "ROT1" } });
+test("demo only: Auto trade is not turned on, not started, and places no order on a real account; the status says so", async () => {
+  const ctx = await setup({ settings: { mode: "signals", allowReal: true }, state: { accountId: "ROT1" } });
   const { engine, sock } = ctx;
   try {
     assert.equal(engine.account.type, "real");
-    assert.throws(() => engine.updateSettings({ scanAuto: true }), (e) => e instanceof UserError && e.code === "scanner_demo_only" && e.status === 403 && /demo only/.test(e.message));
-    assert.equal(engine.settings.scanAuto, false);
-    assert.equal(logged(engine, /^Scanner auto-trade was not turned on: it is demo only/).length, 1);
-    // Saved on before (e.g. set while on demo, then the account changed): Start is refused.
-    engine.settings.scanAuto = true;
+    assert.throws(() => engine.updateSettings({ mode: "auto" }), (e) => e instanceof UserError && e.code === "scanner_demo_only" && e.status === 403 && /demo only/.test(e.message));
+    assert.equal(engine.settings.mode, "signals");
+    assert.equal(logged(engine, /^Auto trade was not turned on: it is demo only/).length, 1);
+    // Saved before (e.g. set while on demo, then the account changed): Start is refused.
+    engine.settings.mode = "auto";
     assert.equal(engine.status().scanAutoBlocked, true);
     assert.equal(engine.status().scanAuto.blocked, true);
-    assert.throws(() => engine.start(), (e) => e.code === "scanner_demo_only");
+    assert.throws(() => engine.start(), (e) => e.code === "scanner_demo_only" && /never trades on a real money account/.test(e.message));
     assert.equal(engine.running, false);
-    assert.equal(logged(engine, /^Did not start: scanner auto-trade is demo only/).length, 1);
+    assert.equal(logged(engine, /^Did not start: auto trade is demo only/).length, 1);
     // Running anyway (resumed after a restart): every setup is refused, with one log line.
     engine.running = true;
     engine.autoScan([setup1()]);
@@ -156,10 +155,12 @@ test("demo only: not turned on, not started, and no order on a real account; the
     await flush();
     assert.equal(sentOf(sock, "proposal").length, 0, "no order on the real account");
     assert.equal(logged(engine, /^Scanner auto-trade placed no trade: it is demo only/).length, 1);
-    // Turning it off still works on the real account.
+    // Signals only still works on the real account.
     engine.running = false;
-    engine.updateSettings({ scanAuto: false });
-    assert.equal(engine.settings.scanAuto, false);
+    engine.updateSettings({ mode: "signals" });
+    engine.start();
+    assert.equal(engine.running, true);
+    assert.equal(engine.status().scanAutoBlocked, false);
   } finally { ctx.cleanup(); }
 });
 
@@ -174,9 +175,9 @@ test("a ready setup is traded on its own market with the bot's sizing, tagged as
     engine.start();
     engine.autoScan([setup1()]);
     await flush();
-    assert.deepEqual(sentOf(sock, "contracts_for").map((r) => r.contracts_for), ["R_75", "R_100"], "the setup's market's Multipliers");
+    assert.deepEqual(sentOf(sock, "contracts_for").map((r) => r.contracts_for), ["R_100"], "the setup's market's Multipliers");
     const [p] = sentOf(sock, "proposal");
-    assert.equal(p.underlying_symbol, "R_100", "not the bot's market (R_75)");
+    assert.equal(p.underlying_symbol, "R_100", "not the clock's market (R_75)");
     assert.equal(p.contract_type, "MULTUP");
     assert.equal(p.multiplier, 50, "the lowest offered on R_100");
     // 1% of 10,000 at a stop 10 away from 1001 with x50: stake 200.2, risk 100, target 200
@@ -186,14 +187,12 @@ test("a ready setup is traded on its own market with the bot's sizing, tagged as
     const st = engine.status();
     assert.equal(st.open.length, 1);
     assert.deepEqual({ ...st.open[0], plan: undefined, opened: undefined },
-      { id: "9000", side: "BUY", symbol: "R_100", stake: 200.2, profit: 0, opened: undefined, horizon: 0, barSec: 900, closing: false, plan: undefined,
+      { id: "9000", side: "BUY", symbol: "R_100", name: "Volatility 100 Index", stake: 200.2, profit: 0, opened: undefined, horizon: 0, barSec: 900, closing: false, plan: undefined,
         source: "scanner", scan: { strategy: "ict", tf: 900, name: "Volatility 100 Index" } });
     assert.equal(st.tradesToday, 1, "the risk guard counts it");
-    assert.deepEqual({ ...st.scanAuto }, { on: true, demoOnly: true, blocked: false, today: 1, maxDay: 4, open: 1, maxOpen: 2,
-                                           strategies: ["ict", "rules"], timeframes: [900, 3600], waiting: "" });
+    assert.deepEqual({ ...st.scanAuto }, { on: true, demoOnly: true, blocked: false, today: 1, maxDay: 4, open: 1, maxOpen: 2, waiting: "" });
     assert.equal(engine.scanTraded(setup1().id), true);
     assert.equal(logged(engine, /^Opened BUY R_100 from the scanner \(ICT 15m Volatility 100 Index\)/).length, 1);
-    assert.equal(st.blockReason, "", "the bot's own open-trade limit doesn't count scanner trades");
 
     // the same setup again: never twice
     engine.autoScan([setup1()]);
@@ -205,18 +204,16 @@ test("a ready setup is traded on its own market with the bot's sizing, tagged as
   } finally { ctx.cleanup(); }
 });
 
-test("caps: open at once, per day, strategies and timeframes picked, the risk guard; best ranked first; skips logged once", async () => {
+test("caps: open at once, per day, the risk guard; best ranked first; skips logged once", async () => {
   const ctx = await setup({ settings: { scanAutoMaxDay: 3 } });
   const { engine, sock } = ctx;
   try {
     engine.start();
     const rules = setup1({ symbol: "frxEURUSD", name: "EUR/USD", strategy: "rules" });
-    const ai = setup1({ symbol: "R_10", strategy: "ai" }), hour = setup1({ symbol: "R_25", tf: 60 });
-    engine.autoScan([ai, hour, rules, setup1()]);
+    engine.autoScan([rules, setup1()]);
     await flush();
-    assert.deepEqual(sentOf(sock, "proposal").map((p) => p.underlying_symbol), ["frxEURUSD"], "AI and other timeframes are not picked: the next best");
-    assert.equal(logged(engine, /not taken/).length, 0, "not picked: quiet");
-    engine.autoScan([ai, hour, rules, setup1()]);
+    assert.deepEqual(sentOf(sock, "proposal").map((p) => p.underlying_symbol), ["frxEURUSD"], "the best first, one at a time");
+    engine.autoScan([rules, setup1()]);
     await flush();
     assert.deepEqual(sentOf(sock, "proposal").map((p) => p.underlying_symbol), ["frxEURUSD", "R_100"]);
     // two open: the third waits, and says why once
@@ -224,8 +221,8 @@ test("caps: open at once, per day, strategies and timeframes picked, the risk gu
     engine.autoScan([third]); engine.autoScan([third]);
     await flush();
     assert.equal(sentOf(sock, "proposal").length, 2);
-    assert.equal(logged(engine, /^Scanner setup not taken: BUY ICT 15m Volatility 50 Index.*2 scanner trades open already/).length, 1);
-    assert.match(engine.status().scanAuto.waiting, /2 scanner trades open/);
+    assert.equal(logged(engine, /^Scanner setup not taken: BUY ICT 15m Volatility 50 Index.*2 trades open already/).length, 1);
+    assert.match(engine.status().scanAuto.waiting, /2 trades open/);
     // one closes: the third is taken (3 of 3 today), then the day is full
     sock.push((r) => r.contract_id === 9000, { msg_type: "proposal_open_contract", proposal_open_contract: { contract_id: 9000, contract_type: "MULTUP", buy_price: 200, profit: 5, is_sold: 1, status: "won" } });
     engine.autoScan([third]);
@@ -236,7 +233,7 @@ test("caps: open at once, per day, strategies and timeframes picked, the risk gu
     engine.autoScan([setup1({ symbol: "R_25" })]);
     await flush();
     assert.equal(sentOf(sock, "proposal").length, 3);
-    assert.equal(logged(engine, /3 scanner trades today already/).length, 1);
+    assert.equal(logged(engine, /max trades for today reached/i).length, 1);
     // a new UTC day: the count starts again, but the risk guard's daily loss halt stops everything
     ctx.t.now += 24 * 3600e3;
     engine.guard.state.halted = true; engine.guard.state.haltReason = "daily loss limit hit (-3.10%)";
@@ -278,7 +275,7 @@ test("freshness and price: stale setups are skipped (logged once), and so is a q
   } finally { ctx.cleanup(); }
 });
 
-test("signals only mode and a stopped bot take nothing; the bot's own market and mode don't matter otherwise", async () => {
+test("Signals only and a stopped bot take nothing; an old saved market changes nothing", async () => {
   const ctx = await setup({ settings: { mode: "signals", symbol: "frxEURUSD" } });
   const { engine, sock } = ctx;
   try {
@@ -286,7 +283,7 @@ test("signals only mode and a stopped bot take nothing; the bot's own market and
     engine.autoScan([setup1()]);
     await flush();
     assert.equal(sentOf(sock, "proposal").length, 0);
-    assert.match(engine.status().scanAuto.waiting, /Signals only/);
+    assert.equal(engine.status().scanAuto.on, false, "Signals only");
     engine.stop();
     engine.updateSettings({ mode: "auto" });
     engine.start();

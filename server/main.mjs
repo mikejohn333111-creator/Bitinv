@@ -284,7 +284,7 @@ async function startServer() {
     } },
     "GET /api/status": { fn: () => ({ ...engine.status(), version: version.commit ? version : null }) },
     "GET /api/candles": { fn: async ({ req, res, url }) => {
-      // Another market than the bot's (a scanner setup): only one Deriv lists (or the built-in ones).
+      // A market Deriv lists (or a built-in one): a scanner setup or an open trade.
       const symbol = url.searchParams.get("symbol");
       if (symbol !== null && (!/^\w{2,30}$/.test(symbol) || !engine.knownSymbols().includes(symbol)))
         throw new UserError("Unknown market.", 400, "bad_symbol");
@@ -307,7 +307,7 @@ async function startServer() {
     "POST /api/start": { fn: () => { engine.start(); return engine.status(); } },
     "POST /api/stop": { fn: () => { engine.stop(); return engine.status(); } },
     "POST /api/settings": { fn: ({ body }) => {
-      const { settings, errors } = cleanSettings(body, engine.settings, engine.knownSymbols());
+      const { settings, errors } = cleanSettings(body, engine.settings);
       if (errors.length) throw new UserError(errors.join(" "), 400, "bad_settings");
       engine.updateSettings(settings);
       return { settings: engine.settings, status: engine.status() };

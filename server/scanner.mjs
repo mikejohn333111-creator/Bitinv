@@ -1,6 +1,7 @@
-// The scanner: the bot's own strategies run over many markets at once, for the control page's
-// "Scanner" list. It only reads market data. With "Auto-trade scanner setups" on (demo only),
-// the engine may take its "Ready now" setups (TradingEngine.autoScan does every check and the order).
+// The scanner: the bot's strategies (ICT, Rules, AI model: the ones picked under "What the
+// scanner looks for") run over many markets at once, for the control page's "Scanner" list. It
+// only reads market data. In Auto trade (demo only) the engine takes its "Ready now" setups
+// (TradingEngine.autoScan does every check and the order).
 //
 // Every 15-minute and 1-hour candle close (plus "Scan now", with a cooldown) it asks Deriv for
 // each market's candles with a one-off ticks_history on the engine's connection (no
@@ -24,7 +25,10 @@ export const SCAN_TIMEFRAMES = [900, 3600];
 export const MAX_MARKETS = 20;
 /** Candles asked for: enough for every strategy and for the 4-hour trend on 15-minute candles (16 x 55). */
 export const SCAN_BARS = { 900: 1000, 3600: 500 };
-export const SCANNER_DEFAULTS = Object.freeze({ on: true, synthetics: false, timeframes: Object.freeze([...SCAN_TIMEFRAMES]) });
+export const SCAN_STRATEGIES = ["ict", "rules", "ai"];
+/** ICT and Rules by default; the AI model (trained on 1-minute candles, untested on 15m and 1h) only when picked. */
+export const SCANNER_DEFAULTS = Object.freeze({ on: true, synthetics: false, timeframes: Object.freeze([...SCAN_TIMEFRAMES]),
+                                                strategies: Object.freeze(["ict", "rules"]) });
 const GAP_MS = 2000;                 // one Deriv request at most this often (30 a minute)
 const COOLDOWN_MS = 2 * 60000;       // between two "Scan now"
 const CLOSE_DELAY_S = 30;            // after a candle closes, wait this long so Deriv has it
@@ -37,7 +41,7 @@ const PRIORITY = [["forex", "major_pairs"], ["commodities", "metals"], ["indices
                   ["commodities", ""], ["cryptocurrency", ""], ["stocks", ""], ["synthetic_index", ""]];
 
 // ---------------------------------------------------------------- settings
-/** Checks a partial scanner settings update ({on, synthetics, timeframes}). Returns {settings, errors}. */
+/** Checks a partial scanner settings update ({on, synthetics, timeframes, strategies}). Returns {settings, errors}. */
 export function cleanScannerSettings(input, current = SCANNER_DEFAULTS) {
   const out = {}, errors = [];
   if (!input || typeof input !== "object" || Array.isArray(input)) return { settings: { ...current }, errors: ["Settings must be an object."] };
@@ -51,14 +55,19 @@ export function cleanScannerSettings(input, current = SCANNER_DEFAULTS) {
     if (!t || !t.length || t.some((v) => !SCAN_TIMEFRAMES.includes(v))) errors.push("Pick 15m, 1h or both.");
     else out.timeframes = SCAN_TIMEFRAMES.filter((v) => t.includes(v));
   }
+  if (input.strategies !== undefined) {
+    const t = Array.isArray(input.strategies) ? [...new Set(input.strategies)] : null;
+    if (!t || !t.length || t.some((v) => !SCAN_STRATEGIES.includes(v))) errors.push("Pick at least one strategy: ICT, Rules or AI model.");
+    else out.strategies = SCAN_STRATEGIES.filter((v) => t.includes(v));
+  }
   return { settings: { ...current, ...out }, errors };
 }
 
 /** Saved settings: anything odd falls back to the default. */
 export function loadScannerSettings(raw) {
-  const s = { ...SCANNER_DEFAULTS, timeframes: [...SCANNER_DEFAULTS.timeframes] };
+  const s = { ...SCANNER_DEFAULTS, timeframes: [...SCANNER_DEFAULTS.timeframes], strategies: [...SCANNER_DEFAULTS.strategies] };
   if (!raw || typeof raw !== "object") return s;
-  for (const k of ["on", "synthetics", "timeframes"]) {
+  for (const k of ["on", "synthetics", "timeframes", "strategies"]) {
     const { settings, errors } = cleanScannerSettings({ [k]: raw[k] }, s);
     if (!errors.length) Object.assign(s, settings);
   }
@@ -222,6 +231,7 @@ export class Scanner {
   constructor(engine, { store = null, now = Date.now, gapMs = GAP_MS, cooldownMs = COOLDOWN_MS, closeDelay = CLOSE_DELAY_S } = {}) {
     Object.assign(this, { engine, store, now, gapMs, cooldownMs, closeDelay });
     this.settings = loadScannerSettings(store?.getScanner?.());
+    if (engine.legacy) this.#migrate(engine.legacy);
     this.series = new Map();      // "symbol:tf" -> {at, items, trend, error}
     this.queue = [];              // [{symbol, tf, tries}]
     this.batch = { total: 0, done: 0 };
@@ -230,6 +240,22 @@ export class Scanner {
     this.inflight = false; this.lastSentAt = 0; this.pausedUntil = 0; this.backoff = 0;
     this.cooldownUntil = 0; this.lastScanAt = 0;
     this.timer = null; this.stopped = false;
+  }
+
+  /**
+   * The first start after the update to scanner-only: the scanner is the whole bot now, so it is
+   * turned on; with scanner auto-trade on before, its strategies and timeframes become the scanner's
+   * (they decided what was traded), so nothing new is traded after the update.
+   */
+  #migrate(legacy) {
+    const s = this.settings;
+    s.on = true;
+    if (legacy.scanAuto) {
+      if (legacy.strategies?.length) s.strategies = [...legacy.strategies];
+      const tfs = s.timeframes.filter((tf) => legacy.timeframes?.includes(tf));
+      if (tfs.length) s.timeframes = tfs;
+    }
+    try { this.store?.saveScanner?.(s); } catch { /* saved with the next change */ }
   }
 
   start() {
@@ -327,8 +353,9 @@ export class Scanner {
   #store(job, candles) {
     const e = this.engine;
     const synthetic = isSynthetic(e.markets, job.symbol);
+    const ai = this.settings.strategies.includes("ai");
     const r = scanSeries({ symbol: job.symbol, name: marketName(e.markets, job.symbol), tf: job.tf, candles, synthetic,
-                           model: e.model, aiSettings: e.settings, nowMs: this.now() });
+                           model: ai ? e.model : null, aiSettings: ai ? e.settings : null, nowMs: this.now() });
     for (const it of r.items) {
       if (it.status !== "waiting") continue;
       if (!this.firstSeen.has(it.id)) this.firstSeen.set(it.id, it.at);
@@ -340,7 +367,7 @@ export class Scanner {
 
   /** "Scan now": every market on every chosen timeframe, at most once per cooldown. */
   scanNow() {
-    if (!this.settings.on) throw new UserError("The scanner is off. Turn it on under Settings first.", 409, "scanner_off");
+    if (!this.settings.on) throw new UserError("The scanner is off.", 409, "scanner_off");
     const wait = this.cooldownUntil - this.now();
     if (wait > 0) throw new UserError(`The scanner just ran. You can scan again in ${Math.ceil(wait / 60000)} min.`, 429, "scanner_cooldown");
     if (!this.online()) throw new UserError("The bot isn't connected to Deriv right now. The scanner carries on once it is.", 409, "not_connected");
@@ -354,7 +381,7 @@ export class Scanner {
   /** Applies already cleaned settings, saves them, and scans what is new. */
   updateSettings(next) {
     const prev = this.settings;
-    this.settings = { on: !!next.on, synthetics: !!next.synthetics, timeframes: [...next.timeframes] };
+    this.settings = { on: !!next.on, synthetics: !!next.synthetics, timeframes: [...next.timeframes], strategies: [...(next.strategies || prev.strategies)] };
     try { this.store?.saveScanner?.(this.settings); } catch { /* disk full: the setting still applies until a restart */ }
     if (!this.settings.on) { this.queue = []; this.batch = { total: 0, done: 0 }; this.done.clear(); return this.view(); }
     // Turned on, more markets, or another timeframe: scan at the next step (not counted as "Scan now").
@@ -363,6 +390,8 @@ export class Scanner {
       const added = this.settings.timeframes.filter((tf) => !prev.timeframes.includes(tf));
       if (this.settings.synthetics && !prev.synthetics) for (const tf of this.settings.timeframes) this.done.delete(tf);
       for (const tf of added) this.done.delete(tf);
+      // A strategy picked again: its setups come with the next scan of every timeframe.
+      if (this.settings.strategies.some((x) => !prev.strategies.includes(x))) this.done.clear();
       this.queue = this.queue.filter((j) => this.settings.timeframes.includes(j.tf));
     }
     return this.view();
@@ -386,7 +415,7 @@ export class Scanner {
       if (!symbols.has(symbol) || !s.timeframes.includes(tf)) continue;
       if (v.error) failed++;
       trends.set(key, v.trend);
-      for (const it of v.items) if (it.validUntil > now) items.push(it);
+      for (const it of v.items) if (it.validUntil > now && s.strategies.includes(it.strategy)) items.push(it);
     }
     return { items: rankItems(items, trends), failed };
   }
@@ -399,12 +428,12 @@ export class Scanner {
     const scanning = s.on && (this.inflight || this.queue.length > 0);
     const next = s.on ? Math.min(...s.timeframes.map((tf) => ((this.done.get(tf) || closedBoundary(now, tf, this.closeDelay)) + tf + this.closeDelay) * 1000)) : null;
     let message = "";
-    if (!s.on) message = "The scanner is off. Turn it on under Settings.";
+    if (!s.on) message = "The scanner is off.";
     else if (!this.online()) message = "Not connected to Deriv right now. The scanner carries on once the bot is connected.";
     else if (!watch.length) message = this.#emptyText();
     else if (now < this.pausedUntil) message = `Deriv asked to slow down, so the scanner waits until ${new Date(this.pausedUntil).toISOString().slice(11, 16)} UTC.`;
     return {
-      settings: { ...s, timeframes: [...s.timeframes] }, now, scanning,
+      settings: { ...s, timeframes: [...s.timeframes], strategies: [...s.strategies] }, now, scanning,
       progress: { done: Math.min(this.batch.done, this.batch.total), total: this.batch.total },
       lastScanAt: this.lastScanAt || null, nextScanAt: next, cooldownUntil: this.cooldownUntil > now ? this.cooldownUntil : null,
       pausedUntil: this.pausedUntil > now ? this.pausedUntil : null,

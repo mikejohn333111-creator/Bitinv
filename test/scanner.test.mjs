@@ -47,16 +47,19 @@ const answer = (e, rows = [FLAT, FLAT]) => e.answers.shift().resolve({ msg_type:
 const memStore = () => { const s = { saved: null, getScanner: () => s.saved || {}, saveScanner: (v) => { s.saved = JSON.parse(JSON.stringify(v)); } }; return s; };
 
 // ---------------------------------------------------------------- settings
-test("settings: on by default, real markets only, 15m and 1h; bad input is refused, odd saved values fall back", () => {
-  assert.deepEqual({ ...SCANNER_DEFAULTS, timeframes: [...SCANNER_DEFAULTS.timeframes] }, { on: true, synthetics: false, timeframes: [900, 3600] });
-  assert.deepEqual(cleanScannerSettings({ synthetics: true, timeframes: ["3600"] }), { settings: { on: true, synthetics: true, timeframes: [3600] }, errors: [] });
+const ALL = { strategies: ["ict", "rules"] };
+test("settings: on by default, real markets only, 15m and 1h, ICT and Rules; bad input is refused, odd saved values fall back", () => {
+  assert.deepEqual({ ...SCANNER_DEFAULTS, timeframes: [...SCANNER_DEFAULTS.timeframes], strategies: [...SCANNER_DEFAULTS.strategies] },
+                   { on: true, synthetics: false, timeframes: [900, 3600], ...ALL });
+  assert.deepEqual(cleanScannerSettings({ synthetics: true, timeframes: ["3600"] }), { settings: { on: true, synthetics: true, timeframes: [3600], ...ALL }, errors: [] });
+  assert.deepEqual(cleanScannerSettings({ strategies: ["ai", "ict", "ai"] }).settings.strategies, ["ict", "ai"], "in order, no repeats");
   assert.deepEqual(cleanScannerSettings({ timeframes: [3600, 900, 900] }).settings.timeframes, [900, 3600], "sorted, no repeats");
-  for (const bad of [{ on: "yes" }, { synthetics: 1 }, { timeframes: [] }, { timeframes: [60] }, { timeframes: "900" }])
+  for (const bad of [{ on: "yes" }, { synthetics: 1 }, { timeframes: [] }, { timeframes: [60] }, { timeframes: "900" }, { strategies: [] }, { strategies: ["magic"] }, { strategies: "ict" }])
     assert.equal(cleanScannerSettings(bad).errors.length, 1, JSON.stringify(bad));
   assert.equal(cleanScannerSettings(null).errors.length, 1);
   assert.deepEqual(cleanScannerSettings({ other: 1 }).settings, cleanScannerSettings({}).settings, "unknown keys are ignored");
-  assert.deepEqual(loadScannerSettings({ on: false, synthetics: "x", timeframes: [60] }), { on: false, synthetics: false, timeframes: [900, 3600] });
-  assert.deepEqual(loadScannerSettings(null), { on: true, synthetics: false, timeframes: [900, 3600] });
+  assert.deepEqual(loadScannerSettings({ on: false, synthetics: "x", timeframes: [60], strategies: ["x"] }), { on: false, synthetics: false, timeframes: [900, 3600], ...ALL });
+  assert.deepEqual(loadScannerSettings(null), { on: true, synthetics: false, timeframes: [900, 3600], ...ALL });
 });
 
 // ----------------------------------------------------------------- markets
@@ -187,12 +190,12 @@ test("Scanner: Scan now queues everything, then waits out its cooldown; settings
 
   sc.updateSettings({ on: false, synthetics: false, timeframes: [900, 3600] });
   assert.equal(sc.queue.length, 0, "off: the queue is dropped");
-  assert.deepEqual(store.saved, { on: false, synthetics: false, timeframes: [900, 3600] });
+  assert.deepEqual(store.saved, { on: false, synthetics: false, timeframes: [900, 3600], ...ALL });
   assert.throws(() => sc.scanNow(), (err) => err.status === 409 && err.code === "scanner_off");
   sc.updateSettings({ on: true, synthetics: true, timeframes: [3600] });
   sc.step();
   assert.equal(sc.queue.length + e.sent.length, 6, "on again: 6 markets with the synthetics, 1h only");
-  assert.deepEqual(new Scanner(e, { store }).settings, { on: true, synthetics: true, timeframes: [3600] }, "loaded after a restart");
+  assert.deepEqual(new Scanner(e, { store }).settings, { on: true, synthetics: true, timeframes: [3600], ...ALL }, "loaded after a restart");
   e.connection = "offline";
   t.now += 200000;
   assert.throws(() => sc.scanNow(), (err) => err.code === "not_connected");
@@ -280,7 +283,7 @@ test("view: only markets and timeframes still watched, no expired setups, at mos
   const sc = new Scanner(e, { now: () => t.now });
   const item = (o) => ({ symbol: "frxEURUSD", name: "EUR/USD", tf: 900, strategy: "rules", side: "BUY", status: "ready", entry: 1, sl: 0.9, tp: 1.2, rr: 2,
                          at: t.now, validUntil: t.now + 1000, reason: "", start: 0, end: null, ...o });
-  sc.series.set("frxEURUSD:900", { items: [item({ id: "a" }), item({ id: "gone", validUntil: t.now - 1 })], trend: "up", error: "" });
+  sc.series.set("frxEURUSD:900", { items: [item({ id: "a" }), item({ id: "gone", validUntil: t.now - 1 }), item({ id: "ai", strategy: "ai", side: "SELL" })], trend: "up", error: "" });
   sc.series.set("R_75:900", { items: [item({ id: "synthetic", symbol: "R_75" })], trend: null, error: "" });
   sc.series.set("frxEURUSD:3600", { items: [item({ id: "hourly", tf: 3600 })], trend: null, error: "" });
   sc.settings.timeframes = [900];
@@ -288,6 +291,10 @@ test("view: only markets and timeframes still watched, no expired setups, at mos
   assert.deepEqual(v.items.map((i) => i.id), ["a"]);
   assert.equal(v.items[0].validUntil, undefined, "internal fields stay on the server");
   assert.deepEqual(v.items[0].agree, ["4h trend is up"]);
+  assert.deepEqual(v.items[0].against, [], "a strategy not picked neither shows nor counts against");
+  sc.settings.strategies = ["rules", "ai"];
+  assert.deepEqual(sc.view().items.map((i) => [i.id, i.against]), [["a", ["AI model 15m"]], ["ai", ["4h trend is up", "Rules 15m"]]]);
+  sc.settings.strategies = ["ict", "rules"];
   assert.equal(v.markets, 4);
   assert.equal(typeof v.now, "number");
   sc.series.set("frxEURUSD:900", { items: Array.from({ length: 60 }, (_, k) => item({ id: `x${k}` })), trend: null, error: "" });

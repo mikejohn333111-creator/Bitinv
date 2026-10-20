@@ -45,3 +45,26 @@ test("guard: daily loss halt, trade count, cooldown, new day reset", () => {
   g2.update(969, t0 + 86400000);                          // next UTC day
   assert.equal(g2.blockReason(0, t0 + 86400000), "");
 });
+
+test("guard: daily profit target stops new trades until the next day; off when 0 or missing", () => {
+  const mem = new Map();
+  const storage = { getItem: (k) => mem.get(k) ?? null, setItem: (k, v) => mem.set(k, v) };
+  const t0 = Date.UTC(2026, 9, 2, 10);
+  const g = new RiskGuard(storage, "DEMO1", { maxDailyLossPct: 1, dailyProfitPct: 1 });
+  g.update(1000, t0);
+  assert.equal(g.update(1009.9, t0).justHalted, false);
+  assert.deepEqual(g.update(1010, t0), { justHalted: true, profit: true });
+  assert.match(g.blockReason(0, t0), /daily profit target reached \(\+1\.00%\)/);
+  assert.equal(g.update(1030, t0).justHalted, false, "reported once");
+  g.update(1010, t0 + 86400000);
+  assert.equal(g.blockReason(0, t0 + 86400000), "", "next UTC day");
+  for (const limits of [{ maxDailyLossPct: 3, dailyProfitPct: 0 }, { maxDailyLossPct: 3 }]) {
+    const h = new RiskGuard(null, "X", limits);
+    h.update(1000, t0);
+    assert.equal(h.update(1500, t0).justHalted, false);
+  }
+  const l = new RiskGuard(null, "Y", { maxDailyLossPct: 1, dailyProfitPct: 1 });
+  l.update(1000, t0);
+  assert.deepEqual(l.update(990, t0), { justHalted: true });
+  assert.match(l.blockReason(0, t0), /daily loss limit/);
+});

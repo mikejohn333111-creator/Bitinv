@@ -39,7 +39,7 @@ export const DEFAULT_SETTINGS = {
   v: SETTINGS_VERSION,
   // "auto": the scanner's ready setups are traded (demo only). "signals": the scanner only shows them.
   mode: "auto",
-  riskPct: 1, maxDailyLossPct: 3, maxConsecLosses: 3, cooldownMinutes: 15,
+  riskPct: 1, maxDailyLossPct: 3, dailyProfitPct: 1, maxConsecLosses: 3, cooldownMinutes: 15,
   scanAutoMaxDay: 4, scanAutoMaxOpen: 2,      // trades per day and open at once
   // The scanner's AI model reads these (not on the page).
   aiThreshold: 0.55, aiBarrier: AI_DEFAULTS.barrierATR, aiHorizon: AI_DEFAULTS.horizonBars,
@@ -75,6 +75,7 @@ const NUMBERS = {
   aiThreshold:     { min: 0.34, max: 0.95, label: "AI confidence" },
   aiBarrier:       { min: 0.5, max: 10, label: "AI stop distance" },
   aiHorizon:       { min: 5, max: 240, int: true, label: "AI time limit" },
+  dailyProfitPct:  { min: 0, max: 20, label: "Daily profit target" },
   scanAutoMaxDay:  { min: 1, max: 10, int: true, label: "Trades per day" },
   scanAutoMaxOpen: { min: 1, max: 5, int: true, label: "Trades open at once" },
 };
@@ -336,7 +337,7 @@ export class TradingEngine {
   /** The risk guard's limits. Trades per day and open at once are the scanner's (one setting each). */
   limits() {
     const s = this.settings;
-    return { maxDailyLossPct: +s.maxDailyLossPct, maxOpen: +s.scanAutoMaxOpen, maxTradesPerDay: +s.scanAutoMaxDay,
+    return { maxDailyLossPct: +s.maxDailyLossPct, dailyProfitPct: +s.dailyProfitPct || 0, maxOpen: +s.scanAutoMaxOpen, maxTradesPerDay: +s.scanAutoMaxDay,
              maxConsecLosses: +s.maxConsecLosses, cooldownMinutes: +s.cooldownMinutes };
   }
 
@@ -780,9 +781,9 @@ export class TradingEngine {
     if (!this.guard || this.busy || this.syncing || !Number.isFinite(this.equity())) return;
     if (this.settling && this.now() - this.settling < SETTLE_MS) return;
     this.settling = 0;
-    const { justHalted } = this.guard.update(this.equity(), this.now());
+    const { justHalted, profit } = this.guard.update(this.equity(), this.now());
     if (justHalted) {
-      this.log("ERROR", `Stopped for today: ${this.guard.state.haltReason}`, "Open trades are being closed. The bot starts again tomorrow (UTC).");
+      this.log(profit ? "INFO" : "ERROR", `Stopped for today: ${this.guard.state.haltReason}`, "Open trades are being closed. The bot starts again tomorrow (UTC).");
       this.haltExits();
     }
   }
@@ -793,7 +794,7 @@ export class TradingEngine {
     if (!g?.state.halted || this.syncing || g.state.day !== new Date(this.now()).toISOString().slice(0, 10)) return;
     for (const [id, c] of this.contracts) if (!c.closing && !c.stale) {
       c.closing = true;
-      this.closeContract(id, "daily loss limit").then((ok) => { if (!ok) c.closing = false; });   // retried next bar
+      this.closeContract(id, "daily limit").then((ok) => { if (!ok) c.closing = false; });   // retried next bar
     }
   }
 

@@ -75,7 +75,8 @@ function stubDeriv(state = {}) {
 function setup({ settings = {}, rawSettings, state, secret = true, over = {}, deriv = {} } = {}) {
   const dir = mkdtempSync(join(tmpdir(), "tbot-engine-"));
   const store = new FileStore(dir);
-  store.saveSettings(rawSettings || { v: SETTINGS_VERSION, mode: "auto", ...settings });
+  // The fake balance doesn't drop by the stake, so the 1% profit target is off unless a test sets it.
+  store.saveSettings(rawSettings || { v: SETTINGS_VERSION, mode: "auto", dailyProfitPct: 0, ...settings });
   if (state) store.saveState(state);
   if (secret) store.saveSecret({ appId: "app42", token: PAT });
   return makeEngine(dir, { over, deriv });
@@ -584,6 +585,31 @@ test("a win reported before the new balance does not trip the daily loss limit",
     assert.equal(st.halted, false);
     assert.ok(Math.abs(st.dayPL - 0.4) < 1e-9);
     assert.equal(logged(engine, /^Stopped for today/).length, 0);
+  } finally { ctx.cleanup(); }
+});
+
+test("the daily profit target (default 1%) stops the bot for the day and closes open trades", async () => {
+  assert.equal(DEFAULT_SETTINGS.dailyProfitPct, 1);
+  const ctx = await ready(setup({ settings: { dailyProfitPct: 1 } }));
+  const { engine, sock } = ctx;
+  try {
+    engine.start();
+    await take(engine);
+    const p = sentOf(sock, "proposal")[0];
+    sock.push(isBal, { balance: { balance: 10000 - p.amount, currency: "USD" } });
+    sock.push(isPoc, { proposal_open_contract: { contract_id: 9000, contract_type: "MULTDOWN", buy_price: p.amount, profit: 50, is_sold: 0 } });
+    clock(sock, NOW_S); clock(sock, NOW_S + 60);
+    await flush();
+    assert.equal(engine.status().halted, false, "+0.5%: keeps going");
+    sock.push(isPoc, { proposal_open_contract: { contract_id: 9000, contract_type: "MULTDOWN", buy_price: p.amount, profit: 120, is_sold: 0 } });
+    clock(sock, NOW_S + 120); clock(sock, NOW_S + 180);
+    await flush();
+    const st = engine.status();
+    assert.equal(st.halted, true);
+    assert.match(st.haltReason, /daily profit target reached/);
+    const [e] = logged(engine, /^Stopped for today: daily profit target reached/);
+    assert.equal(e.tag, "INFO");
+    assert.equal(sentOf(sock, "sell").length, 1, "the open trade is closed to keep the profit");
   } finally { ctx.cleanup(); }
 });
 

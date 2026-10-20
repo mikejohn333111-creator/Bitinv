@@ -413,7 +413,7 @@ test("the scanner: needs a login, checks its settings, scans Deriv's markets, Sc
     // By default: the real markets only (the mock's open forex pairs and Bitcoin; gold is closed).
     let v = await until(async () => { const r = await c.get("/api/scanner"); return r.data.lastScanAt && !r.data.scanning && r; }, 20000);
     assert.equal(v.headers.get("cache-control"), "no-store");
-    assert.deepEqual(v.data.settings, { on: true, synthetics: false, timeframes: [900, 3600], strategies: ["ict", "rules"] });
+    assert.deepEqual(v.data.settings, { on: true, synthetics: false, timeframes: [900, 3600], strategies: ["ict", "smc"] });
     assert.equal(v.data.markets, 3);
     assert.ok(v.data.items.every((i) => !/^R_/.test(i.symbol)));
 
@@ -444,9 +444,10 @@ test("the scanner: needs a login, checks its settings, scans Deriv's markets, Sc
     for (const bad of ["NOPE", "R_50;x", "", "a".repeat(40)]) assert.equal((await c.get(`/api/candles?tf=900&symbol=${encodeURIComponent(bad)}`)).data.error, "bad_symbol", bad);
 
     assert.equal((await c.post("/api/scanner/settings", { strategies: [] })).data.error, "bad_settings");
-    const picked = await c.post("/api/scanner/settings", { strategies: ["rules"] });
-    assert.deepEqual(picked.data.settings.strategies, ["rules"]);
-    assert.ok(picked.data.items.every((i) => i.strategy === "rules"), "only the strategies picked show");
+    assert.equal((await c.post("/api/scanner/settings", { strategies: ["rules"] })).status, 400, "Rules was removed");
+    const picked = await c.post("/api/scanner/settings", { strategies: ["smc"] });
+    assert.deepEqual(picked.data.settings.strategies, ["smc"]);
+    assert.ok(picked.data.items.every((i) => i.strategy === "smc"), "only the strategies picked show");
     assert.equal((await c.post("/api/scanner/settings", { on: false })).data.message, "The scanner is off.");
     assert.equal((await c.post("/api/scanner/scan", {})).data.error, "scanner_off");
   } finally { await srv.stop(); mock.stop(); }

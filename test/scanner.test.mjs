@@ -4,7 +4,8 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { Scanner, scanSeries, rankItems, pickMarkets, closedBoundary, cleanScannerSettings, loadScannerSettings, isRateLimit,
-         SCANNER_DEFAULTS, SCAN_BARS, MAX_MARKETS } from "../server/scanner.mjs";
+         SCANNER_DEFAULTS, SCAN_BARS, MAX_MARKETS, SCAN_STRATEGIES, smcParamsFor } from "../server/scanner.mjs";
+import { renameRules } from "../server/engine.mjs";
 import { evaluateICT, ictMinBars, ictParamsFor } from "../public/js/strategy.js";
 
 const flush = async (n = 4) => { for (let i = 0; i < n; i++) await new Promise((r) => setImmediate(r)); };
@@ -31,7 +32,7 @@ const nowAfter = (rows, tf = 900) => (T0 + rows.length * tf) * 1000 - 1000;   //
 function fakeEngine({ markets = MARKETS, connection = "online" } = {}) {
   const e = {
     markets, marketsAt: 1, connection, busy: false, trading: false, syncing: false, model: null,
-    settings: { strategy: "rules", aiThreshold: 0.55, aiBarrier: 3, aiHorizon: 60 },
+    settings: { aiThreshold: 0.55, aiBarrier: 3, aiHorizon: 60 },
     sent: [], answers: [], logged: [],
     logOnce(tag, title) { e.logged.push(title); },
     socket: {
@@ -47,8 +48,8 @@ const answer = (e, rows = [FLAT, FLAT]) => e.answers.shift().resolve({ msg_type:
 const memStore = () => { const s = { saved: null, getScanner: () => s.saved || {}, saveScanner: (v) => { s.saved = JSON.parse(JSON.stringify(v)); } }; return s; };
 
 // ---------------------------------------------------------------- settings
-const ALL = { strategies: ["ict", "rules"] };
-test("settings: on by default, real markets only, 15m and 1h, ICT and Rules; bad input is refused, odd saved values fall back", () => {
+const ALL = { strategies: ["ict", "smc"] };
+test("settings: on by default, real markets only, 15m and 1h, ICT and SMC; bad input is refused, odd saved values fall back", () => {
   assert.deepEqual({ ...SCANNER_DEFAULTS, timeframes: [...SCANNER_DEFAULTS.timeframes], strategies: [...SCANNER_DEFAULTS.strategies] },
                    { on: true, synthetics: false, timeframes: [900, 3600], ...ALL });
   assert.deepEqual(cleanScannerSettings({ synthetics: true, timeframes: ["3600"] }), { settings: { on: true, synthetics: true, timeframes: [3600], ...ALL }, errors: [] });
@@ -60,6 +61,27 @@ test("settings: on by default, real markets only, 15m and 1h, ICT and Rules; bad
   assert.deepEqual(cleanScannerSettings({ other: 1 }).settings, cleanScannerSettings({}).settings, "unknown keys are ignored");
   assert.deepEqual(loadScannerSettings({ on: false, synthetics: "x", timeframes: [60], strategies: ["x"] }), { on: false, synthetics: false, timeframes: [900, 3600], ...ALL });
   assert.deepEqual(loadScannerSettings(null), { on: true, synthetics: false, timeframes: [900, 3600], ...ALL });
+});
+
+test("settings: Rules was removed; a saved list that had it gets SMC in its place, and the default when nothing is left", () => {
+  assert.deepEqual(SCAN_STRATEGIES, ["ict", "smc", "ai"]);
+  assert.equal(cleanScannerSettings({ strategies: ["rules"] }).errors.length, 1, "Rules can't be picked any more");
+  assert.match(cleanScannerSettings({ strategies: ["rules"] }).errors[0], /ICT, SMC or AI model/);
+  assert.deepEqual(loadScannerSettings({ strategies: ["rules"] }).strategies, ["smc"]);
+  assert.deepEqual(loadScannerSettings({ strategies: ["ict", "rules"] }).strategies, ["ict", "smc"]);
+  assert.deepEqual(loadScannerSettings({ strategies: ["rules", "ai"] }).strategies, ["smc", "ai"]);
+  assert.deepEqual(loadScannerSettings({ strategies: ["rules", "smc", "ict"] }).strategies, ["ict", "smc"], "no repeats");
+  assert.deepEqual(loadScannerSettings({ strategies: ["ai"] }).strategies, ["ai"], "a list without Rules is kept");
+  assert.deepEqual(loadScannerSettings({ strategies: [] }).strategies, ["ict", "smc"], "empty: the default");
+  assert.deepEqual(loadScannerSettings({ strategies: ["magic"] }).strategies, ["ict", "smc"], "nothing known left: the default");
+  assert.deepEqual(renameRules(["rules", "ai"]), ["smc", "ai"]);
+  assert.equal(renameRules(undefined), undefined);
+  // the Scanner saves the moved-over list at once
+  const store = memStore();
+  store.saved = { on: true, synthetics: false, timeframes: [3600], strategies: ["rules"] };
+  const sc = new Scanner(fakeEngine(), { store });
+  assert.deepEqual(sc.settings.strategies, ["smc"]);
+  assert.deepEqual(store.saved, { on: true, synthetics: false, timeframes: [3600], strategies: ["smc"] });
 });
 
 // ----------------------------------------------------------------- markets
@@ -255,6 +277,55 @@ test("scanSeries: real markets use ICT's real-market filters (kill zones on 15m)
   assert.equal(real.items.some((i) => i.strategy === "ict"), inKill, `last candle at ${outside}h UTC`);
 });
 
+const OB_TOUCH = [101.8, 101.9, 98.2, 99.2];   // trades back down into the order block (96.5 to 98.4)
+test("scanSeries: SMC, ICT's setup entered at the order block: a plan waiting for price, then ready once price is in the block", () => {
+  const rows = ictRows([HOLD, HOLD]);
+  const nowMs = nowAfter(rows);
+  const { items } = scanSeries({ symbol: "R_50", tf: 900, candles: candles(rows), synthetic: true, nowMs });
+  const ict = items.find((i) => i.strategy === "ict"), smc = items.find((i) => i.strategy === "smc");
+  assert.ok(ict && smc, JSON.stringify(items));
+  assert.equal(smc.status, "waiting");
+  assert.equal(smc.side, "BUY");
+  assert.deepEqual(smc.zone, [96.5, 98.4], "the last down candle before the move up");
+  assert.equal(smc.entry, 98.4, "price reaches the top of the block first");
+  assert.ok(smc.sl < 96.5 && smc.tp > 98.4);
+  assert.equal(smc.rr, 3, "3R target");
+  assert.match(smc.reason, /Waiting for price to come back to the bullish order block/);
+  assert.notEqual(smc.id, ict.id, "the same candles, but a different plan id");
+  assert.match(smc.id, /^R_50:900:smc:BUY:/);
+  // price has gone below the block: the plan is gone
+  const broken = [...rows.slice(0, -1), [101.8, 101.8, 96, 96]];
+  assert.equal(scanSeries({ symbol: "R_50", tf: 900, candles: candles(broken), synthetic: true, nowMs }).items.filter((i) => i.strategy === "smc").length, 0);
+  // inside the block now
+  const inside = [...rows.slice(0, -1), [101.8, 101.8, 97.5, 97.5]];
+  assert.equal(scanSeries({ symbol: "R_50", tf: 900, candles: candles(inside), synthetic: true, nowMs }).items.find((i) => i.strategy === "smc").inZone, true);
+
+  // a closed candle dipped into the block: ready now, at that candle's close, with 3R and the 60-candle time limit
+  const touch = ictRows([OB_TOUCH, HOLD]);
+  const ready = scanSeries({ symbol: "R_50", tf: 900, candles: candles(touch), synthetic: true, nowMs: nowAfter(touch) }).items;
+  const s2 = ready.find((i) => i.strategy === "smc"), i2 = ready.find((i) => i.strategy === "ict");
+  assert.ok(s2 && i2, JSON.stringify(ready));
+  assert.equal(s2.status, "ready");
+  assert.equal(s2.entry, 99.2);
+  const closed = touch.slice(0, -1).map(([o, h, l, c], k) => ({ epoch: T0 + k * 900, open: o, high: h, low: l, close: c }));
+  const res = evaluateICT(closed, smcParamsFor(900, { real: false }));
+  assert.equal(res.action, "BUY");
+  assert.ok(Math.abs(s2.sl - (99.2 - res.slDist)) < 1e-6 && Math.abs(s2.tp - (99.2 + res.tpDist)) < 1e-6);
+  assert.equal(s2.rr, 3);
+  assert.equal(s2.end, closed.at(-1).epoch + 61 * 900, "the 60-candle time limit");
+  assert.match(s2.reason, /entering the bullish order block/);
+  assert.notEqual(s2.id, i2.id, "ICT and SMC on the same candle are two setups");
+});
+
+test("smcParamsFor: ICT's settings for the timeframe and market, with the order block entry, 3R and 60 candles", () => {
+  for (const tf of [900, 3600]) for (const real of [false, true]) {
+    const p = smcParamsFor(tf, { real });
+    assert.deepEqual(p, { ...ictParamsFor(tf, { real }), entryZone: "ob", rMultiple: 3, horizonBars: 60, mssClose: false, fvgAfterBars: 0 });
+  }
+  assert.equal(smcParamsFor(3600, { real: true }).htfBias, "ema", "the 4h trend filter on 1h real markets, as ICT");
+  assert.equal(smcParamsFor(900, { real: true }).killZone, true, "kill zones on 15m real markets, as ICT");
+});
+
 // ------------------------------------------------------------------ ranking
 test("rankItems: ready first, then the freshest, then the most agreement; agreement is plain words, not a probability", () => {
   const it = (o) => ({ symbol: "A", name: o.symbol || "A", tf: 900, strategy: "ict", side: "BUY", status: "ready", at: 600000, ...o });
@@ -263,14 +334,14 @@ test("rankItems: ready first, then the freshest, then the most agreement; agreem
     it({ id: "old", symbol: "B", name: "B", at: 60000 }),
     it({ id: "lone", symbol: "C", name: "C" }),
     it({ id: "agreed", symbol: "D", name: "D", tf: 3600 }),
-    it({ id: "rules", symbol: "D", name: "D", strategy: "rules" }),
+    it({ id: "smc", symbol: "D", name: "D", strategy: "smc" }),
     it({ id: "against", symbol: "D", name: "D", strategy: "ai", side: "SELL", at: 600000 }),
   ];
   const trends = new Map([["D:3600", "up"], ["C:900", "down"]]);
   const out = rankItems(items, trends);
-  assert.deepEqual(out.map((i) => i.id), ["agreed", "rules", "lone", "against", "old", "wait"]);
+  assert.deepEqual(out.map((i) => i.id), ["agreed", "smc", "lone", "against", "old", "wait"]);
   const agreed = out.find((i) => i.id === "agreed");
-  assert.deepEqual(agreed.agree, ["4h trend is up", "Rules 15m"]);
+  assert.deepEqual(agreed.agree, ["4h trend is up", "SMC 15m"]);
   assert.deepEqual(agreed.against, ["AI model 15m"]);
   assert.equal(agreed.score, 1);
   assert.deepEqual(out.find((i) => i.id === "lone").against, ["4h trend is down"]);
@@ -281,7 +352,7 @@ test("view: only markets and timeframes still watched, no expired setups, at mos
   const t = { now: 1767229240000 };
   const e = fakeEngine();
   const sc = new Scanner(e, { now: () => t.now });
-  const item = (o) => ({ symbol: "frxEURUSD", name: "EUR/USD", tf: 900, strategy: "rules", side: "BUY", status: "ready", entry: 1, sl: 0.9, tp: 1.2, rr: 2,
+  const item = (o) => ({ symbol: "frxEURUSD", name: "EUR/USD", tf: 900, strategy: "smc", side: "BUY", status: "ready", entry: 1, sl: 0.9, tp: 1.2, rr: 2,
                          at: t.now, validUntil: t.now + 1000, reason: "", start: 0, end: null, ...o });
   sc.series.set("frxEURUSD:900", { items: [item({ id: "a" }), item({ id: "gone", validUntil: t.now - 1 }), item({ id: "ai", strategy: "ai", side: "SELL" })], trend: "up", error: "" });
   sc.series.set("R_75:900", { items: [item({ id: "synthetic", symbol: "R_75" })], trend: null, error: "" });
@@ -292,9 +363,9 @@ test("view: only markets and timeframes still watched, no expired setups, at mos
   assert.equal(v.items[0].validUntil, undefined, "internal fields stay on the server");
   assert.deepEqual(v.items[0].agree, ["4h trend is up"]);
   assert.deepEqual(v.items[0].against, [], "a strategy not picked neither shows nor counts against");
-  sc.settings.strategies = ["rules", "ai"];
-  assert.deepEqual(sc.view().items.map((i) => [i.id, i.against]), [["a", ["AI model 15m"]], ["ai", ["4h trend is up", "Rules 15m"]]]);
-  sc.settings.strategies = ["ict", "rules"];
+  sc.settings.strategies = ["smc", "ai"];
+  assert.deepEqual(sc.view().items.map((i) => [i.id, i.against]), [["a", ["AI model 15m"]], ["ai", ["4h trend is up", "SMC 15m"]]]);
+  sc.settings.strategies = ["ict", "smc"];
   assert.equal(v.markets, 4);
   assert.equal(typeof v.now, "number");
   sc.series.set("frxEURUSD:900", { items: Array.from({ length: 60 }, (_, k) => item({ id: `x${k}` })), trend: null, error: "" });

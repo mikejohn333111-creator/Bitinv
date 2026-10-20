@@ -115,7 +115,7 @@ async function ready(ctx) {
 const CLOSED = Math.floor(NOW_S / 900) * 900 - 900;   // the newest closed 15m candle opened at 9:45
 /** A "Ready now" scanner setup: SELL R_100 at 1000, stop 1010, target 980. */
 const setupItem = (o = {}) => {
-  const it = { symbol: "R_100", name: "Volatility 100 Index", tf: 900, strategy: "rules", side: "SELL", status: "ready", at: NOW - 60000,
+  const it = { symbol: "R_100", name: "Volatility 100 Index", tf: 900, strategy: "smc", side: "SELL", status: "ready", at: NOW - 60000,
                entry: 1000, sl: 1010, tp: 980, slDist: 10, tpDist: 20, price: 1000, horizonBars: 0, rr: 2, reason: "Pulled back", start: CLOSED, ...o };
   return { ...it, id: o.id || `${it.symbol}:${it.tf}:${it.strategy}:${it.side}:${it.start}` };
 };
@@ -536,7 +536,7 @@ test("update from the single-market bot with scanner auto-trade on: Auto trade, 
   try {
     assert.equal(ctx.engine.settings.mode, "auto");
     const scanner = new Scanner(ctx.engine, { store: ctx.store });
-    assert.deepEqual(scanner.settings, { on: true, synthetics: true, timeframes: [900], strategies: ["rules"] });
+    assert.deepEqual(scanner.settings, { on: true, synthetics: true, timeframes: [900], strategies: ["smc"] });
     assert.deepEqual(ctx.store.getScanner(), scanner.settings, "saved");
   } finally { ctx.cleanup(); }
 });

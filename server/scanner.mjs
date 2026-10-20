@@ -1,4 +1,4 @@
-// The scanner: the bot's strategies (ICT, Rules, AI model: the ones picked under "What the
+// The scanner: the bot's strategies (ICT, SMC, AI model: the ones picked under "What the
 // scanner looks for") run over many markets at once, for the control page's "Scanner" list. It
 // only reads market data. In Auto trade (demo only) the engine takes its "Ready now" setups
 // (TradingEngine.autoScan does every check and the order).
@@ -10,31 +10,31 @@
 // when Deriv says to slow down. Each answer is checked with the strategies exactly as the bot
 // would on that timeframe:
 //   ICT    evaluateICT(bars, ictParamsFor(tf, {real}))  -> a setup ready now, or one waiting for price
-//   Rules  evaluateRules(bars, rulesParamsFor(tf))       -> a setup ready now
+//   SMC    evaluateICT(bars, smcParamsFor(tf, {real}))  -> the same, entering at the order block
 //   AI     evaluateAI(bars, model, aiParams(settings))   -> a setup ready now (if the model is loaded)
 // The stop loss and take profit are the prices the bot would use (handleSignal, the pending plan).
 // The list is sorted by status (ready first), then freshness, then a plain agreement count
 // (the 4-hour trend, and the other strategies on the same market). No win rates or confidence
 // numbers: the backtests found no proven edge after fees, and the page says so.
-import { evaluateRules, evaluateAI, evaluateICT, aiParams, rulesParamsFor, ictParamsFor, ictHtfBias, ICT_DEFAULTS } from "../public/js/strategy.js";
+import { evaluateAI, evaluateICT, aiParams, ictParamsFor, ictHtfBias, ICT_DEFAULTS } from "../public/js/strategy.js";
 import { makePending, pendingCheck, firstTouch } from "../public/js/pending.js";
 import { FALLBACK_MARKETS, isSynthetic, marketName } from "../public/js/markets.js";
-import { UserError } from "./engine.mjs";
+import { UserError, renameRules } from "./engine.mjs";
 
 export const SCAN_TIMEFRAMES = [900, 3600];
 export const MAX_MARKETS = 20;
 /** Candles asked for: enough for every strategy and for the 4-hour trend on 15-minute candles (16 x 55). */
 export const SCAN_BARS = { 900: 1000, 3600: 500 };
-export const SCAN_STRATEGIES = ["ict", "rules", "ai"];
-/** ICT and Rules by default; the AI model (trained on 1-minute candles, untested on 15m and 1h) only when picked. */
+export const SCAN_STRATEGIES = ["ict", "smc", "ai"];
+/** ICT and SMC by default; the AI model (trained on 1-minute candles, untested on 15m and 1h) only when picked. */
 export const SCANNER_DEFAULTS = Object.freeze({ on: true, synthetics: false, timeframes: Object.freeze([...SCAN_TIMEFRAMES]),
-                                                strategies: Object.freeze(["ict", "rules"]) });
+                                                strategies: Object.freeze(["ict", "smc"]) });
 const GAP_MS = 2000;                 // one Deriv request at most this often (30 a minute)
 const COOLDOWN_MS = 2 * 60000;       // between two "Scan now"
 const CLOSE_DELAY_S = 30;            // after a candle closes, wait this long so Deriv has it
 const BACKOFF_MS = [60000, 120000, 300000, 600000, 900000];   // when Deriv says to slow down
 const MAX_ITEMS = 40;
-const STRATEGY_NAMES = { ict: "ICT", rules: "Rules", ai: "AI model" };
+const STRATEGY_NAMES = { ict: "ICT", smc: "SMC", ai: "AI model" };
 const TF_NAMES = { 900: "15m", 3600: "1h" };
 // Which markets come first when there are more than MAX_MARKETS.
 const PRIORITY = [["forex", "major_pairs"], ["commodities", "metals"], ["indices", ""], ["forex", "minor_pairs"], ["forex", ""],
@@ -57,16 +57,20 @@ export function cleanScannerSettings(input, current = SCANNER_DEFAULTS) {
   }
   if (input.strategies !== undefined) {
     const t = Array.isArray(input.strategies) ? [...new Set(input.strategies)] : null;
-    if (!t || !t.length || t.some((v) => !SCAN_STRATEGIES.includes(v))) errors.push("Pick at least one strategy: ICT, Rules or AI model.");
+    if (!t || !t.length || t.some((v) => !SCAN_STRATEGIES.includes(v))) errors.push("Pick at least one strategy: ICT, SMC or AI model.");
     else out.strategies = SCAN_STRATEGIES.filter((v) => t.includes(v));
   }
   return { settings: { ...current, ...out }, errors };
 }
 
-/** Saved settings: anything odd falls back to the default. */
+/**
+ * Saved settings: anything odd falls back to the default. The Rules strategy was removed: a
+ * saved list that had it gets SMC in its place (renameRules), and an empty list the default.
+ */
 export function loadScannerSettings(raw) {
   const s = { ...SCANNER_DEFAULTS, timeframes: [...SCANNER_DEFAULTS.timeframes], strategies: [...SCANNER_DEFAULTS.strategies] };
   if (!raw || typeof raw !== "object") return s;
+  if (Array.isArray(raw.strategies)) raw = { ...raw, strategies: renameRules(raw.strategies, SCAN_STRATEGIES) };
   for (const k of ["on", "synthetics", "timeframes", "strategies"]) {
     const { settings, errors } = cleanScannerSettings({ [k]: raw[k] }, s);
     if (!errors.length) Object.assign(s, settings);
@@ -112,23 +116,38 @@ export function trend4h(bars, tf) {
   return ictHtfBias(bars, { ...ICT_DEFAULTS, htfBias: "ema", htfMinutes: 240, htfEMA: 50, htfSlopeBars: 3, barMinutes: Math.round(tf / 60) });
 }
 
-const RULES_WORDS = {
-  "trend pullback": "In a strong trend, price pulled back to its average and turned with the trend again",
-  "range reversion": "In a quiet market, price went outside its usual range and came back inside",
-};
+/**
+ * SMC: ICT's sweep and break of structure, entering at the order block (the last candle against
+ * the move) instead of the fair value gap, with a 3R target and a 60-candle time exit (the
+ * 1-hour pick in docs/strategy-results.md, "SMC (order block entries)", 16 October 2026).
+ */
+export function smcParamsFor(tf, { real = false } = {}) {
+  // mssClose and fvgAfterBars off on purpose: ICT's 1-hour settings may turn them on, SMC stays as backtested.
+  return { ...ictParamsFor(tf, { real }), entryZone: "ob", rMultiple: 3, horizonBars: 60, mssClose: false, fvgAfterBars: 0 };
+}
+
+/**
+ * A waiting plan as makePending takes it. SMC's stop level is the order block's own far edge,
+ * which makePending refuses (it wants the line that cancels the plan outside the zone). Past that
+ * edge price is past the zone anyway (cancelled either way), so the line moves halfway to the stop.
+ */
+export function plannable(p) {
+  if (!p || !Array.isArray(p.zone) || ![p.sl, p.invalidateAt, ...p.zone].every(fin)) return p;
+  const lo = Math.min(...p.zone), hi = Math.max(...p.zone);
+  if (p.side === "BUY" && p.invalidateAt >= lo && p.sl < lo) return { ...p, invalidateAt: (lo + p.sl) / 2 };
+  if (p.side === "SELL" && p.invalidateAt <= hi && p.sl > hi) return { ...p, invalidateAt: (hi + p.sl) / 2 };
+  return p;
+}
+
 function plainReason(strategy, res, side) {
   if (strategy === "ai") return `The AI model leans ${side === "BUY" ? "up" : "down"} on the last candle. It was trained on 1-minute candles and is untested on 15m and 1h.`;
-  if (strategy === "rules") {
-    const key = Object.keys(RULES_WORDS).find((k) => String(res.reason).startsWith(k));
-    return key ? `${RULES_WORDS[key]}.` : String(res.reason || "");
-  }
   return String(res.reason || "");
 }
 
 /**
  * One market and timeframe: Deriv's candles (the last one still forming) through the
  * strategies. Returns {items, trend, last} where items are setups ready now (on the last
- * closed candle) and ICT plans waiting for price (still valid at the latest price).
+ * closed candle) and ICT and SMC plans waiting for price (still valid at the latest price).
  * @param {object} o  {symbol, name, tf, candles, synthetic, model, aiSettings, nowMs}
  */
 export function scanSeries({ symbol, name = symbol, tf, candles, synthetic = false, model = null, aiSettings = null, nowMs = Date.now() }) {
@@ -144,7 +163,7 @@ export function scanSeries({ symbol, name = symbol, tf, candles, synthetic = fal
   const base = { symbol, name, tf, at: closedAt };
   const results = [
     ["ict", evaluateICT(bars, ictParamsFor(tf, { real: !synthetic }))],
-    ["rules", evaluateRules(bars, rulesParamsFor(tf))],
+    ["smc", evaluateICT(bars, smcParamsFor(tf, { real: !synthetic }))],
     ...(model && aiSettings ? [["ai", evaluateAI(bars, model, aiParams(aiSettings))]] : []),
   ];
   for (const [strategy, res] of results) {
@@ -159,9 +178,9 @@ export function scanSeries({ symbol, name = symbol, tf, candles, synthetic = fal
         rr: round(res.tpDist / res.slDist), reason: plainReason(strategy, res, res.action),
         start: last.epoch, end: res.horizonBars ? last.epoch + (res.horizonBars + 1) * tf : null, validUntil: closedAt + tf * 1000 });
     }
-    if (strategy === "ict" && res.pending) {
+    if ((strategy === "ict" || strategy === "smc") && res.pending) {
       // As the bot's waiting plan: the same checks, and not shown once price has cancelled it.
-      const plan = makePending(res.pending, { strategy, symbol, barSec: tf, horizonBars: res.pending.horizonBars || 0 });
+      const plan = makePending(plannable(res.pending), { strategy, symbol, barSec: tf, horizonBars: res.pending.horizonBars || 0 });
       if (!plan) continue;
       const check = pendingCheck(plan, forming?.close ?? last.close, Math.max(nowMs / 1000, (forming?.epoch ?? last.epoch)));
       if (check.kind === "cancel") continue;
@@ -230,8 +249,13 @@ export class Scanner {
    */
   constructor(engine, { store = null, now = Date.now, gapMs = GAP_MS, cooldownMs = COOLDOWN_MS, closeDelay = CLOSE_DELAY_S } = {}) {
     Object.assign(this, { engine, store, now, gapMs, cooldownMs, closeDelay });
-    this.settings = loadScannerSettings(store?.getScanner?.());
+    const saved = store?.getScanner?.();
+    this.settings = loadScannerSettings(saved);
     if (engine.legacy) this.#migrate(engine.legacy);
+    else if (Array.isArray(saved?.strategies) && saved.strategies.includes("rules")) {
+      // Rules was removed: the list with SMC in its place is saved now.
+      try { this.store?.saveScanner?.(this.settings); } catch { /* saved with the next change */ }
+    }
     this.series = new Map();      // "symbol:tf" -> {at, items, trend, error}
     this.queue = [];              // [{symbol, tf, tries}]
     this.batch = { total: 0, done: 0 };

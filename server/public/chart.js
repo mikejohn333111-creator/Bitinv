@@ -13,7 +13,7 @@ import { TradePlanLayer, drawable } from "./lib/plan.js";
 
 const $ = (id) => document.getElementById(id);
 const TIMEFRAMES = [[60, "1m"], [300, "5m"], [900, "15m"], [3600, "1h"], [14400, "4h"], [86400, "1D"]];
-const STRATEGY = { ict: "ICT", rules: "Rules", ai: "AI model" };
+const STRATEGY = { ict: "ICT", smc: "SMC", ai: "AI model" };
 const PLAN_KEY = "tbot:server:plan";
 const MIN_GAP_MS = 2000;           // render() also runs after button presses: ask for candles at most this often
 const NOTHING = "The chart shows your first open trade, or the scanner's top setup. There is none right now.";

@@ -193,10 +193,10 @@
               <fieldset class="seg seg-3" id="scanStratSeg">
                 <legend class="sr-only">Strategies the scanner uses</legend>
                 <label><input type="checkbox" name="strategy" value="ict"><span>ICT</span></label>
-                <label><input type="checkbox" name="strategy" value="rules"><span>Rules</span></label>
+                <label><input type="checkbox" name="strategy" value="smc"><span>SMC</span></label>
                 <label><input type="checkbox" name="strategy" value="ai"><span>AI</span></label>
               </fieldset>
-              <p class="hint">ICT and Rules read price action. The AI model was trained on 1-minute candles and is untested on 15m and 1h.</p>
+              <p class="hint">ICT and SMC read price action: SMC enters at the order block, ICT at the fair value gap. The AI model was trained on 1-minute candles and is untested on 15m and 1h.</p>
             </details>
             <p class="msg" id="scanSetMsg" role="status" hidden></p>
           </form>

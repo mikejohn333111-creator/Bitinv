@@ -122,10 +122,10 @@ test("the scanner's ready setups carry what an order needs: id, side, entry, sto
   assert.equal(staleReason(it, nowMs), "", "0.8 of a 4.65 stop away from the entry: fresh");
 });
 
-test("settings: Auto trade by default, 4 a day, 2 open; the scanner looks for ICT and Rules on 15m and 1h; bad values refused, numbers clamped", () => {
+test("settings: Auto trade by default, 4 a day, 2 open; the scanner looks for ICT and SMC on 15m and 1h; bad values refused, numbers clamped", () => {
   assert.equal(DEFAULT_SETTINGS.mode, "auto");
   assert.deepEqual([DEFAULT_SETTINGS.scanAutoMaxDay, DEFAULT_SETTINGS.scanAutoMaxOpen], [4, 2]);
-  assert.deepEqual([SCANNER_DEFAULTS.strategies, SCANNER_DEFAULTS.timeframes], [["ict", "rules"], [900, 3600]]);
+  assert.deepEqual([SCANNER_DEFAULTS.strategies, SCANNER_DEFAULTS.timeframes], [["ict", "smc"], [900, 3600]]);
   assert.deepEqual(cleanSettings({ mode: "signals", scanAutoMaxDay: 99, scanAutoMaxOpen: 0, scanAuto: true }),
                    { settings: { mode: "signals", scanAutoMaxDay: 10, scanAutoMaxOpen: 1 }, errors: [] }, "the old on/off switch is ignored: the mode says it");
   for (const bad of [{ mode: "on" }, { mode: true }, { scanAutoMaxDay: "x" }, { scanAutoMaxOpen: null }])
@@ -209,11 +209,11 @@ test("caps: open at once, per day, the risk guard; best ranked first; skips logg
   const { engine, sock } = ctx;
   try {
     engine.start();
-    const rules = setup1({ symbol: "frxEURUSD", name: "EUR/USD", strategy: "rules" });
-    engine.autoScan([rules, setup1()]);
+    const smc = setup1({ symbol: "frxEURUSD", name: "EUR/USD", strategy: "smc" });
+    engine.autoScan([smc, setup1()]);
     await flush();
     assert.deepEqual(sentOf(sock, "proposal").map((p) => p.underlying_symbol), ["frxEURUSD"], "the best first, one at a time");
-    engine.autoScan([rules, setup1()]);
+    engine.autoScan([smc, setup1()]);
     await flush();
     assert.deepEqual(sentOf(sock, "proposal").map((p) => p.underlying_symbol), ["frxEURUSD", "R_100"]);
     // two open: the third waits, and says why once
@@ -315,6 +315,27 @@ test("after a restart: setups taken and today's count are kept, and the open sca
     again.engine.autoScan([setup1()]);
     await flush();
     assert.equal(sentOf(again.sock, "proposal").length, 0, "not taken twice after a restart");
+    again.engine.shutdown();
+  } finally { rmSync(ctx.dir, { recursive: true, force: true }); }
+});
+
+test("a trade the removed Rules strategy opened is still followed after the update, shown as Rules, and closed as usual", async () => {
+  const ctx = await setup();
+  try {
+    ctx.engine.start();
+    ctx.engine.autoScan([setup1({ strategy: "rules" })]);   // as the bot did before Rules was removed
+    await flush();
+    assert.equal(logged(ctx.engine, /^Opened BUY R_100 from the scanner \(Rules 15m Volatility 100 Index\)/).length, 1, "its old name, not a blank");
+    ctx.engine.shutdown();
+    const again = makeEngine(ctx.dir, { portfolio: [{ contract_id: 9000, contract_type: "MULTUP", underlying_symbol: "R_100" }] });
+    await again.engine.init();
+    await flush();
+    const st = again.engine.status();
+    assert.equal(st.open.length, 1);
+    assert.deepEqual(st.open[0].scan, { strategy: "rules", tf: 900, name: "Volatility 100 Index" });
+    await again.engine.closeAll("test");
+    await flush();
+    assert.deepEqual(sentOf(again.sock, "sell").map((r) => r.sell), [9000], "closed as any other trade");
     again.engine.shutdown();
   } finally { rmSync(ctx.dir, { recursive: true, force: true }); }
 });

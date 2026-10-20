@@ -184,7 +184,7 @@ try {
       await page.waitForFunction(() => /Checked/.test(document.getElementById("scanWhen").textContent), null, { timeout: 30000 });
       await page.click("#secScanner summary");
       assert.equal(await page.isChecked("#scanSynth"), false, "real markets only by default");
-      assert.deepEqual(await page.$$eval('#scanStratSeg input:checked', (els) => els.map((e) => e.value)), ["ict", "rules"]);
+      assert.deepEqual(await page.$$eval('#scanStratSeg input:checked', (els) => els.map((e) => e.value)), ["ict", "smc"]);
       await page.click('label[for="scanSynth"]');
       await page.waitForFunction(() => /Saved/.test(document.getElementById("scanSetMsg").textContent));
       assert.match(await page.textContent("#sumScanner"), /synthetics/);

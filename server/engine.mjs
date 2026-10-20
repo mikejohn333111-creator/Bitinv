@@ -1,7 +1,7 @@
 // Tbot server engine: the scanner's trader. It holds the Deriv connection, the account and the
 // risk limits, and (in Auto trade, demo only) takes the scanner's "Ready now" setups on their own
 // markets (autoScan). It has no single-market strategy of its own any more: the strategies
-// (ICT, Rules, AI model) run inside the scanner (server/scanner.mjs).
+// (ICT, SMC, AI model) run inside the scanner (server/scanner.mjs).
 //
 // Orders go out as on the website: proposal then buy with underlying_symbol and limit_order, open
 // trades tracked with proposal_open_contract, the daily loss limit checked on equity, time exits.
@@ -45,10 +45,21 @@ export const DEFAULT_SETTINGS = {
   aiThreshold: 0.55, aiBarrier: AI_DEFAULTS.barrierATR, aiHorizon: AI_DEFAULTS.horizonBars,
   allowReal: false,
 };
-export const SCAN_AUTO_STRATEGIES = ["ict", "rules", "ai"];
+export const SCAN_AUTO_STRATEGIES = ["ict", "smc", "ai"];
+/**
+ * A saved strategy list from before the Rules strategy was removed: "rules" becomes "smc" (once),
+ * anything unknown is dropped. `known` is the strategies there are now, in their order.
+ */
+export function renameRules(list, known = SCAN_AUTO_STRATEGIES) {
+  if (!Array.isArray(list)) return list;
+  const named = list.map((x) => (x === "rules" ? "smc" : x));
+  return known.filter((x) => named.includes(x));
+}
 export const SCAN_AUTO_TFS = [900, 3600];
 const SCAN_REAL_MSG = "Scanner auto-trade is demo only. It never trades on a real money account.";
-const SCAN_STRATEGY_NAMES = { ict: "ICT", rules: "Rules", ai: "AI model" };
+const SCAN_STRATEGY_NAMES = { ict: "ICT", smc: "SMC", ai: "AI model" };
+/** A strategy's name; one that was removed (an old trade's "rules") just gets a capital letter. */
+const scanStrategyName = (k) => SCAN_STRATEGY_NAMES[k] || (k ? `${String(k).charAt(0).toUpperCase()}${String(k).slice(1)}` : "");
 const SCAN_TF_NAMES = { 900: "15m", 3600: "1h" };
 const SCAN_TAKEN_KEEP = 300;          // setup ids remembered (each is taken at most once)
 const SYMBOL_INFO_MS = 60 * 60000;    // a market's Multiplier range and stake limits are asked again after this
@@ -129,7 +140,7 @@ export function loadSettings(raw) {
   const day = Number(raw.maxTradesPerDay);
   if (Number.isFinite(day) && day >= 1 && day < out.scanAutoMaxDay) out.scanAutoMaxDay = Math.round(day);
   const list = (v, ok) => (Array.isArray(v) ? ok.filter((x) => v.map((y) => (typeof x === "number" ? Number(y) : y)).includes(x)) : []);
-  return { settings: out, legacy: { scanAuto: autoOn, strategies: list(raw.scanAutoStrategies, SCAN_AUTO_STRATEGIES), timeframes: list(raw.scanAutoTfs, SCAN_AUTO_TFS),
+  return { settings: out, legacy: { scanAuto: autoOn, strategies: list(renameRules(raw.scanAutoStrategies), SCAN_AUTO_STRATEGIES), timeframes: list(raw.scanAutoTfs, SCAN_AUTO_TFS),
                                     symbol: typeof raw.symbol === "string" ? raw.symbol.slice(0, 30) : "", strategy: typeof raw.strategy === "string" ? raw.strategy.slice(0, 10) : "" } };
 }
 
@@ -232,7 +243,7 @@ export class TradingEngine {
 
   #loadModel() {
     try { this.model = JSON.parse(readFileSync(this.modelPath, "utf8")); }
-    catch { this.model = null; this.log("INFO", "The AI model could not be loaded, so the scanner uses ICT and Rules only."); }
+    catch { this.model = null; this.log("INFO", "The AI model could not be loaded, so the scanner uses ICT and SMC only."); }
   }
 
   auth() { return { kind: "pat", token: this.secret?.token || "" }; }
@@ -671,7 +682,7 @@ export class TradingEngine {
     return null;
   }
 
-  #scanName(it) { return `${SCAN_STRATEGY_NAMES[it.strategy] || it.strategy} ${SCAN_TF_NAMES[it.tf] || ""} ${it.name || it.symbol}`.replace(/\s+/g, " ").trim(); }
+  #scanName(it) { return `${scanStrategyName(it.strategy)} ${SCAN_TF_NAMES[it.tf] || ""} ${it.name || it.symbol}`.replace(/\s+/g, " ").trim(); }
 
   #scanSkip(it, why) {
     if (this.scanSkipped.has(it.id)) return;

@@ -306,7 +306,7 @@ function renderTrades(s) {
     if (t.source === "scanner") {
       // "from Scanner · ICT 15m EUR/USD"
       const sc = t.scan || {};
-      bits[0] = el("span", "from", `from Scanner · ${[STRATEGY_NAME[sc.strategy] || "", TF_SHORT[sc.tf] || "", sc.name || t.symbol].filter(Boolean).join(" ")}`);
+      bits[0] = el("span", "from", `from Scanner · ${[strategyName(sc.strategy), TF_SHORT[sc.tf] || "", sc.name || t.symbol].filter(Boolean).join(" ")}`);
       sub.replaceChildren(...bits.flatMap((b, k) => (k ? [" · ", b] : [b])));
     } else sub.textContent = bits.join(" · ");
     const p = li.querySelector(".profit");
@@ -318,7 +318,9 @@ function renderTrades(s) {
 }
 
 // ------------------------------------------------------------- scanner
-const STRATEGY_NAME = { ict: "ICT", rules: "Rules", ai: "AI model" };
+const STRATEGY_NAME = { ict: "ICT", smc: "SMC", ai: "AI model" };
+/** A strategy's name; one that was removed (an old trade's "rules") just gets a capital letter. */
+const strategyName = (k) => STRATEGY_NAME[k] || (k ? `${String(k).charAt(0).toUpperCase()}${String(k).slice(1)}` : "");
 const TF_SHORT = { 900: "15m", 3600: "1h" };
 
 /** The scanner's list, asked for every 15 seconds (every 3 while it is scanning) and after a change. */
@@ -369,12 +371,12 @@ function scanItem(it) {
               num("SL", px(it.sl), "sl"), num("TP", px(it.tp), "tp"));
   if (it.traded) line.append(el("span", "scan-traded", "Traded"));
   b.append(head, line);
-  b.setAttribute("aria-label", `${it.side} ${it.name}, ${STRATEGY_NAME[it.strategy]} on ${TF_SHORT[it.tf]}, ${it.status === "ready" ? "ready now" : "waiting for price"}${it.traded ? ", traded by auto trade" : ""}, ` +
+  b.setAttribute("aria-label", `${it.side} ${it.name}, ${strategyName(it.strategy)} on ${TF_SHORT[it.tf]}, ${it.status === "ready" ? "ready now" : "waiting for price"}${it.traded ? ", traded by auto trade" : ""}, ` +
                                `entry ${px(it.entry)}, stop loss ${px(it.sl)}, take profit ${px(it.tp)}. Show on the chart and the reason.`);
   li.append(b);
   if (open) {
     const more = el("div", "scan-more");
-    more.append(el("p", "scan-reason", `${STRATEGY_NAME[it.strategy] || it.strategy} · ${Number.isFinite(it.rr) ? `reward ${it.rr.toFixed(1)} : 1 risk` : ""}`.replace(/ · $/, "")),
+    more.append(el("p", "scan-reason", `${strategyName(it.strategy)} · ${Number.isFinite(it.rr) ? `reward ${it.rr.toFixed(1)} : 1 risk` : ""}`.replace(/ · $/, "")),
                 el("p", "scan-reason", it.reason));
     if (it.agree?.length) more.append(el("p", "scan-agree yes", `Agrees: ${it.agree.join(" · ")}`));
     if (it.against?.length) more.append(el("p", "scan-agree no", `Against: ${it.against.join(" · ")}`));
@@ -424,7 +426,7 @@ function renderScanner() {
   ai.disabled = !d.modelLoaded && !strategies.includes("ai");
   if (!ui.picked && ui.chart) ui.chart.then((c) => c && autoChart(c));
 }
-const STRATEGY_SHORT = { ict: "ICT", rules: "Rules", ai: "AI" };
+const STRATEGY_SHORT = { ict: "ICT", smc: "SMC", ai: "AI" };
 
 $("scanBtn").addEventListener("click", () => busy($("scanBtn"), async () => {
   const r = await api("POST", "/api/scanner/scan", {});

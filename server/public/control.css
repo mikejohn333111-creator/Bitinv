@@ -297,3 +297,54 @@ fieldset { border: 0; padding: 0; margin: 12px 0; min-width: 0; }
 .switch:disabled { opacity: .45; cursor: not-allowed; }
 .switch:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
 @media (prefers-reduced-motion: reduce) { .switch, .switch::before { transition: none; } }
+
+/* ------------------------------------------------------------ scanner */
+.scan-sub { margin: 0 0 8px; font-size: 14px; color: var(--muted); }
+.scan-progress { display: flex; align-items: center; gap: 10px; margin: 4px 0 8px; }
+.scan-meter { flex: 1; min-width: 0; height: 8px; border: 0; border-radius: 4px; overflow: hidden; background: var(--card-2);
+              appearance: none; -webkit-appearance: none; box-shadow: inset 0 0 0 1px var(--line); }
+.scan-meter::-webkit-progress-bar { background: var(--card-2); border-radius: 4px; }
+.scan-meter::-webkit-progress-value { background: var(--accent); border-radius: 4px; transition: width .3s; }
+.scan-meter::-moz-progress-bar { background: var(--accent); border-radius: 4px; }
+.scan-progress span { white-space: nowrap; }
+.scan-list { list-style: none; margin: 4px 0 0; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.scan-item {
+  display: flex; flex-direction: column; gap: 6px; width: 100%; padding: 12px 14px; text-align: left; cursor: pointer;
+  font: inherit; color: var(--text); background: var(--card-2); border: 1px solid var(--line); border-radius: 14px;
+  border-left: 4px solid var(--line); -webkit-tap-highlight-color: transparent; transition: border-color .15s, background-color .15s;
+}
+.scan-item.ready { border-left-color: var(--accent); }
+.scan-item.waiting { border-left-style: dashed; border-left-color: color-mix(in srgb, var(--muted) 70%, transparent); }
+.scan-item:hover { background: color-mix(in srgb, var(--card-2) 70%, var(--line)); }
+.scan-item[aria-pressed="true"] { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+.scan-head { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
+.scan-head .tag { min-width: 44px; }
+.scan-name { font-weight: 700; font-size: 16px; min-width: 0; overflow-wrap: anywhere; line-height: 1.25; }
+.scan-tf { font-size: 12px; font-weight: 700; color: var(--muted); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; flex: none; }
+.scan-age { margin-left: auto; font-size: 12px; color: var(--muted); white-space: nowrap; flex: none; }
+.scan-status { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; font-size: 13px; }
+.scan-pill { font-weight: 700; padding: 2px 8px; border-radius: 999px; }
+.scan-pill.ready { background: var(--accent-soft); color: var(--accent); }
+.scan-pill.waiting { background: var(--warn-soft); color: var(--warn); }
+.scan-strat { color: var(--muted); font-weight: 600; }
+.scan-nums { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px 12px; font-variant-numeric: tabular-nums; }
+.scan-num { display: flex; flex-direction: column; min-width: 0; }
+.scan-num.wide { grid-column: 1 / -1; }
+.scan-num .k { font-size: 11.5px; color: var(--muted); }
+.scan-num .v { font-weight: 650; font-size: 15px; overflow-wrap: anywhere; }
+.scan-num.sl .v { color: var(--down); }
+.scan-num.tp .v { color: var(--up); }
+@media (min-width: 420px) { .scan-nums { grid-template-columns: repeat(4, minmax(0, 1fr)); } .scan-num.wide { grid-column: span 2; } }
+.scan-reason { font-size: 13.5px; color: var(--muted); display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3; overflow: hidden; }
+.scan-item[aria-pressed="true"] .scan-reason { -webkit-line-clamp: unset; line-clamp: unset; }
+.scan-agree { display: flex; flex-direction: column; gap: 1px; font-size: 12.5px; font-weight: 600; }
+.scan-agree .yes { color: var(--accent); }
+.scan-agree .no { color: var(--muted); }
+#scanBtn { margin-top: 12px; }
+.scan-honesty { margin: 12px 0 0; font-size: 13px; }
+.scan-switch { padding: 10px 0; }
+.scan-switch + .scan-switch { border-top: 1px solid var(--line); }
+.chart-focus { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap; margin: 8px 0 0; padding: 8px 10px;
+               border-radius: 12px; background: var(--info-soft); color: var(--info); font-size: 14px; font-weight: 600; }
+.chart-focus p { margin: 0; display: flex; align-items: center; gap: 8px; min-width: 0; }
+#chartCard, #scanCard { scroll-margin-top: 72px; }

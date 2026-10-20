@@ -2,6 +2,7 @@
 //   settings.json  the user's settings            state.json   running flag, chosen account, open-trade notes
 //   secret.json    Deriv App ID + token (0600)    guard.json   daily risk-limit state (RiskGuard storage)
 //   log.jsonl      activity log, one JSON entry per line, trimmed to the last 2000 lines
+//   scanner.json   the scanner's settings (on, synthetic indices, timeframes)
 // Every JSON file is written atomically (temp file, fsync, rename) and with mode 0600.
 import { mkdirSync, readFileSync, openSync, writeSync, fsyncSync, closeSync, renameSync, chmodSync,
          appendFileSync, unlinkSync, statSync } from "node:fs";
@@ -64,6 +65,8 @@ export class FileStore {
   saveSettings(s) { this.writeJSON("settings.json", s); }
   getState() { const s = this.readJSON("state.json", {}); return s && typeof s === "object" ? s : {}; }
   saveState(s) { this.writeJSON("state.json", s); }
+  getScanner() { const s = this.readJSON("scanner.json", {}); return s && typeof s === "object" ? s : {}; }
+  saveScanner(s) { this.writeJSON("scanner.json", s); }
 
   /** {appId, token} or null. */
   getSecret() {

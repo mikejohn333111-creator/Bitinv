@@ -25,6 +25,9 @@
 //   MOCK_HISTORY=30000        1-minute candles of history at start (enough for 1-hour candles too)
 //   MOCK_CLOSED=frxXAUUSD     markets that start closed (comma separated; "" for none)
 //   MOCK_NO_ACTIVE_SYMBOLS=1  active_symbols fails, as if Deriv refused it (the bots keep their built-in list)
+//   MOCK_SCAN_SETUPS=1        fixed ICT buy setups on 15-minute and longer candles, for the scanner: R_50's candles end
+//                             with a setup waiting for price, R_100's with one that entered on the last closed candle
+//   MOCK_RATE_LIMIT=n         every n-th ticks_history is refused with Deriv's RateLimit error (the scanner backs off)
 //
 // active_symbols lists the synthetic indices, a few forex pairs, gold (closed by default), Bitcoin
 // and one stock index without Multipliers, with the field names of Deriv's Options API
@@ -116,6 +119,18 @@ function scriptNext() {
   if (script.hold) return { bar: ICT_HOLD };
   return null;
 }
+// The scanner's fixed setups (MOCK_SCAN_SETUPS=1): the newest candles of a market replaced with flat
+// candles, the ICT setup, then a candle that holds above the gap ("wait") or trades back into it ("ready").
+const SCAN_SETUPS = process.env.MOCK_SCAN_SETUPS ? { R_50: "wait", R_100: "ready" } : {};
+function scanSetup(list, kind) {
+  const tail = [...Array(70).fill(ICT_FLAT), ...ICT_SETUP, kind === "ready" ? ICT_TOUCH.bar : ICT_HOLD, ICT_HOLD];
+  if (list.length < tail.length + 10) return list;
+  const from = list.length - tail.length, base = list[from - 1].close, unit = base * 0.002;
+  const at = (v) => +(base + (v - 100) * unit).toFixed(2);
+  return [...list.slice(0, from), ...tail.map(([o, h, l, c], k) => ({ epoch: list[from + k].epoch, open: at(o), high: at(h), low: at(l), close: at(c) }))];
+}
+let historyAsked = 0;
+
 // Other timeframes are the same random walk grouped into longer candles (the last one still forming).
 // (candlesOf and formingOf are in the R_75 price level; scaleBar turns them into another market's.)
 const GRANULARITIES = [60, 120, 180, 300, 600, 900, 1800, 3600, 7200, 14400, 28800, 86400];
@@ -320,7 +335,10 @@ function handle(ws, req) {
     if (req.count > 5000) return err(ws, req, "InputValidationFailed", "count");
     let list = candlesOf(g);
     if (req.end && req.end !== "latest") list = list.filter((b) => b.epoch <= Number(req.end));
+    if (Number(process.env.MOCK_RATE_LIMIT) > 0 && ++historyAsked % Number(process.env.MOCK_RATE_LIMIT) === 0)
+      return err(ws, req, "RateLimit", "You have reached the rate limit for ticks_history.");
     list = list.slice(-(req.count || 1000)).map((b) => scaleBar(b, sym));
+    if (SCAN_SETUPS[sym] && g >= 900) list = scanSetup(list, SCAN_SETUPS[sym]);
     const subId = req.subscribe ? "sub" + randomBytes(4).toString("hex") : undefined;
     send(ws, { ...r, msg_type: "candles", candles: list, ...(subId && { subscription: { id: subId } }) });
     if (subId) ws.subs.set(subId, { kind: "ohlc", req_id: req.req_id, g, symbol: sym });

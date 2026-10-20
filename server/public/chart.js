@@ -5,13 +5,15 @@
 // The page never talks to Deriv: candles come from GET /api/candles (only the new ones after
 // the first load), and the plans from the status the page already polls. control.js loads this
 // module once the control page shows and calls update(status) after every poll, so the chart
-// pauses with the polling while the page is hidden.
+// pauses with the polling while the page is hidden. A setup tapped in the Scanner list is shown
+// with focus(item): its market and timeframe, and its plan, until "Back to the bot's market".
 import { createChart, CrosshairMode } from "./lib/lightweight-charts.mjs";
 import { TradePlanLayer, drawable } from "./lib/plan.js";
 
 const $ = (id) => document.getElementById(id);
 const TIMEFRAMES = [[60, "1m"], [300, "5m"], [900, "15m"], [3600, "1h"], [14400, "4h"], [86400, "1D"]];
 const TF_WORD = { 60: "1-minute", 300: "5-minute", 900: "15-minute", 3600: "1-hour", 14400: "4-hour", 86400: "1-day" };
+const STRATEGY = { ict: "ICT", rules: "Rules", ai: "AI model" };
 const TF_KEY = "tbot:server:chartTf", PLAN_KEY = "tbot:server:plan";
 const MIN_GAP_MS = 2000;           // render() also runs after button presses: ask for candles at most this often
 const SIGNAL_DIM_MS = 5 * 60000;   // a signal goes dim after 5 minutes, or once the bot is stopped (like the website)
@@ -46,8 +48,13 @@ export function mountChart() {
     tf: TIMEFRAMES.some(([g]) => g === store.get(TF_KEY, 60)) ? store.get(TF_KEY, 60) : 60,
     symbol: null, first: 0, last: 0,    // what the chart shows now
     status: null, loading: false, askedAt: 0, again: false, tradeIds: new Set(), markSig: "",
+    focus: null,                        // a scanner setup shown instead of the bot's market
   };
   const botTf = () => view.status?.botTf || 60;
+  /** The market the chart should show: the scanner setup's, or the bot's. */
+  const wanted = () => view.focus?.symbol || view.status?.symbol;
+  /** True when the bot's own plans and arrows belong on the chart. */
+  const ownMarket = () => !view.focus || view.focus.symbol === view.status?.symbol;
   const signed = (v) => `${v > 0 ? "+" : v < 0 ? "−" : ""}${num(Math.abs(v))} ${view.status?.currency || ""}`.trim();
 
   const chart = createChart($("chart"), {
@@ -90,12 +97,13 @@ export function mountChart() {
   async function load() {
     if (view.loading) { view.again = true; return; }
     view.loading = true; view.askedAt = Date.now();
-    const tf = view.tf, after = view.symbol === view.status?.symbol ? view.last : 0;
+    const tf = view.tf, symbol = wanted(), after = view.symbol === symbol ? view.last : 0;
+    const other = view.focus ? `&symbol=${encodeURIComponent(view.focus.symbol)}` : "";
     try {
-      const res = await fetch(`/api/candles?tf=${tf}${after ? `&after=${after}` : ""}`, { credentials: "same-origin", cache: "no-store" });
+      const res = await fetch(`/api/candles?tf=${tf}${after ? `&after=${after}` : ""}${other}`, { credentials: "same-origin", cache: "no-store" });
       if (!res.ok) return;
       const d = await res.json();
-      if (d.tf !== view.tf) return;                                       // the timeframe changed meanwhile
+      if (d.tf !== view.tf || d.symbol !== wanted()) return;              // the timeframe or market changed meanwhile
       if (!d.full && d.symbol !== view.symbol) { view.symbol = null; view.again = true; return; }   // the market changed: load all
       if (d.full) {
         series.setData(d.candles.map(toBar));
@@ -105,7 +113,10 @@ export function mountChart() {
         for (const c of d.candles) if (c[0] >= view.last) { series.update(toBar(c)); view.last = c[0]; }
       }
       $("chart").dataset.candles = String(series.data().length);
+      $("chart").dataset.symbol = d.symbol;
       empty(view.last ? "" : d.message || "Loading prices.");
+      const c = d.candles.at(-1);
+      if (view.focus && c) { view.focusPrice = c[4].toLocaleString(undefined, { maximumFractionDigits: Math.abs(c[4]) > 1000 ? 2 : 5 }); showPrice(); }
       paintMarkers(); plans.redraw();
     } catch { /* offline: control.js shows that; tried again on the next poll */ }
     finally {
@@ -117,7 +128,7 @@ export function mountChart() {
   // ------------------------------------------------------------ markers
   /** An arrow for every recent signal and trade, on the candle of the chart's timeframe that holds it. */
   function paintMarkers() {
-    const marks = view.status?.marks || [];
+    const marks = ownMarket() ? view.status?.marks || [] : [];
     const sig = JSON.stringify([marks, view.first, view.tf]);
     if (sig === view.markSig) return;
     view.markSig = sig;
@@ -132,6 +143,12 @@ export function mountChart() {
   // -------------------------------------------------------------- plans
   /** Open trades, the latest signal and the waiting plan from the status, as plans on the chart. */
   function showPlans(s) {
+    if (!ownMarket()) {   // another market on the chart: the bot's plans are not drawn on its prices
+      for (const id of view.tradeIds) plans.remove(id);
+      view.tradeIds = new Set();
+      plans.remove("signal"); plans.remove("pending");
+      return;
+    }
     const ids = new Set();
     for (const t of s.open || []) {
       if (!t.plan || t.symbol !== s.symbol) continue;
@@ -154,22 +171,53 @@ export function mountChart() {
     } else plans.remove("pending");
   }
 
+  // ------------------------------------------------------ scanner setup
+  /** The scanner setup's plan: a trade plan for one ready now, the dashed zone for one waiting for price. */
+  function showFocus() {
+    const f = view.focus;
+    $("chartFocus").hidden = !f;
+    $("chartMarket").textContent = f ? f.name : view.status?.symbolName || view.status?.symbol || "Chart";
+    if (!f) { plans.remove("scan"); return; }
+    $("focusSide").textContent = f.side;
+    $("focusSide").className = `tag ${f.side}`;
+    $("focusText").textContent = `${f.name} · ${STRATEGY[f.strategy] || f.strategy} on ${{ 900: "15m", 3600: "1h" }[f.tf] || ""} · ${f.status === "ready" ? "Ready now" : "Waiting for price"}`;
+    plans.set("scan", f.status === "waiting"
+      ? { kind: "pending", side: f.side, zone: f.zone, sl: f.sl, tp: f.tp, slMoney: NaN, tpMoney: NaN, start: f.start, end: f.end, stale: false }
+      : { side: f.side, entry: f.entry, sl: f.sl, tp: f.tp, slMoney: NaN, tpMoney: NaN, start: f.start, end: f.end ?? null, stale: false });
+  }
+  /** The price shown next to the market: the scanner setup's market's latest close (control.js shows the bot's). */
+  function showPrice() { if (view.focus && view.focusPrice) $("chartPrice").textContent = view.focusPrice; }
+  /** Shows another market and timeframe (or the bot's again): everything is loaded afresh. */
+  function switchTo(tf) {
+    view.tf = tf;
+    view.symbol = null; view.first = view.last = 0; view.markSig = "";
+    series.setData([]);
+    empty("Loading prices.");
+    renderTimeframe();
+    if (view.status) showPlans(view.status);
+    showFocus();
+    paintMarkers();
+    load();
+  }
+  $("focusBack").addEventListener("click", () => {
+    view.focus = null; view.focusPrice = "";
+    switchTo(TIMEFRAMES.some(([g]) => g === store.get(TF_KEY, 60)) ? store.get(TF_KEY, 60) : 60);
+    const p = view.status?.lastPrice;
+    $("chartPrice").textContent = Number.isFinite(p) ? p.toLocaleString(undefined, { maximumFractionDigits: Math.abs(p) > 1000 ? 2 : 5 }) : "";
+  });
+
   // ---------------------------------------------------------- timeframe
   function renderTimeframe() {
     document.querySelectorAll("[data-tf]").forEach((b) => b.setAttribute("aria-pressed", String(+b.dataset.tf === view.tf)));
-    $("tfNote").hidden = view.tf === botTf();
+    $("tfNote").hidden = view.tf === botTf() || !!view.focus;
     $("tfNote").textContent = `The bot trades on ${TF_WORD[botTf()]} candles; this only changes the chart.`;
     $("tfName").textContent = TF_WORD[view.tf];
     $("chart").setAttribute("aria-label", `${TIMEFRAMES.find(([g]) => g === view.tf)[1]} candlestick chart`);
   }
   document.querySelectorAll("[data-tf]").forEach((b) => b.addEventListener("click", () => {
     if (+b.dataset.tf === view.tf) return;
-    view.tf = +b.dataset.tf; store.set(TF_KEY, view.tf);
-    view.symbol = null; view.first = view.last = 0;
-    series.setData([]);
-    empty("Loading prices.");
-    renderTimeframe();
-    load();
+    if (!view.focus) store.set(TF_KEY, +b.dataset.tf);   // a scanner setup's timeframe isn't kept for next time
+    switchTo(+b.dataset.tf);
   }));
   $("planToggle").checked = store.get(PLAN_KEY, true) !== false;
   plans.setVisible($("planToggle").checked);
@@ -180,11 +228,17 @@ export function mountChart() {
     /** Called with every status the page gets. */
     update(s) {
       view.status = s;
-      $("chartMarket").textContent = s.symbolName || s.symbol;
       renderTimeframe();
       showPlans(s);
+      showFocus();
+      showPrice();
       paintMarkers();
-      if (view.symbol !== s.symbol || Date.now() - view.askedAt >= MIN_GAP_MS) load();
+      if (view.symbol !== wanted() || Date.now() - view.askedAt >= MIN_GAP_MS) load();
+    },
+    /** A setup from the Scanner list: its market, its timeframe and its plan. */
+    focus(item) {
+      view.focus = item; view.focusPrice = "";
+      switchTo(item.tf);
     },
   };
 }

@@ -396,6 +396,77 @@ test("the chart: the website's chart code is served as JavaScript (ETag, gzip), 
   } finally { await srv.stop(); }
 });
 
+test("the scanner: needs a login, checks its settings, scans Deriv's markets, Scan now has a cooldown; candles of another market", async () => {
+  const mock = await startMock({ MOCK_SCAN_SETUPS: "1" });
+  const dir = tempDir();
+  setPassword(dir, PASSWORD);
+  const srv = await startServer(dir, { TBOT_SCAN_GAP_MS: "60", DERIV_PUBLIC_WS: `ws://localhost:${mock.port}/trading/v1/options/ws/public` });
+  const c = client(srv.base);
+  try {
+    assert.equal((await c.get("/api/scanner")).status, 401);
+    assert.equal((await c.post("/api/scanner/scan", {})).status, 401);
+    assert.equal((await c.get("/api/candles?tf=900&symbol=R_50")).status, 401);
+    await c.login();
+    assert.equal((await c.post("/api/scanner/scan", {}, { origin: "https://evil.example" })).status, 403);
+    assert.equal((await c.post("/api/scanner/settings", { timeframes: [60] })).status, 400);
+    assert.equal((await c.post("/api/scanner/settings", { on: "yes" })).data.error, "bad_settings");
+    assert.equal((await c.req("GET", "/api/scanner/scan")).status, 405);
+
+    // By default: the real markets only (the mock's open forex pairs and Bitcoin; gold is closed).
+    let v = await until(async () => { const r = await c.get("/api/scanner"); return r.data.lastScanAt && !r.data.scanning && r; }, 20000);
+    assert.equal(v.headers.get("cache-control"), "no-store");
+    assert.deepEqual(v.data.settings, { on: true, synthetics: false, timeframes: [900, 3600] });
+    assert.equal(v.data.markets, 3);
+    assert.ok(v.data.items.every((i) => !/^R_/.test(i.symbol)));
+
+    // With synthetic indices: the mock's fixed setups show up, ready first.
+    const set = await c.post("/api/scanner/settings", { synthetics: true });
+    assert.equal(set.status, 200);
+    assert.equal(set.data.settings.synthetics, true);
+    assert.equal(statSync(join(dir, "scanner.json")).mode & 0o777, 0o600);
+    v = await until(async () => { const r = await c.get("/api/scanner"); return r.data.items.some((i) => i.symbol === "R_50") && r.data.items.some((i) => i.symbol === "R_100") && r; }, 20000);
+    const ready = v.data.items.find((i) => i.symbol === "R_100" && i.strategy === "ict"), wait = v.data.items.find((i) => i.symbol === "R_50");
+    assert.equal(ready.status, "ready");
+    assert.equal(wait.status, "waiting");
+    assert.ok(v.data.items.findIndex((i) => i.status === "waiting") > v.data.items.findIndex((i) => i.status === "ready"));
+    for (const i of [ready, wait]) assert.ok(i.side === "BUY" && i.sl < i.entry && i.tp > i.entry && i.rr > 0 && i.reason && i.name, JSON.stringify(i));
+
+    const scan = await c.post("/api/scanner/scan", {});
+    assert.equal(scan.status, 200, JSON.stringify(scan.data));
+    assert.ok(scan.data.progress.total >= 10);
+    const again = await c.post("/api/scanner/scan", {});
+    assert.equal(again.status, 429);
+    assert.match(again.data.message, /scan again in/);
+
+    // The chart can show a scanner setup's market; only markets Deriv lists.
+    const r = await c.get("/api/candles?tf=900&symbol=R_50");
+    assert.equal(r.status, 200);
+    assert.equal(r.data.symbol, "R_50");
+    assert.ok(r.data.candles.length > 100 || /Loading/.test(r.data.message));
+    for (const bad of ["NOPE", "R_50;x", "", "a".repeat(40)]) assert.equal((await c.get(`/api/candles?tf=900&symbol=${encodeURIComponent(bad)}`)).data.error, "bad_symbol", bad);
+
+    assert.equal((await c.post("/api/scanner/settings", { on: false })).data.message, "The scanner is off. Turn it on under Settings.");
+    assert.equal((await c.post("/api/scanner/scan", {})).data.error, "scanner_off");
+  } finally { await srv.stop(); mock.stop(); }
+});
+
+test("the scanner backs off when Deriv answers with its rate limit, and says so", async () => {
+  const mock = await startMock({ MOCK_RATE_LIMIT: "2" });
+  const dir = tempDir();
+  setPassword(dir, PASSWORD);
+  const srv = await startServer(dir, { TBOT_SCAN_GAP_MS: "60", DERIV_PUBLIC_WS: `ws://localhost:${mock.port}/trading/v1/options/ws/public` });
+  const c = client(srv.base);
+  try {
+    await c.login();
+    const v = await until(async () => { const r = await c.get("/api/scanner"); return r.data.pausedUntil && r; }, 15000);
+    assert.match(v.data.message, /slow down/);
+    assert.ok(v.data.pausedUntil - v.data.now > 50000, "about a minute");
+    assert.ok(v.data.progress.done < v.data.progress.total, "the rest waits");
+    const log = await c.get("/api/log?after=0");
+    assert.ok(log.data.entries.some((e) => e.title === "Scanner paused: Deriv asked to slow down"));
+  } finally { await srv.stop(); mock.stop(); }
+});
+
 test("the mock accepts MOCK_PAT only with a Deriv-App-ID header", async () => {
   const mock = await startMock({ MOCK_PAT: "pat_only_for_tests" });
   try {

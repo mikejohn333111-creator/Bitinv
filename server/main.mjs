@@ -17,6 +17,7 @@ import { fileURLToPath } from "node:url";
 import { CONFIG } from "../public/js/config.js";
 import { TradingEngine, cleanSettings, UserError } from "./engine.mjs";
 import { ChartFeed } from "./chart.mjs";
+import { Scanner, cleanScannerSettings } from "./scanner.mjs";
 import { FileStore, ensureDataDir } from "./store.mjs";
 import { parseProxyList } from "./proxy-ips.mjs";
 import { PasswordFile, Sessions, Devices, LoginLimiter, ipBucket, hashPassword, verifyPassword, writeAuthFile, checkNewPassword,
@@ -125,6 +126,9 @@ async function startServer() {
     log: (e) => console.log(`${e.tag} ${e.title}${e.detail ? `: ${e.detail}` : ""}`),
   });
   const chartFeed = new ChartFeed(engine);
+  // TBOT_SCAN_GAP_MS is for tests only: the gap between the scanner's Deriv requests.
+  const scanGap = Number(env.TBOT_SCAN_GAP_MS) >= 50 ? Number(env.TBOT_SCAN_GAP_MS) : undefined;
+  const scanner = new Scanner(engine, { store, ...(scanGap && { gapMs: scanGap }) });
 
   // ------------------------------------------------------------ helpers
   const LOCAL = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
@@ -280,10 +284,21 @@ async function startServer() {
     } },
     "GET /api/status": { fn: () => ({ ...engine.status(), version: version.commit ? version : null }) },
     "GET /api/candles": { fn: async ({ req, res, url }) => {
+      // Another market than the bot's (a scanner setup): only one Deriv lists (or the built-in ones).
+      const symbol = url.searchParams.get("symbol");
+      if (symbol !== null && (!/^\w{2,30}$/.test(symbol) || !engine.knownSymbols().includes(symbol)))
+        throw new UserError("Unknown market.", 400, "bad_symbol");
       let out;
-      try { out = await chartFeed.candles(url.searchParams.get("tf"), url.searchParams.get("after")); }
+      try { out = await chartFeed.candles(url.searchParams.get("tf"), url.searchParams.get("after"), symbol); }
       catch (e) { if (e instanceof RangeError) throw new UserError(e.message, 400, "bad_timeframe"); throw e; }
       jsonZipped(req, res, out);
+    } },
+    "GET /api/scanner": { fn: ({ req, res }) => { jsonZipped(req, res, scanner.view()); } },
+    "POST /api/scanner/scan": { fn: () => scanner.scanNow() },
+    "POST /api/scanner/settings": { fn: ({ body }) => {
+      const { settings, errors } = cleanScannerSettings(body, scanner.settings);
+      if (errors.length) throw new UserError(errors.join(" "), 400, "bad_settings");
+      return scanner.updateSettings(settings);
     } },
     "GET /api/log": { fn: ({ url }) => {
       const after = Math.max(0, Number(url.searchParams.get("after")) || 0);
@@ -507,6 +522,7 @@ async function startServer() {
     if (closing) return;
     closing = true;
     console.log(`Shutting down (${why}). The bot ${engine.running ? "resumes" : "stays stopped"} when it starts again.`);
+    scanner.stop();
     engine.shutdown();
     try { sessions.flush(); } catch { /* best effort */ }
     clearTimeout(extraTimer);
@@ -527,6 +543,7 @@ async function startServer() {
     if (extraHost && extraHost !== host) listenExtra(a.port);
   });
   engine.init().catch((e) => console.error("Engine start failed:", e?.stack || e));
+  scanner.start();
 }
 
 // ==================================================================== main

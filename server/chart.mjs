@@ -4,7 +4,8 @@
 // On the bot's own timeframe the candles are the engine's (the ones the strategy reads, plus
 // the forming one). Other timeframes are loaded on the engine's Deriv connection with a
 // one-off ticks_history, kept per timeframe and asked again at most every 15 seconds; between
-// loads the newest candle follows the bot's live price. The trade plans (open trades, the
+// loads the newest candle follows the bot's live price. With a symbol (a setup from the scanner)
+// the chart shows another market the same way, loaded on the same connection. The trade plans (open trades, the
 // latest signal, the waiting plan) come with /api/status.
 import { planFromContract } from "../public/js/plan.js";
 
@@ -14,6 +15,7 @@ export const CHART_BARS = 500;
 const MIN_GAP_MS = 15000;          // one Deriv request per timeframe at most this often
 const MAX_AGE_MS = 5 * 60000;      // a timeframe the live price can't keep up to date is loaded again after this
 const WAIT_MS = 8000;              // a first load answers "loading" after this; the page asks again
+const CACHE_KEEP = 8;              // markets and timeframes kept (the bot's own, and a few scanner setups)
 
 /** A candle as the page gets it: [epoch, open, high, low, close]. */
 const row = (b) => [b.epoch, b.open, b.high, b.low, b.close];
@@ -57,17 +59,21 @@ export class ChartFeed {
    */
   constructor(engine, { now = Date.now, minGapMs = MIN_GAP_MS, waitMs = WAIT_MS } = {}) {
     Object.assign(this, { engine, now, minGapMs, waitMs });
-    this.cache = new Map();          // tf -> {symbol, bars, forming, at, loading, failed}
+    this.cache = new Map();          // "symbol:tf" -> {symbol, bars, forming, at, loading, failed}
   }
 
-  /** The answer for GET /api/candles. Throws a RangeError for a timeframe the chart doesn't have. */
-  async candles(tf, after) {
+  /**
+   * The answer for GET /api/candles. Throws a RangeError for a timeframe the chart doesn't have.
+   * `symbol` is another market than the bot's (a scanner setup); the caller checks it is a known one.
+   */
+  async candles(tf, after, symbol) {
     tf = Number(tf);
     if (!CHART_TIMEFRAMES.includes(tf)) throw new RangeError("Unknown chart timeframe.");
-    const e = this.engine, symbol = e.settings.symbol, botTf = e.tf();
+    const e = this.engine, own = e.settings.symbol, botTf = e.tf();
+    symbol = symbol || own;
     let list, failed = false;
-    if (tf === botTf) list = [...e.bars.slice(-(CHART_BARS - 1)), ...(e.forming ? [e.forming] : [])];
-    else ({ list, failed } = await this.#other(tf, symbol, botTf));
+    if (symbol === own && tf === botTf) list = [...e.bars.slice(-(CHART_BARS - 1)), ...(e.forming ? [e.forming] : [])];
+    else ({ list, failed } = await this.#other(tf, symbol, symbol === own ? botTf : 0));
     const online = e.connection === "online";
     const message = list.length ? ""
       : !online ? "Not connected to Deriv right now. The chart shows once the bot is connected."
@@ -76,12 +82,13 @@ export class ChartFeed {
     return { symbol, tf, botTf, live: online, ...candlesAfter(list, after), message };
   }
 
+  /** botTf is 0 for a market the bot isn't watching: then nothing follows the live price between loads. */
   async #other(tf, symbol, botTf) {
-    let c = this.cache.get(tf);
-    if (c && c.symbol !== symbol) { this.cache.clear(); c = null; }   // the market changed
+    const key = `${symbol}:${tf}`;
+    let c = this.cache.get(key);
     const e = this.engine, now = this.now();
     // A bigger timeframe than the bot's follows the live price: the bot's forming candle lies inside the chart's.
-    const follows = tf > botTf && tf % botTf === 0;
+    const follows = botTf > 0 && tf > botTf && tf % botTf === 0;
     if (c?.forming && follows && e.forming) {
       const start = Math.floor(e.forming.epoch / tf) * tf, f = c.forming;
       if (start === f.epoch) c.forming = { ...f, high: Math.max(f.high, e.forming.high), low: Math.min(f.low, e.forming.low), close: e.forming.close };
@@ -89,10 +96,14 @@ export class ChartFeed {
     }
     const due = !c || (now - c.at >= this.minGapMs && (!follows || c.rolled || now - c.at >= MAX_AGE_MS || !c.forming));
     if (due && !c?.loading && e.socket && e.connection === "online") {
-      c = c || { symbol, bars: [], forming: null, at: 0 };
-      this.cache.set(tf, c);
+      if (!c) {
+        c = { symbol, bars: [], forming: null, at: 0 };
+        this.cache.set(key, c);
+        // Old markets and timeframes are dropped (the oldest first), so the cache stays small.
+        for (const [k, v] of this.cache) if (this.cache.size > CACHE_KEEP && v !== c && !v.loading) this.cache.delete(k);
+      }
       c.at = now;
-      c.loading = this.#load(tf, symbol, c).finally(() => { c.loading = null; });
+      c.loading = this.#load(tf, symbol, c, key).finally(() => { c.loading = null; });
     }
     // The first load is waited for (a little); later ones happen behind the cached candles.
     if (c?.loading && !c.bars.length && !c.forming) {
@@ -104,11 +115,11 @@ export class ChartFeed {
     return { list: [...c.bars, ...(c.forming ? [c.forming] : [])], failed: !!c.failed && !c.loading };
   }
 
-  async #load(tf, symbol, c) {
+  async #load(tf, symbol, c, key) {
     try {
       const msg = await this.engine.socket.send({ ticks_history: symbol, style: "candles", granularity: tf, count: CHART_BARS,
                                                   end: "latest", adjust_start_time: 1 });
-      if (this.cache.get(tf) !== c || this.engine.settings.symbol !== symbol) return;   // changed meanwhile
+      if (this.cache.get(key) !== c) return;   // dropped meanwhile
       const all = (msg.candles || []).map(bar).filter((b) => Number.isFinite(b.epoch));
       c.forming = all.pop() || null;
       c.bars = all;

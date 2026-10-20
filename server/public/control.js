@@ -2,7 +2,9 @@
 // the page is visible and pauses while it is hidden. No inline scripts (strict CSP).
 const $ = (id) => document.getElementById(id);
 const POLL_MS = 3000;
-const ui = { screen: "loading", status: null, lastSeq: 0, stateKey: null, timer: null, dirty: new Set(), restart: null, chart: null };
+const SCAN_POLL_MS = 15000, SCAN_BUSY_MS = 3000;   // the scanner list is asked for less often than the status
+const ui = { screen: "loading", status: null, lastSeq: 0, stateKey: null, timer: null, dirty: new Set(), restart: null, chart: null,
+             scan: null, scanAt: 0, scanSkew: 0, scanSig: "", scanSaving: false, focusId: null };
 
 // ------------------------------------------------------------- helpers
 async function api(method, path, body) {
@@ -70,6 +72,7 @@ function show(screen) {
   if (screen === "login") {
     clearTimeout(ui.timer);
     ui.lastSeq = 0; $("logList").replaceChildren();
+    ui.scanAt = 0;
     setTimeout(() => $("loginPassword").focus(), 50);
   }
 }
@@ -92,6 +95,7 @@ async function refresh() {
     show("main");
     render(r.data);
     await pullLog();
+    await pullScanner();
   } else if (r.status === 0 || r.status >= 500 && r.status !== 503) {
     if (ui.screen === "main") setConn("unreachable"); else show("offline");
   }
@@ -289,6 +293,136 @@ function renderSignal(s) {
   $("costText").hidden = !c;
   if (c) $("costText").textContent = `Last commission: ${money(c.commission, c.currency)} (${(c.r * 100).toFixed(1)}% of the risk). This cost is why results lean negative.`;
 }
+
+// ------------------------------------------------------------- scanner
+const STRATEGY_NAME = { ict: "ICT", rules: "Rules", ai: "AI model" };
+const TF_SHORT = { 900: "15m", 3600: "1h" };
+
+/** The scanner's list, asked for every 15 seconds (every 3 while it is scanning) and after a change. */
+async function pullScanner(force = false) {
+  if (!force && Date.now() - ui.scanAt < (ui.scan?.scanning ? SCAN_BUSY_MS : SCAN_POLL_MS)) { if (ui.scan) renderScanAges(); return; }
+  ui.scanAt = Date.now();
+  const r = await api("GET", "/api/scanner");
+  if (r.ok) showScanner(r.data);
+}
+
+function showScanner(d) {
+  ui.scan = d;
+  ui.scanSkew = Date.now() - d.now;   // the server's clock, for "12 min ago"
+  renderScanner();
+}
+
+/** "just now", "12 min ago", "3 h ago", by the server's clock. */
+function ago(ms) {
+  const min = Math.floor((Date.now() - ui.scanSkew - ms) / 60000);
+  if (min < 1) return "just now";
+  if (min < 60) return `${min} min ago`;
+  if (min < 48 * 60) return `${Math.floor(min / 60)} h ago`;
+  return when(ms);
+}
+const inMin = (ms) => Math.max(1, Math.ceil((ms - (Date.now() - ui.scanSkew)) / 60000));
+
+function scanItem(it) {
+  const li = el("li");
+  const b = el("button", `scan-item ${it.status}`);
+  b.type = "button";
+  b.dataset.id = it.id;
+  b.setAttribute("aria-pressed", String(ui.focusId === it.id));
+  const head = el("span", "scan-head");
+  head.append(el("span", `tag ${it.side}`, it.side), el("span", "scan-name", it.name), el("span", "scan-tf", TF_SHORT[it.tf] || ""));
+  const age = el("span", "scan-age", ago(it.at));
+  age.dataset.at = it.at;
+  head.append(age);
+  const status = el("span", "scan-status");
+  status.append(el("span", `scan-pill ${it.status}`, it.status === "ready" ? "Ready now" : it.inZone ? "Price in the zone" : "Waiting for price"),
+                el("span", "scan-strat", STRATEGY_NAME[it.strategy] || it.strategy));
+  const nums = el("span", "scan-nums");
+  const num = (label, v, cls = "") => { const x = el("span", `scan-num ${cls}`.trim()); x.append(el("span", "k", label), el("span", "v", v)); return x; };
+  nums.append(it.status === "waiting" && it.zone ? num("Entry zone", `${px(it.zone[0])} – ${px(it.zone[1])}`, "wide") : num("Entry", px(it.entry)),
+              num("Stop loss", px(it.sl), "sl"), num("Take profit", px(it.tp), "tp"),
+              num("Reward : risk", Number.isFinite(it.rr) ? `${it.rr.toFixed(1)} : 1` : "–"));
+  b.append(head, status, nums, el("span", "scan-reason", it.reason));
+  if (it.agree?.length || it.against?.length) {
+    const ag = el("span", "scan-agree");
+    if (it.agree.length) ag.append(el("span", "yes", `Agrees: ${it.agree.join(" · ")}`));
+    if (it.against.length) ag.append(el("span", "no", `Against: ${it.against.join(" · ")}`));
+    b.append(ag);
+  }
+  b.setAttribute("aria-label", `${it.side} ${it.name}, ${STRATEGY_NAME[it.strategy]} on ${TF_SHORT[it.tf]}, ${it.status === "ready" ? "ready now" : "waiting for price"}, ` +
+                               `entry ${px(it.entry)}, stop loss ${px(it.sl)}, take profit ${px(it.tp)}. Show on the chart.`);
+  li.append(b);
+  return li;
+}
+
+function renderScanAges() { for (const a of document.querySelectorAll("#scanList .scan-age")) a.textContent = ago(Number(a.dataset.at)); }
+
+function renderScanner() {
+  const d = ui.scan;
+  if (!d) return;
+  const items = d.items || [];
+  $("scanWhen").textContent = d.lastScanAt ? `Checked ${ago(d.lastScanAt)}` : "";
+  const total = d.progress?.total || 0, done = d.progress?.done || 0;
+  $("scanProgress").hidden = !d.scanning;
+  if (d.scanning) {
+    $("scanMeter").value = total ? Math.round((100 * done) / total) : 0;
+    $("scanProgressText").textContent = `Scanning ${done} of ${total} charts`;
+  }
+  setMsg("scanMsg", d.message);
+  const sig = JSON.stringify([items.map((i) => [i.id, i.status, i.inZone, i.agree, i.against]), ui.focusId]);
+  if (sig !== ui.scanSig) { ui.scanSig = sig; $("scanList").replaceChildren(...items.map(scanItem)); }
+  else renderScanAges();
+  $("scanEmpty").hidden = items.length > 0 || !!d.message;
+  $("scanEmpty").textContent = d.scanning && !d.lastScanAt ? "Scanning. The first setups show in a minute or two."
+    : `No setups on the ${d.markets} market${d.markets === 1 ? "" : "s"} watched right now. It checks again after the next candle${d.nextScanAt ? ` (in ${inMin(d.nextScanAt)} min)` : ""}.`;
+  $("scanHint").hidden = !items.length;
+  const btn = $("scanBtn");
+  btn.disabled = !d.settings.on || !!d.cooldownUntil || d.scanning;
+  btn.textContent = !d.settings.on ? "Scanner is off" : d.scanning ? "Scanning…" : d.cooldownUntil ? `Scan again in ${inMin(d.cooldownUntil)} min` : "Scan now";
+  // settings
+  const set = d.settings;
+  $("sumScanner").textContent = set.on ? `On · ${set.timeframes.map((t) => TF_SHORT[t]).join(", ")}${set.synthetics ? " · with synthetics" : ""}` : "Off";
+  if (!ui.scanSaving) {
+    $("scanOn").checked = set.on;
+    $("scanSynth").checked = set.synthetics;
+    for (const c of document.querySelectorAll('#scanTfSeg input[name="tf"]')) c.checked = set.timeframes.includes(Number(c.value));
+  }
+}
+
+$("scanBtn").addEventListener("click", () => busy($("scanBtn"), async () => {
+  const r = await api("POST", "/api/scanner/scan", {});
+  if (r.ok) { showScanner(r.data); ui.scanAt = Date.now(); toast("Scanning the markets now."); }
+  else if (r.status !== 401) { toast(r.data.message || "That didn't work."); pullScanner(true); }
+}).then(() => { if (ui.scan) renderScanner(); }));
+
+$("scanList").addEventListener("click", (ev) => {
+  const b = ev.target.closest(".scan-item");
+  const it = b && ui.scan?.items.find((i) => i.id === b.dataset.id);
+  if (!it || !ui.chart) return;
+  ui.chart.then((c) => {
+    if (!c) return;
+    ui.focusId = it.id;
+    c.focus(it);
+    for (const x of document.querySelectorAll("#scanList .scan-item")) x.setAttribute("aria-pressed", String(x === b));
+    ui.scanSig = "";
+    $("chartCard").scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+    announce(`Chart shows ${it.name}, ${TF_SHORT[it.tf]}, with the ${it.side} setup.`);
+  });
+});
+$("focusBack").addEventListener("click", () => {
+  ui.focusId = null;
+  for (const x of document.querySelectorAll("#scanList .scan-item")) x.setAttribute("aria-pressed", "false");
+});
+
+$("scanForm").addEventListener("change", async () => {
+  const tfs = [...document.querySelectorAll('#scanTfSeg input[name="tf"]:checked')].map((c) => Number(c.value));
+  if (!tfs.length) { setMsg("scanSetMsg", "Pick at least one timeframe.", "error"); if (ui.scan) renderScanner(); return; }
+  ui.scanSaving = true;
+  try {
+    const r = await api("POST", "/api/scanner/settings", { on: $("scanOn").checked, synthetics: $("scanSynth").checked, timeframes: tfs });
+    if (r.ok) { setMsg("scanSetMsg", r.data.settings.on ? "Saved. The scanner checks the markets again shortly." : "Saved. The scanner is off.", "ok"); showScanner(r.data); ui.scanAt = 0; }
+    else setMsg("scanSetMsg", r.data.message || "Couldn't save that.", "error");
+  } finally { ui.scanSaving = false; if (ui.scan) renderScanner(); }
+});
 
 // ------------------------------------------------------------- settings
 const RISK_FIELDS = ["riskPct", "maxDailyLossPct", "maxOpen", "maxTradesPerDay", "maxConsecLosses", "cooldownMinutes", "signalGap"];

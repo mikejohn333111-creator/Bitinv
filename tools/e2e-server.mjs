@@ -24,15 +24,15 @@ if (SHOTS) mkdirSync(SHOTS, { recursive: true });
 const { chromium } = await import(process.env.PLAYWRIGHT || "/opt/node22/lib/node_modules/playwright/index.mjs");
 
 // ---------------------------------------------------------------- mock
-Object.assign(process.env, { PORT: String(MOCK_PORT), BAR_MS: "1000", MOCK_PAT: PAT, MOCK_CONTROL: "1" });
+Object.assign(process.env, { PORT: String(MOCK_PORT), BAR_MS: "1000", MOCK_PAT: PAT, MOCK_CONTROL: "1", MOCK_SCAN_SETUPS: "1" });
 await import("./mock-deriv.mjs");
 const MOCK = `http://localhost:${MOCK_PORT}`;
 
 // --------------------------------------------------------------- server
 const dataDir = mkdtempSync(join(tmpdir(), "tbot-e2e-"));
-const serverEnv = { ...process.env, TBOT_DATA_DIR: dataDir, TBOT_PORT: String(SERVER_PORT), TBOT_HOST: "127.0.0.1", TBOT_DEV: "1",
+const serverEnv = { ...process.env, TBOT_DATA_DIR: dataDir, TBOT_PORT: String(SERVER_PORT), TBOT_HOST: "127.0.0.1", TBOT_DEV: "1", TBOT_SCAN_GAP_MS: "100",
                     DERIV_API_URL: MOCK, DERIV_PUBLIC_WS: `ws://localhost:${MOCK_PORT}/trading/v1/options/ws/public` };
-for (const k of ["PORT", "BAR_MS", "MOCK_PAT", "MOCK_CONTROL"]) delete serverEnv[k];
+for (const k of ["PORT", "BAR_MS", "MOCK_PAT", "MOCK_CONTROL", "MOCK_SCAN_SETUPS"]) delete serverEnv[k];
 const mockClock = (barMs) => fetch(`${MOCK}/mock/clock`, { method: "POST", body: JSON.stringify({ barMs }) });
 const pw = spawnSync(process.execPath, ["server/main.mjs", "set-password"], { cwd: ROOT, input: PASSWORD + "\n", env: serverEnv, encoding: "utf8" });
 assert.equal(pw.stdout, "Password saved.\n", pw.stderr);
@@ -184,6 +184,43 @@ try {
     assert.equal(await page.textContent("#tfNote"), "The bot trades on 1-minute candles; this only changes the chart.");
     await page.click('[data-tf="60"]');
     await page.waitForFunction(() => document.getElementById("tfNote").hidden);
+
+    step = "scanner";
+    if (scheme === "light") {
+      // Real markets only at first; the mock's fixed setups are on two synthetic indices.
+      await page.waitForFunction(() => /Checked/.test(document.getElementById("scanWhen").textContent), null, { timeout: 30000 });
+      await page.click("#secScanner summary");
+      assert.equal(await page.isChecked("#scanOn"), true, "on by default");
+      assert.equal(await page.isChecked("#scanSynth"), false, "real markets only by default");
+      await page.click('label[for="scanSynth"]');
+      await page.waitForFunction(() => /Saved/.test(document.getElementById("scanSetMsg").textContent));
+      assert.match(await page.textContent("#sumScanner"), /with synthetics/);
+      await page.click("#secScanner summary");
+    }
+    await page.waitForFunction(() => document.querySelectorAll("#scanList .scan-item").length >= 2 &&
+      [...document.querySelectorAll("#scanList .scan-name")].some((e) => e.textContent === "Volatility 50 Index"), null, { timeout: 60000 });
+    assert.equal(await page.$eval("#scanList .scan-item", (b) => b.classList.contains("ready")), true, "ready now comes first");
+    assert.match(await page.textContent("#scanList"), /Waiting for price/);
+    assert.match(await page.textContent("#scanCard"), /no proven edge/);
+    assert.ok(!/%/.test(await page.textContent("#scanList")), "no percentages on the cards");
+    await page.$eval("#scanCard", (e) => e.scrollIntoView());
+    if (SHOTS) await page.locator("#scanCard").screenshot({ path: join(SHOTS, `scanner-card-${scheme}.png`) });
+    await page.click('#scanList .scan-item:has(.scan-name:text-is("Volatility 50 Index"))');
+    await page.waitForFunction(() => document.getElementById("chart").dataset.symbol === "R_50" &&
+      document.getElementById("chart").dataset.plans?.split(" ").includes("scan") && Number(document.getElementById("chart").dataset.candles) > 50, null, { timeout: 15000 });
+    assert.equal(await page.isVisible("#chartFocus"), true);
+    assert.match(await page.textContent("#chartMarket"), /Volatility 50/);
+    assert.match(await page.textContent("#focusText"), /Waiting for price/);
+    assert.equal(await page.isVisible("#tfNote"), false);
+    if (SHOTS) await page.locator("#chartCard").screenshot({ path: join(SHOTS, `scanner-chart-${scheme}.png`) });
+    await page.click("#focusBack");
+    await page.waitForFunction(() => document.getElementById("chart").dataset.symbol === "R_75" && document.getElementById("chartFocus").hidden &&
+      !document.getElementById("chart").dataset.plans?.split(" ").includes("scan"), null, { timeout: 15000 });
+    if (scheme === "light") {
+      await page.click("#scanBtn");
+      await page.waitForFunction(() => /Scan again in|Scanning/.test(document.getElementById("scanBtn").textContent));
+      assert.equal(await page.isDisabled("#scanBtn"), true, "cooldown");
+    }
 
     step = "page checks";
     assert.ok(!(await page.content()).includes(PAT), "the token never reaches the page");

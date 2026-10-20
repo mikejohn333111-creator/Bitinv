@@ -153,3 +153,22 @@ test("ChartFeed: not connected, a failed or slow request, and a market change gi
   assert.deepEqual(r.candles, []);
   assert.equal(e.sent.at(-1).ticks_history, "R_100");
 });
+
+test("ChartFeed: another market (a scanner setup) is loaded on its own, never follows the bot's price, and the cache stays small", async () => {
+  const t = { now: 1e6 };
+  const e = fakeEngine();
+  e.bars = bars(0, 5, 60);
+  e.forming = { epoch: 300, open: 1, high: 999, low: 0.1, close: 500 };
+  const feed = new ChartFeed(e, { now: () => t.now });
+  const own = await feed.candles(60, 0, "R_75");
+  assert.equal(own.candles.length, 6, "the bot's own market and timeframe: its candles");
+  const p = feed.candles(60, 0, "frxEURUSD");
+  await flush();
+  assert.deepEqual(e.sent, [{ ticks_history: "frxEURUSD", style: "candles", granularity: 60, count: CHART_BARS, end: "latest", adjust_start_time: 1 }]);
+  answer(e, bars(0, 3, 60, 1));
+  const r = await p;
+  assert.equal(r.symbol, "frxEURUSD");
+  assert.deepEqual(r.candles.at(-1), [120, 3, 5, 2, 4], "not moved by the bot's own forming candle");
+  for (let k = 0; k < 12; k++) { feed.candles(900, 0, `S${k}`); await flush(); answer(e, bars(0, 2, 900)); await flush(); }
+  assert.ok(feed.cache.size <= 8, `cache ${feed.cache.size}`);
+});

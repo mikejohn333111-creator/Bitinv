@@ -134,12 +134,16 @@ export function rulesParamsFor(granularity = 60) {
  *   1 hour:     4h trend filter (EMA 50 on 4-hour candles): it was not worse out of sample.
  *   15 minutes: kill zones (London 07-10, New York 12-15 UTC): not worse out of sample.
  * Neither is proof of an edge; premium/discount and the OTE tested worse and stay off.
+ * Audit of 20 October 2026 (11 markets, 2010-2021 to choose, 2022-2025 to test once):
+ *   1 hour: also MSS by close (mssClose) and a later gap when the first is missed
+ *   (fvgAfterBars 10). About 60% more trades and not worse out of sample, though still
+ *   below zero after costs. On 15 minutes the pick (fvgAfterBars) was worse out of sample: off.
  */
 export function ictParamsFor(granularity = 60, { real = false } = {}) {
   const m = Math.max(1, Math.round(granularity / 60));
   const p = { ...ICT_DEFAULTS, barMinutes: m };
   if (!real) return p;
-  if (m === 60) return { ...p, htfBias: "ema", htfMinutes: 240, htfEMA: 50 };
+  if (m === 60) return { ...p, htfBias: "ema", htfMinutes: 240, htfEMA: 50, mssClose: true, fvgAfterBars: 10 };
   if (m === 15) return { ...p, killZone: true };
   return p;
 }
@@ -314,6 +318,10 @@ export function evaluateAI(bars, model, p = AI_DEFAULTS) {
 // Stop goes beyond the sweep extreme plus a small ATR buffer; target is a fixed
 // R multiple or the nearest opposite swing ("liquidity"); time exit horizonBars.
 // Sells are the exact mirror (the detector runs on price-flipped bars).
+// Options (all off in ICT_DEFAULTS; see ictParamsFor for what real markets use): session
+// liquidity (previous day, Asian range), breaker block / order block / OTE entries instead of
+// the gap, MSS by close with displacement anywhere in the leg, and a later gap when the
+// first is missed. Tested in docs/strategy-results.md (20 October 2026).
 export const ICT_DEFAULTS = {
   swingLen: 2,          // fractal: a swing high is higher than swingLen bars on each side
   liqLookback: 60,      // the swept swing must be at most this many bars before the sweep
@@ -347,9 +355,33 @@ export const ICT_DEFAULTS = {
   pdFilter: "off",
   oteLow: 0.62,
   oteHigh: 0.79,
-  // Where price must come back to: "fvg" (fair value gap, ICT) or "ob" (order block: the last
-  // opposite candle before the displacement, as in Smart Money Concepts; stop beyond it).
+  // Where price must come back to:
+  //   "fvg"     fair value gap (ICT), the default;
+  //   "ob"      order block: the last opposite (down) candle before the displacement, as in
+  //             Smart Money Concepts; stop beyond it;
+  //   "breaker" breaker block (ICT): the last up-close candle before the down move that ran the
+  //             swept low. Once displacement closes above it, that candle flips from resistance
+  //             to support; entry when price comes back to it, stop beyond the sweep's low;
+  //   "ote"     optimal trade entry (ICT): price retraces 62% to 79% (oteLow / oteHigh) of the
+  //             dealing range from the swept low to the highest high since; stop beyond the low.
   entryZone: "fvg",
+  // Extra liquidity pools besides swing points (both ICT "draws on liquidity"), checked after
+  // the swing low:
+  //   liqPrevDay: the previous trading day's low (high for sells); Monday looks at Friday;
+  //   liqAsia:    today's Asian session low (high), asiaHours in UTC, swept after the session ends.
+  liqPrevDay: false,
+  liqAsia: false,
+  asiaHours: [0, 5],
+  // Market structure shift by a close beyond structure: the first close above the internal
+  // swing high is the shift whatever its size, and the displacement (a body of at least
+  // dispATR x ATR) may be any bar of the leg from the sweep to that close. Off: the breaking
+  // bar itself must be the displacement candle (stricter).
+  mssClose: false,
+  // Re-entry on a later gap: fair value gaps that form up to fvgAfterBars bars after the shift
+  // count too. The newest gap is the entry as long as no gap of the setup has been revisited, so
+  // when price runs on without coming back to the first gap ("missed"), the next gap of the
+  // same leg is used instead. 0 = only gaps of the displacement leg up to the shift (as before).
+  fvgAfterBars: 0,
 };
 
 /** Closed bars needed for the higher-timeframe bias (0 when it is off). */
@@ -359,8 +391,15 @@ function htfBarsNeeded(p) {
   return per * ((p.htfBias === "ema" ? p.htfEMA + p.htfSlopeBars : p.htfSwingLookback) + 2);
 }
 
+/** Closed bars needed for session liquidity: back past the start of the previous trading day (Friday on a Monday). */
+function sessionBarsNeeded(p) {
+  if (!p.liqPrevDay && !p.liqAsia) return 0;
+  const days = p.liqPrevDay ? 4 : 1;
+  return Math.min(4000, Math.ceil((days * 1440) / (p.barMinutes || 1)) + p.sweepWindow + p.entryWindow + 5);
+}
+
 export function ictMinBars(p = ICT_DEFAULTS) {
-  return Math.max(p.atrPeriod + p.liqLookback + p.sweepWindow + p.entryWindow + 2 * p.swingLen + 6, htfBarsNeeded(p));
+  return Math.max(p.atrPeriod + p.liqLookback + p.sweepWindow + p.entryWindow + 2 * p.swingLen + 6, htfBarsNeeded(p), sessionBarsNeeded(p));
 }
 
 /** Plain-words name of a higher timeframe in minutes: "4h", "daily", "15m". */
@@ -401,15 +440,22 @@ export function ictHtfBias(bars, p = ICT_DEFAULTS) {
 
 const flipBar = (b) => ({ epoch: b.epoch, open: -b.open, high: -b.low, low: -b.high, close: -b.close });
 
+// UTC calendar helpers for session liquidity. Bars are stamped anywhere inside the candle
+// (Deriv: its open; the backtester: its last minute), so the hour and day of the stamp are the candle's.
+const utcDay = (e) => Math.floor(e / 86400);
+const utcHour = (e) => Math.floor((((e % 86400) + 86400) % 86400) / 3600);
+const isWeekend = (e) => { const w = (utcDay(e) + 4) % 7; return w === 0 || w === 6; };   // 1970-01-01 was a Thursday
+
 /**
  * Looks for a bullish setup. Returns null, a setup that enters on the last bar
  * ({kind: "entry"}), or one that has formed and waits for price to come back to the gap
  * ({kind: "pending"}).
  */
 function ictBullish(bars, tr, p, waiting = false) {
-  const i = bars.length - 1, L = p.swingLen, ob = p.entryZone === "ob";
-  // An order block is known when the displacement bar closes, a gap one bar later.
-  const newest = i - (ob ? 1 : 2) + (waiting ? 1 : 0);
+  const i = bars.length - 1, L = p.swingLen, zoneKind = p.entryZone || "fvg", ob = zoneKind === "ob";
+  // A gap is known one bar after the displacement bar closes; an order block, breaker or OTE
+  // range when the displacement bar closes.
+  const newest = i - (zoneKind === "fvg" ? 2 : 1) + (waiting ? 1 : 0);
   const H = (j) => bars[j].high, Lo = (j) => bars[j].low;
   const isHigh = (j) => { if (j - L < 0 || j + L > i) return false;
     for (let k = 1; k <= L; k++) if (!(H(j) > H(j - k) && H(j) > H(j + k))) return false; return true; };
@@ -418,78 +464,147 @@ function ictBullish(bars, tr, p, waiting = false) {
   const atrI = atrAt(tr, p.atrPeriod, i);
   if (!(atrI > 0)) return null;
 
+  // Session liquidity for a sweep at bar s (previous day's low, today's Asian low), worked out
+  // once per day. A level counts only when the window holds the whole session it comes from.
+  const sessions = new Map();
+  const sessionPools = (s) => {
+    if (!p.liqPrevDay && !p.liqAsia) return [];
+    const day = utcDay(bars[s].epoch);
+    let e = sessions.get(day);
+    if (!e) {
+      e = {};
+      let t0 = s;
+      while (t0 > 0 && utcDay(bars[t0 - 1].epoch) === day) t0--;
+      if (t0 > 0 && p.liqAsia) {
+        let lo = Infinity, at = -1;
+        for (let j = t0; j <= i && utcDay(bars[j].epoch) === day; j++) {
+          const h = utcHour(bars[j].epoch);
+          if (h >= p.asiaHours[1]) break;
+          if (h >= p.asiaHours[0] && Lo(j) < lo) { lo = Lo(j); at = j; }
+        }
+        if (at >= 0) e.asia = { level: lo, bar: at, pool: "asia" };
+      }
+      if (t0 > 0 && p.liqPrevDay) {
+        let j = t0 - 1;
+        while (j >= 0 && isWeekend(bars[j].epoch)) j--;     // Monday looks at Friday
+        if (j >= 0) {
+          const pd = utcDay(bars[j].epoch);
+          let lo = Infinity, at = -1;
+          for (; j >= 0 && utcDay(bars[j].epoch) === pd; j--) if (Lo(j) <= lo) { lo = Lo(j); at = j; }
+          if (j >= 0) e.prev = { level: lo, bar: at, pool: "prevDay" };   // j >= 0: the whole day is in the window
+        }
+      }
+      sessions.set(day, e);
+    }
+    const out = [];
+    if (e.prev) out.push(e.prev);
+    if (e.asia && utcHour(bars[s].epoch) >= p.asiaHours[1]) out.push(e.asia);
+    return out;
+  };
+
   // d = structure-shift (displacement) bar; the gap needs bar d+1 closed, entry at i >= d+2.
   // Entries scan from d = i - 2 (as backtested). Waiting setups also look at d = i - 1,
   // where the gap has only just formed on the last bar.
   for (let d = newest; d >= Math.max(p.atrPeriod, i - p.entryWindow); d--) {
     const bd = bars[d], atrD = atrAt(tr, p.atrPeriod, d - 1);
-    if (!(atrD > 0) || bd.close - bd.open < p.dispATR * atrD) continue;
+    if (!(atrD > 0)) continue;
+    // Default: the breaking bar itself is the displacement. mssClose: any close beyond structure
+    // is the shift; the displacement is checked on the whole leg below.
+    if (!p.mssClose && bd.close - bd.open < p.dispATR * atrD) continue;
     // sweep bar s in [d - sweepWindow, d - 1], most recent first
     for (let s = d - 1; s >= Math.max(1, d - p.sweepWindow); s--) {
-      // the swing low being swept: most recent one already confirmed before s
-      let pv = -1;
-      for (let j = s - 1 - L; j >= Math.max(L, s - p.liqLookback); j--) if (isLow(j)) { pv = j; break; }
-      if (pv < 0) continue;
-      const level = Lo(pv);
-      if (!(Lo(s) < level && bars[s].close > level)) continue;
-      // the pool must still be untouched until the sweep bar
-      let untaken = true;
-      for (let j = pv + 1; j < s; j++) if (Lo(j) < level) { untaken = false; break; }
-      if (!untaken) continue;
-      // internal swing high after the swept low, confirmed before d
-      let q = -1;
-      for (let j = d - 1 - L; j > pv; j--) if (isHigh(j)) { q = j; break; }
-      if (q < 0) continue;
-      const mss = H(q);
-      if (!(bd.close > mss)) continue;
-      let firstBreak = true;
-      for (let j = Math.max(q + 1, s); j < d; j++) if (bars[j].close > mss) { firstBreak = false; break; }
-      if (!firstBreak) continue;
-      let sweepLow = Infinity;
-      for (let j = s; j <= d; j++) sweepLow = Math.min(sweepLow, Lo(j));
-      // The zone price must come back to. FVG: the gap from the displacement leg, centre c in
-      // [s+1, d], nearest to d. Order block: the last down candle before the displacement
-      // (from the sweep on). from = first bar that may revisit, formed = bar that completes it.
-      let gap = null;
-      if (ob) {
-        for (let k = d - 1; k >= s; k--) if (bars[k].close < bars[k].open) { gap = { bot: Lo(k), top: H(k), start: k, from: d + 1, formed: d }; break; }
-      } else {
-        for (let c = d; c >= s + 1; c--) {
-          const bot = H(c - 1), top = Lo(c + 1);
-          if (top - bot > p.fvgMinATR * atrD && top > bot) { gap = { bot, top, start: c - 1, from: c + 2, formed: c + 1 }; break; }
+      // The pools that may be swept: the most recent swing low already confirmed before s,
+      // then (options) the previous day's low and the Asian session low.
+      const pools = [];
+      for (let j = s - 1 - L; j >= Math.max(L, s - p.liqLookback); j--) if (isLow(j)) { pools.push({ level: Lo(j), bar: j, pool: "swing" }); break; }
+      pools.push(...sessionPools(s));
+      for (const { level, bar: pv, pool } of pools) {
+        if (!(Lo(s) < level && bars[s].close > level)) continue;
+        // the pool must still be untouched until the sweep bar
+        let untaken = true;
+        for (let j = pv + 1; j < s; j++) if (Lo(j) < level) { untaken = false; break; }
+        if (!untaken) continue;
+        // internal swing high after the swept low, confirmed before d
+        let q = -1;
+        for (let j = d - 1 - L; j > Math.max(pv, s - p.liqLookback); j--) if (isHigh(j)) { q = j; break; }
+        if (q < 0) continue;
+        const mss = H(q);
+        if (!(bd.close > mss)) continue;
+        let firstBreak = true;
+        for (let j = Math.max(q + 1, s); j < d; j++) if (bars[j].close > mss) { firstBreak = false; break; }
+        if (!firstBreak) continue;
+        if (p.mssClose) {   // displacement somewhere in the leg from the sweep to the shift
+          let body = -Infinity;
+          for (let j = s; j <= d; j++) body = Math.max(body, bars[j].close - bars[j].open);
+          if (body < p.dispATR * atrD) continue;
         }
+        let sweepLow = Infinity;
+        for (let j = s; j <= d; j++) sweepLow = Math.min(sweepLow, Lo(j));
+        // The zone price must come back to. from = first bar that may revisit, formed = bar that completes it.
+        //   FVG: the gap from the displacement leg, centre c in [s+1, d], nearest to d; with
+        //        fvgAfterBars also gaps centred up to fvgAfterBars bars after d (newest wins).
+        //   Order block: the last down candle before the displacement (from the sweep on).
+        //   Breaker: the last up-close candle before the sweep (from the swing high on).
+        //   OTE: 62% to 79% back from the highest high since the sweep toward the swept low.
+        let gap = null, gaps = null;
+        if (zoneKind === "ob") {
+          for (let k = d - 1; k >= s; k--) if (bars[k].close < bars[k].open) { gap = { bot: Lo(k), top: H(k), start: k, from: d + 1, formed: d }; break; }
+        } else if (zoneKind === "breaker") {
+          for (let k = s - 1; k >= Math.max(pv + 1, Math.min(q, s - 1) - L); k--) if (bars[k].close > bars[k].open) { gap = { bot: Lo(k), top: H(k), start: k, from: d + 1, formed: d }; break; }
+        } else if (zoneKind === "ote") {
+          gap = { bot: NaN, top: NaN, start: s, from: d + 1, formed: d, ote: true };
+        } else {
+          const fvgAt = (c) => { const bot = H(c - 1), top = Lo(c + 1);
+            return top - bot > p.fvgMinATR * atrD && top > bot ? { bot, top, start: c - 1, from: c + 2, formed: c + 1 } : null; };
+          for (let c = d; c >= s + 1; c--) if ((gap = fvgAt(c))) break;
+          if (p.fvgAfterBars > 0) {
+            gaps = gap ? [gap] : [];
+            for (let c = d + 1; c <= Math.min(d + p.fvgAfterBars, i - 2 + (waiting ? 1 : 0)); c++) { const g = fvgAt(c); if (g) gaps.push(g); }
+            gap = gaps.at(-1) || null;
+          }
+        }
+        if (!gap || ((ob || zoneKind === "breaker") && !(gap.top < bd.close))) continue;
+        // the stop goes beyond the order block's low (it is at or above the sweep's low), else the sweep's
+        const stopLevel = ob ? gap.bot : sweepLow;
+        // OTE levels from the dealing range: the swept low to the highest high of bars s..t
+        let rh = -Infinity, rhAt = s - 1;
+        const oteAt = (t) => { for (; rhAt < t; ) rh = Math.max(rh, H(++rhAt));
+          gap.top = rh - p.oteLow * (rh - sweepLow); gap.bot = rh - p.oteHigh * (rh - sweepLow); };
+        // first revisit must be the last bar; stop must not have been hit since
+        // (the most recent structure shift decides: a used or broken setup means no trade).
+        // With later gaps, every gap of the setup must still be untouched ("missed").
+        let ok = true;
+        for (const g of gaps || [gap]) for (let j = g.from; ok && j < i; j++) {
+          if (g.ote) oteAt(j - 1);
+          if (Lo(j) <= g.top) ok = false;
+        }
+        for (let j = d + 1; ok && j <= i; j++) if (Lo(j) <= stopLevel) ok = false;
+        if (!ok) return null;
+        const b = bars[i];
+        if (gap.ote) oteAt(i - 1);
+        const touched = i >= gap.from && Lo(i) <= gap.top;
+        if (touched && !(b.close > gap.bot)) return null;
+        if (gap.ote && !touched) oteAt(i);   // waiting: the zone from every closed bar
+        // Waiting: price is still above the gap. The plan enters at the gap's top, the price
+        // reaches first, so stop and target are worked out from there.
+        const entry = touched ? b.close : gap.top;
+        const slDist = entry - stopLevel + p.stopBufferATR * atrI;
+        if (slDist < p.minStopATR * atrI) return null;
+        // dealing range: the swept low to the highest high since the sweep (closed bars only)
+        let rangeHigh = -Infinity;
+        for (let j = s; j <= i; j++) rangeHigh = Math.max(rangeHigh, H(j));
+        const depth = rangeHigh > sweepLow ? (entry - sweepLow) / (rangeHigh - sweepLow) : 1;   // 0 = the low, 1 = the high
+        if (p.pdFilter === "discount" && !(depth <= 0.5)) return null;
+        if (p.pdFilter === "ote" && !(depth >= 1 - p.oteHigh && depth <= 1 - p.oteLow)) return null;
+        let tpDist = p.rMultiple * slDist, targetNote = `${p.rMultiple}R`;
+        if (p.target === "liquidity") {
+          let best = Infinity;
+          for (let j = i - L; j >= Math.max(L, i - p.liqLookback); j--) if (isHigh(j) && H(j) > entry) best = Math.min(best, H(j));
+          if (Number.isFinite(best)) { tpDist = best - entry; targetNote = "the nearest swing high"; }
+        }
+        return { kind: touched ? "entry" : "pending", level, mss, sweepLow, stopLevel, gap, entry, slDist, tpDist, targetNote,
+                 sweepAgo: i - s, atr: atrI, d, gapBar: gap.formed, depth, pool, later: gap.formed > d + 1 };
       }
-      if (!gap || (ob && !(gap.top < bd.close))) continue;
-      // the stop goes beyond the order block's low (it is at or above the sweep's low), else the sweep's
-      const stopLevel = ob ? gap.bot : sweepLow;
-      // first revisit must be the last bar; stop must not have been hit since
-      // (the most recent structure shift decides: a used or broken setup means no trade)
-      let ok = true;
-      for (let j = gap.from; ok && j < i; j++) if (Lo(j) <= gap.top) ok = false;
-      for (let j = d + 1; ok && j <= i; j++) if (Lo(j) <= stopLevel) ok = false;
-      if (!ok) return null;
-      const b = bars[i];
-      const touched = i >= gap.from && Lo(i) <= gap.top;
-      if (touched && !(b.close > gap.bot)) return null;
-      // Waiting: price is still above the gap. The plan enters at the gap's top, the price
-      // reaches first, so stop and target are worked out from there.
-      const entry = touched ? b.close : gap.top;
-      const slDist = entry - stopLevel + p.stopBufferATR * atrI;
-      if (slDist < p.minStopATR * atrI) return null;
-      // dealing range: the swept low to the highest high since the sweep (closed bars only)
-      let rangeHigh = -Infinity;
-      for (let j = s; j <= i; j++) rangeHigh = Math.max(rangeHigh, H(j));
-      const depth = rangeHigh > sweepLow ? (entry - sweepLow) / (rangeHigh - sweepLow) : 1;   // 0 = the low, 1 = the high
-      if (p.pdFilter === "discount" && !(depth <= 0.5)) return null;
-      if (p.pdFilter === "ote" && !(depth >= 1 - p.oteHigh && depth <= 1 - p.oteLow)) return null;
-      let tpDist = p.rMultiple * slDist, targetNote = `${p.rMultiple}R`;
-      if (p.target === "liquidity") {
-        let best = Infinity;
-        for (let j = i - L; j >= Math.max(L, i - p.liqLookback); j--) if (isHigh(j) && H(j) > entry) best = Math.min(best, H(j));
-        if (Number.isFinite(best)) { tpDist = best - entry; targetNote = "the nearest swing high"; }
-      }
-      return { kind: touched ? "entry" : "pending", level, mss, sweepLow, stopLevel, gap, entry, slDist, tpDist, targetNote,
-               sweepAgo: i - s, atr: atrI, d, gapBar: gap.formed, depth };
     }
   }
   return null;
@@ -528,18 +643,25 @@ export function evaluateICT(bars, p = ICT_DEFAULTS) {
     return out.length ? `; ${out.join("; ")}` : "";
   };
   const ob = p.entryZone === "ob", tag = ob ? "smc" : "ict";
-  const zoneName = (side) => (ob ? `${side === "BUY" ? "bullish" : "bearish"} order block` : "fair value gap");
+  const zoneName = (side) => { const dir = side === "BUY" ? "bullish" : "bearish";
+    return ob ? `${dir} order block` : p.entryZone === "breaker" ? `${dir} breaker block`
+         : p.entryZone === "ote" ? "optimal trade entry zone (62% to 79% back)" : "fair value gap"; };
+  // What was swept: a swing point, the previous day's low/high or the Asian session's.
+  const pooled = (q, side) => { const w = side === "BUY" ? "low" : "high";
+    return q.pool === "prevDay" ? `the previous day's ${w}` : q.pool === "asia" ? `the Asian session ${w}` : `the ${w}`; };
+  // A setup is named after its structure shift; a later gap (fvgAfterBars) is a new plan.
+  const idOf = (q, side) => `${tag}:${side}:${bars[q.d].epoch}${q.later ? `:${bars[q.gapBar].epoch}` : ""}`;
   // A setup that has formed but waits for price: a plan the bot can enter on a later tick.
   const waiting = (q, side) => {
     const s = side === "BUY" ? 1 : -1, v = (x) => s * x;   // mirror prices back for sells
     const sl = v(q.entry - q.slDist), tp = v(q.entry + q.tpDist);
     const zone = side === "BUY" ? [q.gap.bot, q.gap.top] : [-q.gap.top, -q.gap.bot];
-    return { ...res, setupId: `${tag}:${side}:${bars[q.d].epoch}`,
+    return { ...res, setupId: idOf(q, side),
       info: { ...res.info, sweptLevel: v(q.level), structureLevel: v(q.mss), gapLow: zone[0], gapHigh: zone[1] },
-      pending: { id: `${tag}:${side}:${bars[q.d].epoch}`, side, zone, sl, tp, sticky: true, since: bars[q.gap.start].epoch,
+      pending: { id: idOf(q, side), side, zone, sl, tp, sticky: true, since: bars[q.gap.start].epoch,
         expiresAt: bars[q.gapBar].epoch + sec * (1 + (p.pendingBars ?? PENDING_BARS)), invalidateAt: v(q.stopLevel),
         horizonBars: p.horizonBars,
-        reason: `Swept the ${side === "BUY" ? "low" : "high"} at ${fmt(v(q.level))} and broke structure ${side === "BUY" ? "up above" : "down below"} ` +
+        reason: `Swept ${pooled(q, side)} at ${fmt(v(q.level))} and broke structure ${side === "BUY" ? "up above" : "down below"} ` +
                 `${fmt(v(q.mss))}. Waiting for price to come back to the ${zoneName(side)} (${fmt(zone[0])} to ${fmt(zone[1])}); ` +
                 `target ${side === "BUY" ? q.targetNote : q.targetNote.replace("swing high", "swing low")}${checks(q, side)}` } };
   };
@@ -547,15 +669,15 @@ export function evaluateICT(bars, p = ICT_DEFAULTS) {
   const bull = canBuy ? ictBullish(bars, tr, p) : null;
   const bear = bull?.kind === "entry" || !canSell ? null : ictBullish(flipped, tr, p);
   if (bull?.kind === "entry") {
-    return { ...res, action: "BUY", slDist: bull.slDist, tpDist: bull.tpDist, horizonBars: p.horizonBars, setupId: `${tag}:BUY:${bars[bull.d].epoch}`,
+    return { ...res, action: "BUY", slDist: bull.slDist, tpDist: bull.tpDist, horizonBars: p.horizonBars, setupId: idOf(bull, "BUY"),
       info: { ...res.info, sweptLevel: bull.level, structureLevel: bull.mss, gapLow: bull.gap.bot, gapHigh: bull.gap.top },
-      reason: `Swept the low at ${fmt(bull.level)}, broke structure up above ${fmt(bull.mss)}, ` +
+      reason: `Swept ${pooled(bull, "BUY")} at ${fmt(bull.level)}, broke structure up above ${fmt(bull.mss)}, ` +
               `entering the ${zoneName("BUY")} (${fmt(bull.gap.bot)} to ${fmt(bull.gap.top)}); target ${bull.targetNote}${checks(bull, "BUY")}` };
   }
   if (bear?.kind === "entry") {
-    return { ...res, action: "SELL", slDist: bear.slDist, tpDist: bear.tpDist, horizonBars: p.horizonBars, setupId: `${tag}:SELL:${bars[bear.d].epoch}`,
+    return { ...res, action: "SELL", slDist: bear.slDist, tpDist: bear.tpDist, horizonBars: p.horizonBars, setupId: idOf(bear, "SELL"),
       info: { ...res.info, sweptLevel: -bear.level, structureLevel: -bear.mss, gapLow: -bear.gap.top, gapHigh: -bear.gap.bot },
-      reason: `Swept the high at ${fmt(-bear.level)}, broke structure down below ${fmt(-bear.mss)}, ` +
+      reason: `Swept ${pooled(bear, "SELL")} at ${fmt(-bear.level)}, broke structure down below ${fmt(-bear.mss)}, ` +
               `entering the ${zoneName("SELL")} (${fmt(-bear.gap.top)} to ${fmt(-bear.gap.bot)}); target ` +
               bear.targetNote.replace("swing high", "swing low") + checks(bear, "SELL") };
   }

@@ -1,8 +1,92 @@
-# Strategy backtests: ICT, Rules and AI (6 October 2026, updated 16 October 2026)
+# Strategy backtests: ICT, Rules and AI (6 October 2026, updated 16 and 20 October 2026)
 
 Short version: none of the three strategies makes money after realistic costs in an out-of-sample test. The new ICT strategy behaves like a coin flip on simulated Volatility 75 (as anything must on a random walk), and on real EURUSD it loses after costs on M1 and M15. One row (ICT on H1) is slightly positive, but with 75 trades in two years its uncertainty is about five times the result, so it is not evidence of an edge.
 
 All numbers are in R: 1R is the amount risked on a trade, so a stop loss costs -1R and +0.05R means winning 5% of the risk per trade on average. "±" is the 95% confidence interval of the average. If the interval includes zero, the result cannot be told apart from luck.
+
+## Update, 20 October 2026: ICT audit on 11 markets, and five standard ICT additions
+
+**Short version.** The ICT code is not missing entries by mistake: an independent re-count of every stage agrees with the bot's own trades to within 2%. It is selective on purpose. Of every 100 liquidity sweeps, about 35 break structure, 17 to 19 do so with a big enough candle, and 3 to 5 end up as trades. Five standard ICT ideas were added as options: previous-day and Asian-session liquidity, breaker block and OTE entries, a market structure shift by any close, and a second gap when price never came back to the first. They were chosen on 2010 to 2021 and tested once on 2022 to 2025, on 11 markets. None of them makes ICT profitable after costs. Before costs, every row is within about ±0.05R of zero.
+
+- **1 hour (real markets): changed.** The pick was *MSS by close* together with *a later gap*. It gives about 60% more trades (0.90 a day across the 11 markets, up from 0.55). Out of sample it lost less: −0.03 ± 0.06R a trade, against −0.07 ± 0.08R. Total R, worst drawdown and losing months were the same or better. That passes the rule "not worse out of sample", so `ictParamsFor` now turns both on for real markets on 1h. The difference is well inside the noise. It is **not** evidence of an edge, and the strategy still loses a little after costs.
+- **15 minutes: unchanged.** The pick (*a later gap*) was slightly worse out of sample: −0.080R against −0.071R a trade, and −203R against −157R in total. It stays off.
+- **Liquidity pools (previous day, Asian range), order block, breaker and OTE entries** were all worse in the 2010 to 2021 training years on both timeframes. They stay in the code as options, off.
+- **More trades is possible, but not for free.** Everything on together gives 2.8 trades a day on 15m (instead of 1.5) and 1.4 on 1h (instead of 0.55). On 15m the average per trade stays about the same, so the total loss doubles (−315R against −157R in 2022 to 2025). On 1h it looked better in 2022 to 2025 (−0.01R a trade) but was worse than the pick in training. The biggest single cut in the funnel is the kill zone: on 15m it removes 63% of otherwise valid entries. Turning it off would roughly triple the trades. It was not part of this test, and on EURUSD (16 October) trading all day did not do better.
+
+### Funnel: where the setups go (current rules, 2010 to 2025, 11 markets, buys and sells)
+
+Re-counted bar by bar with the same rules as `ictBullish` (15m with kill zones, 1h with the 4h trend, as the bot runs them on real markets). Per day is per calendar day, summed over the 11 markets.
+
+| Stage | 15m count | 15m per day | 1h count | 1h per day |
+|---|---:|---:|---:|---:|
+| Wick through the latest untouched swing low/high | 530,598 | 91.3 | 139,926 | 24.1 |
+| ... and the bar closes back inside (the sweep) | 247,545 | 42.6 | 68,230 | 11.7 |
+| Close beyond the internal swing within 10 bars (MSS) | 87,205 | 15.0 | 24,543 | 4.2 |
+| That breaking bar's body is ≥ 1 ATR (displacement) | 42,629 | 7.3 | 12,749 | 2.2 |
+| A fair value gap in the leg | 36,216 | 6.2 | 10,572 | 1.8 |
+| First revisit within 15 bars, closing in or above the gap | 24,311 | 4.2 | 6,614 | 1.1 |
+| Stop at least 0.5 ATR | 24,309 | 4.2 | 6,614 | 1.1 |
+| Inside a kill zone (15m) / with the 4h trend (1h) | 9,017 | 1.55 | 3,475 | 0.60 |
+| Became a trade in the backtest | 8,214 | 1.41 | 3,159 | 0.54 |
+
+What each condition removes:
+
+- **No structure shift within 10 bars:** 65% of sweeps on both timeframes. Most sweeps are not reversals, and this is the core of the setup.
+- **The breaking bar must itself be ≥ 1 ATR:** about half of the remaining shifts (51% on 15m, 48% on 1h). At 0.7 ATR, 68% to 70% would pass. If the big candle may be anywhere in the leg, 65% to 67% pass.
+- **No gap in the leg:** 15% to 17%.
+- **Revisit:** a third are lost. On 15m that is 6,847 never revisited in 15 bars (3,050 of them were revisited 16 to 60 bars later), 4,121 that closed through the gap, and 937 that hit the stop first. The 1h split is similar.
+- **Minimum stop (0.5 ATR):** removes nothing. The sweep already puts the stop far enough away.
+- **Kill zone:** 63% of otherwise valid 15m entries. **4h trend:** 47% of 1h entries (40% against the trend, 7% with no clear trend).
+- **Already in a trade, or a newer setup takes over:** about 9%.
+- **Bars required (history):** only affects the first 109 to 220 bars of the data.
+
+### Results (pooled over the 11 markets; costs as a round trip in basis points of price)
+
+Costs: FX 0.8bp (pessimistic 1.5), EURJPY/GBPJPY/SPX 1.5 (3), gold 2 (4). Win rate and gross R are before costs. Max drawdown is in R over the pooled trade sequence. Losing months counts calendar months with a negative total after main costs.
+
+Chosen on 2010 to 2021 (best average after main costs), then tested once on 2022 to 2025:
+
+| Timeframe | Variant | Period | Trades | Per day (11 mk) | Win | Gross R | Avg R, main costs | Avg R, pessimistic | Total R (main) | Max DD (R) | Losing months |
+|---|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 15m | current | 2010-21 | 6030 | 1.38 | 40.2% | +0.012 | −0.049 ± 0.031 | −0.107 ± 0.031 | −297 | 354 | 60% |
+| 15m | current | **2022-25** | 2212 | 1.51 | 38.4% | −0.009 | **−0.071 ± 0.052** | −0.129 ± 0.052 | −157 | 161 | 67% |
+| 15m | pick: later gap | 2010-21 | 7078 | 1.61 | 42.0% | +0.018 | −0.036 ± 0.027 | −0.087 ± 0.027 | −255 | 281 | 57% |
+| 15m | pick: later gap | **2022-25** | 2530 | 1.73 | 39.4% | −0.025 | **−0.080 ± 0.046** | −0.131 ± 0.046 | −203 | 233 | 69% |
+| 1h | current | 2010-21 | 2419 | 0.55 | 43.4% | +0.008 | −0.019 ± 0.044 | −0.044 ± 0.044 | −45 | 89 | 53% |
+| 1h | current | **2022-25** | 800 | 0.55 | 39.5% | −0.039 | **−0.066 ± 0.079** | −0.091 ± 0.079 | −53 | 58 | 60% |
+| 1h | pick: MSS by close + later gap | 2010-21 | 3816 | 0.87 | 45.9% | +0.017 | −0.005 ± 0.031 | −0.026 ± 0.031 | −19 | 81 | 55% |
+| 1h | pick: MSS by close + later gap | **2022-25** | 1322 | 0.90 | 43.3% | −0.006 | **−0.028 ± 0.055** | −0.048 ± 0.055 | −37 | 57 | 60% |
+
+The 10 variants on 2010 to 2021 (these chose the picks):
+
+| Variant | 15m trades/day | 15m avg R (main) | 1h trades/day | 1h avg R (main) |
+|---|---:|---:|---:|---:|
+| current | 1.38 | −0.049 ± 0.031 | 0.55 | −0.019 ± 0.044 |
+| + previous-day and Asian (00-05 UTC) liquidity | 1.59 | −0.059 ± 0.029 | 0.71 | −0.049 ± 0.038 |
+| order block entry | 1.28 | −0.126 ± 0.036 | 0.44 | −0.067 ± 0.060 |
+| breaker block entry | 1.46 | −0.106 ± 0.032 | 0.50 | −0.050 ± 0.053 |
+| OTE entry (62-79%) | 1.45 | −0.098 ± 0.033 | 0.50 | −0.075 ± 0.054 |
+| displacement 0.7 ATR | 1.63 | −0.046 ± 0.028 | 0.68 | −0.029 ± 0.040 |
+| MSS by close (displacement anywhere in the leg) | 1.56 | −0.048 ± 0.029 | 0.66 | −0.015 ± 0.040 |
+| later gap (fvgAfterBars 10) | 1.61 | **−0.036 ± 0.027** | 0.72 | −0.008 ± 0.035 |
+| MSS by close + later gap | 1.85 | −0.041 ± 0.025 | 0.87 | **−0.005 ± 0.031** |
+| all of the "more entries" options (liquidity, MSS by close, 0.7 ATR, later gap) | 2.53 | −0.047 ± 0.022 | 1.33 | −0.022 ± 0.025 |
+
+For information only (not used to choose), 2022 to 2025 for every variant, average R after main costs: 15m from −0.061 (0.7 ATR) to −0.186 (order block). 1h from −0.005 (breaker, 768 trades) to −0.081 (liquidity pools). The breaker and order block rows look better on 1h in these years, the opposite of training. That flip is what noise looks like at these sample sizes. On 1h the new default made money on 6 of the 11 markets out of sample (current rules: 3 of 11).
+
+### What the new options do (all in `ICT_DEFAULTS`, off)
+
+- `liqPrevDay`, `liqAsia`, `asiaHours`: besides the latest swing low, the previous trading day's low (Friday on a Monday) and today's Asian-range low (00:00 to 05:00 UTC, swept only after the range closes) count as liquidity, if still untouched. The bot needs 4 days of candles for this (capped at 4000).
+- `entryZone: "breaker"`: the last up-close candle before the down move that took the low. Displacement must close above it, and the entry is on the way back. The stop goes beyond the sweep low. `entryZone: "ote"`: entry when price comes 62% to 79% back from the highest high since the sweep toward the swept low. `entryZone: "ob"` (order block, 16 October) is unchanged.
+- `mssClose`: the first close above the internal swing high is the structure shift, whatever the size of that candle. The displacement (`dispATR`) may come from any candle of the leg from the sweep to that close.
+- `fvgAfterBars`: gaps that form up to N bars after the shift count too. The newest gap is the entry, but only while no gap of the setup has been revisited. So a second gap is used only when price never came back to the first, and a setup is never traded twice. A plan for a later gap gets its own id, so the "Waiting for price" plan moves to it.
+
+Unit tests: `test/ict-audit.test.mjs`. With all options off the backtest trades are identical, trade for trade, to the code before the audit (checked on all 22 market and timeframe files).
+
+### Method notes
+
+- Data: HistData M1, 2010 to 2025, resampled to 15m and 1h exactly as `tools/backtest.mjs` does. The driver runs the bot's own `evaluateICT` with `ictParamsFor(tf, {real: true})` and the trade loop copied from `tools/backtest.mjs`: entry at the signal bar's close, stop first if both are hit in one bar, a time exit, one trade at a time per market.
+- Ten variants in all, chosen per timeframe by the best average R after main costs on 2010 to 2021, all 11 markets pooled. Each was tested once on 2022 to 2025. The rule for changing a default was decided before the test: only if the pick is not worse out of sample, and more trades alone is not a reason.
 
 ## Update, 16 October 2026: a "smarter" ICT, and an SMC test
 

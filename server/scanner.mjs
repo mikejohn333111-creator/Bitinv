@@ -34,6 +34,8 @@ const COOLDOWN_MS = 2 * 60000;       // between two "Scan now"
 const CLOSE_DELAY_S = 30;            // after a candle closes, wait this long so Deriv has it
 const BACKOFF_MS = [60000, 120000, 300000, 600000, 900000];   // when Deriv says to slow down
 const MAX_ITEMS = 40;
+/** Timeframes SMC is scanned on. */
+export const SMC_TFS = [3600];
 const STRATEGY_NAMES = { ict: "ICT", smc: "SMC", ai: "AI model" };
 const TF_NAMES = { 900: "15m", 3600: "1h" };
 // Which markets come first when there are more than MAX_MARKETS.
@@ -163,7 +165,8 @@ export function scanSeries({ symbol, name = symbol, tf, candles, synthetic = fal
   const base = { symbol, name, tf, at: closedAt };
   const results = [
     ["ict", evaluateICT(bars, ictParamsFor(tf, { real: !synthetic }))],
-    ["smc", evaluateICT(bars, smcParamsFor(tf, { real: !synthetic }))],
+    // SMC on 1h only: on 15m it lost clearly after costs (11 markets, 2010-2025: -0.11 to -0.15R a trade).
+    ...(SMC_TFS.includes(tf) ? [["smc", evaluateICT(bars, smcParamsFor(tf, { real: !synthetic }))]] : []),
     ...(model && aiSettings ? [["ai", evaluateAI(bars, model, aiParams(aiSettings))]] : []),
   ];
   for (const [strategy, res] of results) {

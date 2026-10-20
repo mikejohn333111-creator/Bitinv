@@ -278,10 +278,10 @@ test("scanSeries: real markets use ICT's real-market filters (kill zones on 15m)
 });
 
 const OB_TOUCH = [101.8, 101.9, 98.2, 99.2];   // trades back down into the order block (96.5 to 98.4)
-test("scanSeries: SMC, ICT's setup entered at the order block: a plan waiting for price, then ready once price is in the block", () => {
-  const rows = ictRows([HOLD, HOLD]);
-  const nowMs = nowAfter(rows);
-  const { items } = scanSeries({ symbol: "R_50", tf: 900, candles: candles(rows), synthetic: true, nowMs });
+test("scanSeries: SMC (1h only), ICT's setup entered at the order block: a plan waiting for price, then ready once price is in the block", () => {
+  const H = 3600, rows = ictRows([HOLD, HOLD]);
+  const nowMs = nowAfter(rows, H);
+  const { items } = scanSeries({ symbol: "R_50", tf: H, candles: candles(rows, H), synthetic: true, nowMs });
   const ict = items.find((i) => i.strategy === "ict"), smc = items.find((i) => i.strategy === "smc");
   assert.ok(ict && smc, JSON.stringify(items));
   assert.equal(smc.status, "waiting");
@@ -292,29 +292,32 @@ test("scanSeries: SMC, ICT's setup entered at the order block: a plan waiting fo
   assert.equal(smc.rr, 3, "3R target");
   assert.match(smc.reason, /Waiting for price to come back to the bullish order block/);
   assert.notEqual(smc.id, ict.id, "the same candles, but a different plan id");
-  assert.match(smc.id, /^R_50:900:smc:BUY:/);
+  assert.match(smc.id, /^R_50:3600:smc:BUY:/);
   // price has gone below the block: the plan is gone
   const broken = [...rows.slice(0, -1), [101.8, 101.8, 96, 96]];
-  assert.equal(scanSeries({ symbol: "R_50", tf: 900, candles: candles(broken), synthetic: true, nowMs }).items.filter((i) => i.strategy === "smc").length, 0);
+  assert.equal(scanSeries({ symbol: "R_50", tf: H, candles: candles(broken, H), synthetic: true, nowMs }).items.filter((i) => i.strategy === "smc").length, 0);
   // inside the block now
   const inside = [...rows.slice(0, -1), [101.8, 101.8, 97.5, 97.5]];
-  assert.equal(scanSeries({ symbol: "R_50", tf: 900, candles: candles(inside), synthetic: true, nowMs }).items.find((i) => i.strategy === "smc").inZone, true);
+  assert.equal(scanSeries({ symbol: "R_50", tf: H, candles: candles(inside, H), synthetic: true, nowMs }).items.find((i) => i.strategy === "smc").inZone, true);
 
   // a closed candle dipped into the block: ready now, at that candle's close, with 3R and the 60-candle time limit
   const touch = ictRows([OB_TOUCH, HOLD]);
-  const ready = scanSeries({ symbol: "R_50", tf: 900, candles: candles(touch), synthetic: true, nowMs: nowAfter(touch) }).items;
+  const ready = scanSeries({ symbol: "R_50", tf: H, candles: candles(touch, H), synthetic: true, nowMs: nowAfter(touch, H) }).items;
   const s2 = ready.find((i) => i.strategy === "smc"), i2 = ready.find((i) => i.strategy === "ict");
   assert.ok(s2 && i2, JSON.stringify(ready));
   assert.equal(s2.status, "ready");
   assert.equal(s2.entry, 99.2);
-  const closed = touch.slice(0, -1).map(([o, h, l, c], k) => ({ epoch: T0 + k * 900, open: o, high: h, low: l, close: c }));
-  const res = evaluateICT(closed, smcParamsFor(900, { real: false }));
+  const closed = touch.slice(0, -1).map(([o, h, l, c], k) => ({ epoch: T0 + k * H, open: o, high: h, low: l, close: c }));
+  const res = evaluateICT(closed, smcParamsFor(H, { real: false }));
   assert.equal(res.action, "BUY");
   assert.ok(Math.abs(s2.sl - (99.2 - res.slDist)) < 1e-6 && Math.abs(s2.tp - (99.2 + res.tpDist)) < 1e-6);
   assert.equal(s2.rr, 3);
-  assert.equal(s2.end, closed.at(-1).epoch + 61 * 900, "the 60-candle time limit");
+  assert.equal(s2.end, closed.at(-1).epoch + 61 * H, "the 60-candle time limit");
   assert.match(s2.reason, /entering the bullish order block/);
   assert.notEqual(s2.id, i2.id, "ICT and SMC on the same candle are two setups");
+  // SMC is scanned on 1h only: on 15m the same candles give ICT and no SMC
+  const m15 = scanSeries({ symbol: "R_50", tf: 900, candles: candles(touch), synthetic: true, nowMs: nowAfter(touch) }).items;
+  assert.ok(m15.some((i) => i.strategy === "ict") && !m15.some((i) => i.strategy === "smc"));
 });
 
 test("smcParamsFor: ICT's settings for the timeframe and market, with the order block entry, 3R and 60 candles", () => {

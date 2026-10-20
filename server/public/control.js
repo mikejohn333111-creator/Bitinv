@@ -4,7 +4,7 @@ const $ = (id) => document.getElementById(id);
 const POLL_MS = 3000;
 const SCAN_POLL_MS = 15000, SCAN_BUSY_MS = 3000;   // the scanner list is asked for less often than the status
 const ui = { screen: "loading", status: null, lastSeq: 0, stateKey: null, timer: null, dirty: new Set(), restart: null, chart: null,
-             scan: null, scanAt: 0, scanSkew: 0, scanSig: "", scanSaving: false, focusId: null };
+             scan: null, scanAt: 0, scanSkew: 0, scanSig: "", scanSaving: false, scanAutoSaving: false, focusId: null };
 
 // ------------------------------------------------------------- helpers
 async function api(method, path, body) {
@@ -155,8 +155,10 @@ function detailText(s) {
   }
   if (s.fastBlocked && s.mode === "auto") return "Fast mode is demo only, so the bot places no trades on this REAL account. Switch to a demo account or turn fast mode off.";
   if (s.ictBlocked) return "ICT is demo only for auto trade, so the bot places no trades on this REAL account. Switch to a demo account or use Signals only.";
+  if (s.scanAutoBlocked && s.mode === "auto") return "Scanner auto-trade is demo only, so it places no trades on this REAL account. Switch to a demo account or turn it off under Settings > Scanner.";
   if (s.halted) return `The daily loss limit was hit (${s.haltReason}). The bot carries on tomorrow (UTC). Press Stop to stop it fully.`;
   let t = s.mode === "auto" ? `Auto trading ${s.symbolName} with ${strat}.` : `Watching ${s.symbolName} for signals with ${strat}. Nothing is traded.`;
+  if (s.mode === "auto" && s.scanAuto?.on) t += " It also takes the scanner's ready setups (demo only).";
   if (s.resumedAt && Date.now() - s.resumedAt < 12 * 3600e3) t += ` It carried on by itself after a server restart at ${when(s.resumedAt)}.`;
   if (s.marketOpen === false) t += ` ${s.symbolName} is closed now, so nothing is traded until it opens.`;
   else if (s.pending) t += " A setup has formed: waiting for price to come back to the entry zone.";
@@ -211,6 +213,7 @@ function render(s) {
   renderTrades(s);
   renderSignal(s);
   renderSettings(s);
+  renderScanAuto();
   renderChart(s);
 }
 
@@ -244,7 +247,16 @@ function renderTrades(s) {
       btn.type = "button";
       btn.dataset.close = t.id;
       btn.setAttribute("aria-label", `Close trade ${t.id}`);
-      li.append(el("span", "tag"), el("div", "title"), el("span", "profit"), el("div", "sub"), btn);
+      const btns = el("div", "trade-btns");
+      btns.append(btn);
+      if (t.source === "scanner") {   // a scanner trade is often on another market: its plan is drawn on that market's chart
+        const show = el("button", "btn small", "Chart");
+        show.type = "button";
+        show.dataset.chart = t.id;
+        show.setAttribute("aria-label", `Show trade ${t.id} on the chart`);
+        btns.append(show);
+      }
+      li.append(el("span", "tag"), el("div", "title"), el("span", "profit"), el("div", "sub"), btns);
       list.append(li);
     }
     li.children[0].className = `tag ${t.side}`;
@@ -252,9 +264,15 @@ function renderTrades(s) {
     li.querySelector(".title").textContent = `Stake ${Number.isFinite(t.stake) ? nf2.format(t.stake) : "–"}`;
     const bits = [t.symbol || s.symbol];
     if (t.opened) bits.push(`opened ${when(t.opened)}`);
-    if (t.horizon) bits.push(`closes after ${t.horizon} min`);
+    if (t.horizon) { const min = Math.round((t.horizon * (t.barSec || 60)) / 60); bits.push(`closes after ${min < 120 || min % 60 ? `${min} min` : `${min / 60} hours`}`); }
     if (t.closing) bits.push("closing");
-    li.querySelector(".sub").textContent = bits.join(" · ");
+    const sub = li.querySelector(".sub");
+    if (t.source === "scanner") {
+      // "from Scanner · ICT 15m EUR/USD"
+      const sc = t.scan || {};
+      bits[0] = el("span", "from", `from Scanner · ${[STRATEGY_NAME[sc.strategy] || "", TF_SHORT[sc.tf] || "", sc.name || t.symbol].filter(Boolean).join(" ")}`);
+      sub.replaceChildren(...bits.flatMap((b, k) => (k ? [" · ", b] : [b])));
+    } else sub.textContent = bits.join(" · ");
     const p = li.querySelector(".profit");
     p.textContent = signed(t.profit, s.currency);
     p.className = `profit ${t.profit > 0 ? "pos" : t.profit < 0 ? "neg" : ""}`;
@@ -336,6 +354,7 @@ function scanItem(it) {
   const status = el("span", "scan-status");
   status.append(el("span", `scan-pill ${it.status}`, it.status === "ready" ? "Ready now" : it.inZone ? "Price in the zone" : "Waiting for price"),
                 el("span", "scan-strat", STRATEGY_NAME[it.strategy] || it.strategy));
+  if (it.traded) status.append(el("span", "scan-traded", "Traded"));
   const nums = el("span", "scan-nums");
   const num = (label, v, cls = "") => { const x = el("span", `scan-num ${cls}`.trim()); x.append(el("span", "k", label), el("span", "v", v)); return x; };
   nums.append(it.status === "waiting" && it.zone ? num("Entry zone", `${px(it.zone[0])} – ${px(it.zone[1])}`, "wide") : num("Entry", px(it.entry)),
@@ -348,7 +367,7 @@ function scanItem(it) {
     if (it.against.length) ag.append(el("span", "no", `Against: ${it.against.join(" · ")}`));
     b.append(ag);
   }
-  b.setAttribute("aria-label", `${it.side} ${it.name}, ${STRATEGY_NAME[it.strategy]} on ${TF_SHORT[it.tf]}, ${it.status === "ready" ? "ready now" : "waiting for price"}, ` +
+  b.setAttribute("aria-label", `${it.side} ${it.name}, ${STRATEGY_NAME[it.strategy]} on ${TF_SHORT[it.tf]}, ${it.status === "ready" ? "ready now" : "waiting for price"}${it.traded ? ", traded by auto-trade" : ""}, ` +
                                `entry ${px(it.entry)}, stop loss ${px(it.sl)}, take profit ${px(it.tp)}. Show on the chart.`);
   li.append(b);
   return li;
@@ -368,7 +387,7 @@ function renderScanner() {
     $("scanProgressText").textContent = `Scanning ${done} of ${total} charts`;
   }
   setMsg("scanMsg", d.message);
-  const sig = JSON.stringify([items.map((i) => [i.id, i.status, i.inZone, i.agree, i.against]), ui.focusId]);
+  const sig = JSON.stringify([items.map((i) => [i.id, i.status, i.inZone, i.agree, i.against, i.traded]), ui.focusId]);
   if (sig !== ui.scanSig) { ui.scanSig = sig; $("scanList").replaceChildren(...items.map(scanItem)); }
   else renderScanAges();
   $("scanEmpty").hidden = items.length > 0 || !!d.message;
@@ -380,7 +399,9 @@ function renderScanner() {
   btn.textContent = !d.settings.on ? "Scanner is off" : d.scanning ? "Scanning…" : d.cooldownUntil ? `Scan again in ${inMin(d.cooldownUntil)} min` : "Scan now";
   // settings
   const set = d.settings;
-  $("sumScanner").textContent = set.on ? `On · ${set.timeframes.map((t) => TF_SHORT[t]).join(", ")}${set.synthetics ? " · with synthetics" : ""}` : "Off";
+  const auto = ui.status?.scanAuto || d.auto;
+  $("sumScanner").textContent = set.on ? `On · ${set.timeframes.map((t) => TF_SHORT[t]).join(", ")}${set.synthetics ? " · with synthetics" : ""}${auto?.on ? " · auto-trade" : ""}` : "Off";
+  renderScanAuto();
   if (!ui.scanSaving) {
     $("scanOn").checked = set.on;
     $("scanSynth").checked = set.synthetics;
@@ -422,6 +443,76 @@ $("scanForm").addEventListener("change", async () => {
     if (r.ok) { setMsg("scanSetMsg", r.data.settings.on ? "Saved. The scanner checks the markets again shortly." : "Saved. The scanner is off.", "ok"); showScanner(r.data); ui.scanAt = 0; }
     else setMsg("scanSetMsg", r.data.message || "Couldn't save that.", "error");
   } finally { ui.scanSaving = false; if (ui.scan) renderScanner(); }
+});
+
+/** The auto-trade line on the Scanner card: "Auto-trade: on (demo) · 2 of 4 today", and why it isn't trading now. */
+function renderScanAuto() {
+  const a = ui.status?.scanAuto || ui.scan?.auto;
+  const box = $("scanAuto");
+  box.hidden = !a;
+  if (!a) return;
+  const s = ui.status;
+  let state, why = "", cls = "scan-auto";
+  if (!a.on) state = "Auto-trade: off";
+  else if (a.blocked) { state = "Auto-trade: on, but this is a REAL account"; why = "It is demo only, so nothing is traded here."; cls += " real"; }
+  else {
+    state = `Auto-trade: on (demo) · ${a.today} of ${a.maxDay} today`;
+    cls += " on";
+    if (a.open) state += ` · ${a.open} open`;
+    if (s && !s.running) why = "It takes setups once you press Start.";
+    else if (a.waiting && !/busy/.test(a.waiting)) why = `Not taking setups now: ${a.waiting}.`;
+  }
+  box.className = cls;
+  $("scanAutoState").textContent = state;
+  $("scanAutoWhy").textContent = why;
+}
+
+/** Settings > Scanner > Auto-trade scanner setups (saved with the bot's settings; demo only). */
+function renderScanAutoForm(s) {
+  const set = s.settings, real = !!s.account && s.account.type !== "demo";
+  const f = $("scanAutoForm").elements;
+  $("scanAutoForm").classList.toggle("locked", real);
+  if (!ui.scanAutoSaving && !ui.dirty.has("scanAutoForm")) {
+    f.scanAuto.checked = !!set.scanAuto;
+    for (const c of document.querySelectorAll('input[name="scanAutoStrategy"]')) c.checked = (set.scanAutoStrategies || []).includes(c.value);
+    for (const c of document.querySelectorAll('input[name="scanAutoTf"]')) c.checked = (set.scanAutoTfs || []).includes(Number(c.value));
+    f.scanAutoMaxDay.value = set.scanAutoMaxDay;
+    f.scanAutoMaxOpen.value = set.scanAutoMaxOpen;
+  }
+  f.scanAuto.disabled = real && !set.scanAuto;   // on a real account it can be turned off, not on
+  $("scanAutoNote").hidden = !real;
+  $("scanAutoNote").textContent = "Scanner auto-trade is demo only. It never trades on a real money account. Switch to a demo account to use it.";
+}
+
+$("scanAutoForm").addEventListener("input", () => ui.dirty.add("scanAutoForm"));
+$("scanAutoForm").addEventListener("submit", (ev) => ev.preventDefault());
+$("scanAutoForm").addEventListener("change", async () => {
+  const f = $("scanAutoForm").elements;
+  const strategies = [...document.querySelectorAll('input[name="scanAutoStrategy"]:checked')].map((c) => c.value);
+  const tfs = [...document.querySelectorAll('input[name="scanAutoTf"]:checked')].map((c) => Number(c.value));
+  if (!strategies.length) return setMsg("scanAutoMsg", "Pick at least one strategy.", "error");
+  if (!tfs.length) return setMsg("scanAutoMsg", "Pick at least one timeframe.", "error");
+  const partial = { scanAuto: f.scanAuto.checked, scanAutoStrategies: strategies, scanAutoTfs: tfs,
+                    scanAutoMaxDay: Number(f.scanAutoMaxDay.value), scanAutoMaxOpen: Number(f.scanAutoMaxOpen.value) };
+  if (!Number.isFinite(partial.scanAutoMaxDay) || !Number.isFinite(partial.scanAutoMaxOpen) || f.scanAutoMaxDay.value === "" || f.scanAutoMaxOpen.value === "")
+    return setMsg("scanAutoMsg", "Please fill in both numbers.", "error");
+  ui.scanAutoSaving = true;
+  try {
+    const r = await saveSettings(partial);
+    if (r.ok) {
+      ui.dirty.delete("scanAutoForm");
+      const on = r.data.settings.scanAuto;
+      const adjusted = r.data.settings.scanAutoMaxDay !== partial.scanAutoMaxDay || r.data.settings.scanAutoMaxOpen !== partial.scanAutoMaxOpen;
+      setMsg("scanAutoMsg", `${on ? "Saved. Auto-trade is on (demo only)." : "Saved. Auto-trade is off."}${adjusted ? " Some numbers were outside the safe range, so they were adjusted." : ""}`, "ok");
+    } else {
+      setMsg("scanAutoMsg", r.data.message || "Couldn't save that.", "error");
+      ui.dirty.delete("scanAutoForm");
+    }
+  } finally {
+    ui.scanAutoSaving = false;
+    if (ui.status) { renderScanAutoForm(ui.status); renderScanAuto(); }
+    if (ui.scan) renderScanner();
+  }
 });
 
 // ------------------------------------------------------------- settings
@@ -513,6 +604,7 @@ function renderSettings(s) {
   const aiRadio = document.querySelector('input[name="strategy"][value="ai"]');
   aiRadio.disabled = !s.modelLoaded;
   renderFast(s);
+  renderScanAutoForm(s);
 
   // risk
   const ms = $("multiplierSelect");
@@ -617,6 +709,21 @@ $("runBtn").addEventListener("click", () => busy($("runBtn"), async () => {
 }));
 
 $("openList").addEventListener("click", (ev) => {
+  const show = ev.target.closest("[data-chart]");
+  const t = show && ui.status?.open.find((x) => x.id === show.dataset.chart);
+  if (t && ui.chart) {
+    // The trade's market and timeframe, with its plan (drawn from the status like every open trade).
+    const sc = t.scan || {};
+    ui.chart.then((c) => {
+      if (!c) return;
+      ui.focusId = null;
+      c.focus({ id: `trade:${t.id}`, tradeId: t.id, symbol: t.symbol, tf: sc.tf || 900, side: t.side, name: sc.name || t.symbol,
+                strategy: sc.strategy, status: "traded" });
+      $("chartCard").scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" });
+      announce(`Chart shows ${sc.name || t.symbol} with the open ${t.side} trade.`);
+    });
+    return;
+  }
   const btn = ev.target.closest("[data-close]");
   if (!btn) return;
   if (!confirm("Close this trade now at the current price?")) return;

@@ -190,10 +190,12 @@ fieldset { border: 0; padding: 0; margin: 12px 0; min-width: 0; }
 .trade .title { grid-area: title; font-weight: 600; font-size: 15px; overflow-wrap: anywhere; }
 .trade .sub { grid-area: sub; font-size: 13px; color: var(--muted); }
 .trade .profit { grid-area: profit; font-weight: 700; font-size: 17px; text-align: right; white-space: nowrap; }
-.trade .btn { grid-area: btn; margin-top: 8px; }
+.trade .trade-btns { grid-area: btn; display: flex; gap: 8px; margin-top: 8px; }
+.trade .trade-btns .btn { flex: 1; }
+.trade .from { color: var(--accent); font-weight: 650; }
 @media (min-width: 420px) {
   .trade { grid-template-columns: auto minmax(0, 1fr) auto auto; grid-template-areas: "tag title profit btn" "tag sub sub btn"; }
-  .trade .btn { margin-top: 0; }
+  .trade .trade-btns { margin-top: 0; flex-direction: column; gap: 6px; }
 }
 #closeAllBtn { margin-top: 10px; }
 
@@ -340,6 +342,19 @@ fieldset { border: 0; padding: 0; margin: 12px 0; min-width: 0; }
 .scan-agree { display: flex; flex-direction: column; gap: 1px; font-size: 12.5px; font-weight: 600; }
 .scan-agree .yes { color: var(--accent); }
 .scan-agree .no { color: var(--muted); }
+.scan-traded { font-weight: 800; font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; padding: 2px 8px; border-radius: 999px;
+               background: var(--info-soft); color: var(--info); }
+.scan-auto { display: flex; flex-direction: column; gap: 1px; margin: 4px 0 10px; padding: 9px 12px; border-radius: 12px; font-size: 14px;
+             background: var(--card-2); border: 1px solid var(--line); }
+.scan-auto.on { background: var(--accent-soft); border-color: transparent; }
+.scan-auto.real { background: var(--down-soft); border-color: transparent; }
+.scan-auto-state { font-weight: 700; }
+.scan-auto.on .scan-auto-state { color: var(--accent); }
+.scan-auto.real .scan-auto-state { color: var(--down); }
+.scan-auto-why { font-size: 13px; color: var(--muted); }
+.scan-auto-why:empty { display: none; }
+.scan-auto-box { margin-top: 12px; }
+.scan-auto-box.locked { background: var(--down-soft); border-color: color-mix(in srgb, var(--down) 45%, transparent); }
 #scanBtn { margin-top: 12px; }
 .scan-honesty { margin: 12px 0 0; font-size: 13px; }
 .scan-switch { padding: 10px 0; }

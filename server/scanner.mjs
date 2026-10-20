@@ -1,5 +1,6 @@
 // The scanner: the bot's own strategies run over many markets at once, for the control page's
-// "Scanner" list. Signals only: it never trades, and it only reads market data.
+// "Scanner" list. It only reads market data. With "Auto-trade scanner setups" on (demo only),
+// the engine may take its "Ready now" setups (TradingEngine.autoScan does every check and the order).
 //
 // Every 15-minute and 1-hour candle close (plus "Scan now", with a cooldown) it asks Deriv for
 // each market's candles with a one-off ticks_history on the engine's connection (no
@@ -141,8 +142,11 @@ export function scanSeries({ symbol, name = symbol, tf, candles, synthetic = fal
     if (res.action && fin(res.slDist) && fin(res.tpDist) && res.slDist > 0 && res.tpDist > 0) {
       // As the bot's handleSignal: entry at the last close, stop and target at the strategy's distances.
       const up = res.action === "BUY", entry = last.close;
+      // id is the setup's id (market, timeframe, strategy, side, candle): auto-trade takes each one once.
+      // slDist / tpDist / horizonBars are what the bot's order needs; price is the latest price when scanned.
       out.items.push({ ...base, id: `${symbol}:${tf}:${strategy}:${res.action}:${last.epoch}`, strategy, side: res.action, status: "ready",
         entry: round(entry), sl: round(up ? entry - res.slDist : entry + res.slDist), tp: round(up ? entry + res.tpDist : entry - res.tpDist),
+        slDist: round(res.slDist), tpDist: round(res.tpDist), horizonBars: res.horizonBars || 0, price: round(forming?.close ?? entry),
         rr: round(res.tpDist / res.slDist), reason: plainReason(strategy, res, res.action),
         start: last.epoch, end: res.horizonBars ? last.epoch + (res.horizonBars + 1) * tf : null, validUntil: closedAt + tf * 1000 });
     }
@@ -187,6 +191,26 @@ export function rankItems(items, trends = new Map()) {
   const minute = (ms) => Math.floor(ms / 60000);
   return ranked.sort((a, b) => (a.status === "ready" ? 0 : 1) - (b.status === "ready" ? 0 : 1) ||
     minute(b.at) - minute(a.at) || b.score - a.score || a.name.localeCompare(b.name) || a.tf - b.tf);
+}
+
+// --------------------------------------------------------------- auto-trade
+/** How far price may be from a ready setup's entry (in R, the stop distance) and still be taken. */
+export const FRESH_R = 0.25;
+
+/**
+ * Why a setup is no longer good to take now, or "" when it is: it must be ready now, found on
+ * the newest closed candle of its timeframe, and the latest price must still be inside the
+ * plan (not past the stop loss or take profit, and within FRESH_R of the entry either way).
+ */
+export function staleReason(it, nowMs) {
+  if (it.status !== "ready") return "it is waiting for price, and auto-trade only takes setups that are ready now";
+  if ((it.start + it.tf) * 1000 < closedBoundary(nowMs, it.tf, 0) * 1000) return "a newer candle has closed since it was found";
+  const up = it.side === "BUY", p = it.price, risk = it.slDist;
+  if (!fin(p) || !fin(risk) || !(risk > 0)) return "no price to check it with";
+  if (up ? p <= it.sl : p >= it.sl) return "price is already past its stop loss";
+  if (up ? p >= it.tp : p <= it.tp) return "price is already past its take profit";
+  if (Math.abs(p - it.entry) > FRESH_R * risk) return `price moved more than ${FRESH_R}R away from the entry`;
+  return "";
 }
 
 // ------------------------------------------------------------------ scanner
@@ -257,6 +281,10 @@ export class Scanner {
    */
   step() {
     this.#schedule();
+    // A finished scan: the bot may take the best ready setup (engine.autoScan does every check).
+    if (!this.inflight && !this.queue.length && this.settings.on && this.engine.autoScan) {
+      try { this.engine.autoScan(this.ranked().filter((it) => it.status === "ready")); } catch { /* tried again next step */ }
+    }
     const e = this.engine, now = this.now();
     if (!this.settings.on || this.inflight || !this.queue.length) return false;
     if (now < this.pausedUntil || now - this.lastSentAt < this.gapMs) return false;
@@ -346,10 +374,11 @@ export class Scanner {
       : "The real markets (forex, gold, stock indices) are closed right now. They open again on weekdays. Turn on synthetic indices to scan them around the clock.";
   }
 
-  /** What GET /api/scanner returns. */
-  view() {
-    const now = this.now(), s = this.settings;
-    const watch = this.watchList(), symbols = new Set(watch.map((m) => m.symbol));
+  /** The setups still valid on the markets and timeframes watched now, ranked as on the page. */
+  ranked(watch = this.watchList()) { return this.#collect(watch).items; }
+
+  #collect(watch) {
+    const now = this.now(), s = this.settings, symbols = new Set(watch.map((m) => m.symbol));
     const items = [], trends = new Map();
     let failed = 0;
     for (const [key, v] of this.series) {
@@ -359,6 +388,14 @@ export class Scanner {
       trends.set(key, v.trend);
       for (const it of v.items) if (it.validUntil > now) items.push(it);
     }
+    return { items: rankItems(items, trends), failed };
+  }
+
+  /** What GET /api/scanner returns. */
+  view() {
+    const now = this.now(), s = this.settings;
+    const watch = this.watchList();
+    const { items, failed } = this.#collect(watch);
     const scanning = s.on && (this.inflight || this.queue.length > 0);
     const next = s.on ? Math.min(...s.timeframes.map((tf) => ((this.done.get(tf) || closedBoundary(now, tf, this.closeDelay)) + tf + this.closeDelay) * 1000)) : null;
     let message = "";
@@ -372,7 +409,8 @@ export class Scanner {
       lastScanAt: this.lastScanAt || null, nextScanAt: next, cooldownUntil: this.cooldownUntil > now ? this.cooldownUntil : null,
       pausedUntil: this.pausedUntil > now ? this.pausedUntil : null,
       markets: watch.length, failed, modelLoaded: !!this.engine.model, message,
-      items: rankItems(items, trends).slice(0, MAX_ITEMS).map(({ validUntil, ...it }) => it),
+      auto: this.engine.scanAutoView?.() ?? null,
+      items: items.slice(0, MAX_ITEMS).map(({ validUntil, ...it }) => ({ ...it, traded: !!this.engine.scanTraded?.(it.id) })),
     };
   }
 }

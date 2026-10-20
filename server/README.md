@@ -21,13 +21,26 @@ No bot can guarantee profits. In our tests the strategies roughly broke even bef
 
 ### The scanner
 
-The **Scanner** card lists setups the bot's own strategies find on many markets at once, like the "AI trade scanners" you see online, but honest about what they are: signals only, nothing is traded, and our backtests found no proven edge after fees.
+The **Scanner** card lists setups the bot's own strategies find on many markets at once, like the "AI trade scanners" you see online, but honest about what they are: setups, not predictions, and our backtests found no proven edge after fees. By default nothing is traded; see **Auto-trade scanner setups** below.
 
 - It watches up to 20 open markets from Deriv's Multiplier list: real markets by default (forex majors first, then gold and silver, stock indices, other pairs), synthetic indices only if you turn them on under **Settings > Scanner**.
 - After every 15-minute and 1-hour candle close (30 seconds later) it asks Deriv for each market's candles with a one-off `ticks_history` on the bot's own connection: one request every 2 seconds, never while the bot is placing an order or reloading its trades. If Deriv answers with its rate limit, it pauses (1, 2, 5, 10, then 15 minutes) and says so on the page and in Activity. **Scan now** runs it at once, at most every 2 minutes.
 - Each market is checked exactly as the bot would on that timeframe: ICT (with the real-market filters), Rules, and the AI model when it is loaded. A card is **Ready now** (a setup on the last closed candle; entry, stop loss and take profit as the bot's signal) or **Waiting for price** (an ICT plan; its zone, stop and target, until it expires or price cancels it), with the reward to risk ratio and the reason in words.
 - Sorted by status, then freshness, then "Agrees": the 4-hour trend and the other strategies or timeframes on the same market pointing the same way. It is a count, not a win chance; there are no confidence percentages.
-- Tapping a card shows that market, timeframe and plan on the chart. To trade it, set the market in Settings.
+- Tapping a card shows that market, timeframe and plan on the chart. To trade it, set the market in Settings, or turn on auto-trade.
+
+### Auto-trade scanner setups (demo only)
+
+Under **Settings > Scanner > Auto-trade scanner setups** the bot can take the scanner's setups by itself, aiming at a few price-action trades a day. It is **off** by default.
+
+- **Demo only**, like ICT and fast mode: it can't be turned on while a real money account is connected (403 `scanner_demo_only`), the bot refuses to Start on a real account while it is on, every order checks the account again, and the page says so in plain words (`scanAutoBlocked` in the status). It never trades real money, whatever Allow real money says.
+- It acts only while the bot is **started in Auto trade** mode (not in Signals only). The bot's own market doesn't matter: each trade is on the setup's own market.
+- It takes **"Ready now"** setups only, as soon as a scan finishes, best first (the scanner's order: ready, freshest, most agreement). A setup must be from the newest closed candle of its timeframe, and the latest price must still be inside the plan: not past its stop loss or take profit, and within 0.25R (a quarter of the stop distance) of the entry either way. Just before buying, Deriv's quoted price is checked again against the stop loss and take profit.
+- "Waiting for price" ICT plans are **not** auto-traded: the scanner reads candles at each candle close, not every tick, so it can't see the moment price touches the zone. (An ICT setup that entered its zone on the last closed candle shows as Ready now and can be taken.)
+- Choices: the strategies it may take (ICT and Rules by default, the price-action ones; the AI model is off by default), the timeframes (15m and 1h), trades per day (4, from 1 to 10) and scanner trades open at once (2, from 1 to 5). Only one open trade per market, from any source.
+- Orders go through the bot's normal path: a `proposal` with the stop loss and take profit as money (from the setup's stop and target distances), then a `buy`, sized with your **Risk per trade** and **Multiplier** (the lowest one that market offers when yours isn't), using that market's own Multiplier range and stake limits (`contracts_for`, asked once an hour).
+- The trades are followed like any other: in Open trades as "from Scanner · ICT 15m EUR/USD" with a **Chart** button that shows the trade's plan on its market's chart, picked up again after a restart, closed by the daily loss limit, and counted by the risk guard (max trades per day, the pause after losses; the daily loss limit stops everything). The bot's own **Max open trades** doesn't count them; they have their own limit.
+- Each setup is taken at most once (also after a restart), and today's count is kept in `state.json`. Every reason a setup was not taken is written once in Activity. The Scanner card shows "Auto-trade: on (demo) · 2 of 4 today" and a **Traded** badge on setups it took.
 
 A few things are stricter than in the browser, because a server runs unattended and restarts:
 
@@ -95,7 +108,7 @@ TBOT_DATA_DIR=/tmp/tbot-data TBOT_PORT=8802 TBOT_DEV=1 DERIV_API_URL=http://loca
 
 Open http://127.0.0.1:8802, log in, and under **Deriv connection** paste any App ID with the token `pat_local_test_1234`. The mock's time runs fast (one candle per `BAR_MS`).
 
-`node tools/e2e-server.mjs` runs the whole thing in a real browser (Playwright and Chromium needed): login, token, start, a restart with an open trade, closing it, settings, real money switch, the scanner (its setups and one on the chart), log out, in light and dark mode. `npm test` runs the engine and API tests.
+`node tools/e2e-server.mjs` runs the whole thing in a real browser (Playwright and Chromium needed): login, token, start, a restart with an open trade, closing it, settings, real money switch, the scanner (its setups and one on the chart), scanner auto-trade on demo (the trade, its tag, its plan on the chart), log out, in light and dark mode. `npm test` runs the engine and API tests.
 
 ## The data folder
 
@@ -134,16 +147,16 @@ All under `/api/`, JSON in and out. Every call needs the session cookie except l
 | `GET /healthz` | `200 ok`, no login needed. |
 | `POST /api/login` `{password}` | Sets the session cookie. 401 wrong password, 429 too many tries. |
 | `POST /api/logout` | Ends this session. |
-| `GET /api/status` | Everything the page shows: `running`, `mode`, `strategy`, `symbol`, `connection`, `account {id,type,currency}`, `balance`, `equity`, `dayPL` (%), `tradesToday`, `halted`, `haltReason`, `cooldownUntil`, `blockReason`, `lastPrice`, `lastEval` (what the strategy sees), `lastSignal` (kept across restarts; with `end`, `slMoney`, `tpMoney` for the chart), `marks` (recent signals and trades as `{t, side}`, for chart arrows), `resumedAt` (when it carried on by itself after a restart), `lastCost`, `open` trades (`id, side, symbol, stake, profit, opened, horizon, plan`; `plan` is `{side, entry, sl, tp, slMoney, tpMoney, start, end}` from Deriv's numbers, or null), `botTf` (seconds per candle the strategy reads), `pending` (the waiting plan: `side, zone, sl, tp, expiresAt, invalidateAt, reason, text, start, slMoney, tpMoney`, or null), `marketOpen`, `synthetic`, `noMultipliers`, `marketGroups` (Deriv's Multiplier markets by group, with `open`), `ictBlocked`, `accounts`, `needsToken`, `hasToken`, `tokenHint` (last 4 characters), `appId`, `error`, `settings`, `limits`, `multipliers`, `version`. |
+| `GET /api/status` | Everything the page shows: `running`, `mode`, `strategy`, `symbol`, `connection`, `account {id,type,currency}`, `balance`, `equity`, `dayPL` (%), `tradesToday`, `halted`, `haltReason`, `cooldownUntil`, `blockReason`, `lastPrice`, `lastEval` (what the strategy sees), `lastSignal` (kept across restarts; with `end`, `slMoney`, `tpMoney` for the chart), `marks` (recent signals and trades as `{t, side}`, for chart arrows), `resumedAt` (when it carried on by itself after a restart), `lastCost`, `open` trades (`id, side, symbol, stake, profit, opened, horizon, barSec, plan, source` ("bot" or "scanner"), and `scan: {strategy, tf, name}` for scanner trades; `plan` is `{side, entry, sl, tp, slMoney, tpMoney, start, end}` from Deriv's numbers, or null), `botTf` (seconds per candle the strategy reads), `pending` (the waiting plan: `side, zone, sl, tp, expiresAt, invalidateAt, reason, text, start, slMoney, tpMoney`, or null), `marketOpen`, `synthetic`, `noMultipliers`, `marketGroups` (Deriv's Multiplier markets by group, with `open`), `ictBlocked`, `scanAutoBlocked`, `scanAuto` (`{on, demoOnly, blocked, today, maxDay, open, maxOpen, strategies, timeframes, waiting}`), `accounts`, `needsToken`, `hasToken`, `tokenHint` (last 4 characters), `appId`, `error`, `settings`, `limits`, `multipliers`, `version`. |
 | `GET /api/candles?tf=<sec>[&after=<epoch>]` | The chart's candles of the bot's market, `tf` one of 60, 300, 900, 3600, 14400, 86400: `{symbol, tf, botTf, live, full, candles: [[epoch, open, high, low, close], ...], message}`. The bot's own timeframe is its own candles; others are loaded on the bot's Deriv connection (at most every 15 seconds per timeframe, 500 candles). With `after`, only that candle and newer ones (`full: false`). An empty list comes with a `message` (not connected, loading). 400 for another `tf`. |
 | `GET /api/candles?tf=<sec>&symbol=<code>` | The same for another market (a scanner setup). The code must be one Deriv lists, else 400 `bad_symbol`. |
-| `GET /api/scanner` | The scanner: `{settings: {on, synthetics, timeframes}, now, scanning, progress: {done, total}, lastScanAt, nextScanAt, cooldownUntil, pausedUntil, markets, failed, modelLoaded, message, items}`. Each item: `id, symbol, name, tf, strategy, side, status` ("ready" or "waiting"), `entry, sl, tp, zone, rr, reason, inZone, at, start, end, agree, against, score`. At most 40, gzipped. |
+| `GET /api/scanner` | The scanner: `{settings: {on, synthetics, timeframes}, now, scanning, progress: {done, total}, lastScanAt, nextScanAt, cooldownUntil, pausedUntil, markets, failed, modelLoaded, message, items}`. Each item: `id, symbol, name, tf, strategy, side, status` ("ready" or "waiting"), `entry, sl, tp, zone, rr, reason, inZone, at, start, end, agree, against, score, traded`; ready ones also `slDist, tpDist, horizonBars, price` (the latest price when scanned). `auto` is the same as `scanAuto` in the status. At most 40, gzipped. |
 | `POST /api/scanner/scan` | Scan every market now. 429 within 2 minutes of the last one, 409 when off or not connected. |
 | `POST /api/scanner/settings` `{on, synthetics, timeframes}` | Changes the scanner settings (saved in `scanner.json`). `timeframes` is `[900]`, `[3600]` or both. |
 | `GET /api/log?after=<seq>` | Activity log entries newer than `seq` (up to 200), plus `last`. |
 | `POST /api/start` | Starts the bot. 409 with a message if it can't (no token, real account not allowed, not connected yet). |
 | `POST /api/stop` | Stops the bot. Open trades keep their stop loss and take profit. |
-| `POST /api/settings` `{...}` | Changes some settings. Numbers are clamped to safe ranges. `allowReal: true` also needs `confirmReal: "REAL"`. Switching `mode` needs the bot stopped. A new `symbol` stops the bot. `aiFast: true` turns on fast mode (AI only, demo only: refused on a real account). |
+| `POST /api/settings` `{...}` | Changes some settings. Numbers are clamped to safe ranges. `allowReal: true` also needs `confirmReal: "REAL"`. Switching `mode` needs the bot stopped. A new `symbol` stops the bot. `aiFast: true` turns on fast mode (AI only, demo only: refused on a real account). Scanner auto-trade: `scanAuto` (demo only: 403 `scanner_demo_only` on a real account), `scanAutoStrategies` (some of `ict`, `rules`, `ai`), `scanAutoTfs` (`900`, `3600`), `scanAutoMaxDay` (1-10), `scanAutoMaxOpen` (1-5). |
 | `POST /api/deriv` `{appId, token}` | Checks them by listing the accounts at Deriv, then saves them and connects (demo account first). Returns the accounts, never the token. |
 | `POST /api/deriv/forget` | Stops the bot and deletes the saved token. |
 | `GET /api/accounts[?refresh=1]` | The accounts on the token (refresh asks Deriv again). |
@@ -158,7 +171,7 @@ All under `/api/`, JSON in and out. Every call needs the session cookie except l
 
 - `server/main.mjs`: HTTP server, API, security, `set-password` and `self-test` commands.
 - `server/engine.mjs`: the trading engine (a port of the engine in `public/js/app.js`).
-- `server/scanner.mjs`: the multi-market scanner (read-only market data, signals only).
+- `server/scanner.mjs`: the multi-market scanner (read-only market data; its ready setups go to the engine's demo-only auto-trade).
 - `server/chart.mjs`: the chart's candles for the control page.
 - `server/auth.mjs`: password hashing, sessions, login limits.
 - `server/proxy-ips.mjs`: `TBOT_PROXY_IPS` parsing and matching.

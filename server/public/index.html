@@ -128,9 +128,10 @@
         <span id="scanProgressText" class="small muted">Scanning</span>
       </div>
       <p class="msg" id="scanMsg" role="status" hidden></p>
+      <p class="scan-auto" id="scanAuto" hidden><span class="scan-auto-state" id="scanAutoState"></span><span class="scan-auto-why" id="scanAutoWhy"></span></p>
       <ul class="scan-list" id="scanList" aria-label="Setups found"></ul>
       <p class="empty" id="scanEmpty">No setups right now.</p>
-      <p class="hint" id="scanHint" hidden>Tap a setup to see it on the chart. Signals only: to trade it, set this market in Settings.</p>
+      <p class="hint" id="scanHint" hidden>Tap a setup to see it on the chart. To trade it, set this market in Settings, or turn on auto-trade (demo only) under Settings &gt; Scanner.</p>
       <button class="btn wide" id="scanBtn" type="button">Scan now</button>
       <p class="honesty scan-honesty">
         <svg viewBox="0 0 20 20" width="16" height="16" aria-hidden="true"><circle cx="10" cy="10" r="8.5" fill="none" stroke="currentColor" stroke-width="1.6"/><path d="M10 9v5M10 6.2v.1" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>
@@ -282,7 +283,7 @@
             <label class="fast-switch scan-switch" for="scanOn">
               <span class="fast-text">
                 <span class="fast-name">Scanner on</span>
-                <span class="hint" id="scanOnHint">Checks up to 20 markets after every 15-minute and 1-hour candle. It only reads prices; it never trades.</span>
+                <span class="hint" id="scanOnHint">Checks up to 20 markets after every 15-minute and 1-hour candle. It only reads prices; it trades only if you turn on auto-trade below.</span>
               </span>
               <input class="switch" id="scanOn" name="on" type="checkbox" aria-describedby="scanOnHint">
             </label>
@@ -301,6 +302,38 @@
               </fieldset>
             </div>
             <p class="msg" id="scanSetMsg" role="status" hidden></p>
+          </form>
+          <form id="scanAutoForm" class="fast scan-auto-box" novalidate>
+            <label class="fast-switch" for="scanAutoInput">
+              <span class="fast-text">
+                <span class="fast-name">Auto-trade scanner setups <span class="badge demo">Demo only</span></span>
+                <span class="hint" id="scanAutoHint">While the bot runs in Auto trade, it takes "Ready now" setups as soon as the scanner finds them, on their own market, with your risk settings. Never on a real money account.</span>
+              </span>
+              <input class="switch" id="scanAutoInput" name="scanAuto" type="checkbox" aria-describedby="scanAutoHint">
+            </label>
+            <div class="field">
+              <span id="scanAutoStratLabel">Strategies it may take</span>
+              <fieldset class="seg seg-3" id="scanAutoStratSeg" aria-labelledby="scanAutoStratLabel">
+                <label><input type="checkbox" name="scanAutoStrategy" value="ict"><span>ICT</span></label>
+                <label><input type="checkbox" name="scanAutoStrategy" value="rules"><span>Rules</span></label>
+                <label><input type="checkbox" name="scanAutoStrategy" value="ai"><span>AI</span></label>
+              </fieldset>
+              <span class="hint">ICT and Rules read price action. The AI model is off by default: it was trained on 1-minute candles.</span>
+            </div>
+            <div class="field">
+              <span id="scanAutoTfLabel">Timeframes it may take</span>
+              <fieldset class="seg" id="scanAutoTfSeg" aria-labelledby="scanAutoTfLabel">
+                <label><input type="checkbox" name="scanAutoTf" value="900"><span>15m</span></label>
+                <label><input type="checkbox" name="scanAutoTf" value="3600"><span>1h</span></label>
+              </fieldset>
+            </div>
+            <div class="grid2">
+              <label class="field">Trades per day <input name="scanAutoMaxDay" type="number" inputmode="numeric" min="1" max="10" step="1"></label>
+              <label class="field">Open at once <input name="scanAutoMaxOpen" type="number" inputmode="numeric" min="1" max="5" step="1"></label>
+            </div>
+            <p class="hint">One trade per market at a time. Your daily loss limit, max trades per day and pause after losses apply to these trades too.</p>
+            <p class="fast-note real" id="scanAutoNote" hidden></p>
+            <p class="msg" id="scanAutoMsg" role="status" hidden></p>
           </form>
         </div>
       </details>

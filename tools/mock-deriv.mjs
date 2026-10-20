@@ -121,11 +121,12 @@ function scriptNext() {
 }
 // The scanner's fixed setups (MOCK_SCAN_SETUPS=1): the newest candles of a market replaced with flat
 // candles, the ICT setup, then a candle that holds above the gap ("wait") or trades back into it ("ready").
+// The last (forming) candle ends at the market's live price, so a scanner trade's price checks see the same price.
 const SCAN_SETUPS = process.env.MOCK_SCAN_SETUPS ? { R_50: "wait", R_100: "ready" } : {};
 function scanSetup(list, kind) {
   const tail = [...Array(70).fill(ICT_FLAT), ...ICT_SETUP, kind === "ready" ? ICT_TOUCH.bar : ICT_HOLD, ICT_HOLD];
   if (list.length < tail.length + 10) return list;
-  const from = list.length - tail.length, base = list[from - 1].close, unit = base * 0.002;
+  const from = list.length - tail.length, base = list.at(-1).close / (1 + (ICT_HOLD[3] - 100) * 0.002), unit = base * 0.002;
   const at = (v) => +(base + (v - 100) * unit).toFixed(2);
   return [...list.slice(0, from), ...tail.map(([o, h, l, c], k) => ({ epoch: list[from + k].epoch, open: at(o), high: at(h), low: at(l), close: at(c) }))];
 }

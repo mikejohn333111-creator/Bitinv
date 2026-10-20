@@ -467,6 +467,82 @@ test("the scanner backs off when Deriv answers with its rate limit, and says so"
   } finally { await srv.stop(); mock.stop(); }
 });
 
+test("scanner auto-trade: settings checked, demo only, takes the mock's ready setup once on its own market, also after a restart", async () => {
+  const TOKEN = "pat_api_SCAN_77aa11bb";
+  const mock = await startMock({ MOCK_PAT: TOKEN, MOCK_SCAN_SETUPS: "1" });
+  const dir = tempDir();
+  setPassword(dir, PASSWORD);
+  const env = { TBOT_DEV: "1", TBOT_SCAN_GAP_MS: "60", DERIV_API_URL: mock.base, DERIV_PUBLIC_WS: `ws://localhost:${mock.port}/trading/v1/options/ws/public` };
+  let srv = await startServer(dir, env);
+  const c = client(srv.base);
+  try {
+    await c.login();
+    assert.equal((await c.post("/api/deriv", { appId: "1234", token: TOKEN })).status, 200);
+    await until(async () => { const s = await c.get("/api/status"); return s.data.connection === "online" && s.data.balance !== null && !s.data.syncing && s; });
+    let st = (await c.get("/api/status")).data;
+    assert.deepEqual({ ...st.scanAuto, waiting: undefined }, { on: false, demoOnly: true, blocked: false, today: 0, maxDay: 4, open: 0, maxOpen: 2,
+                                                              strategies: ["ict", "rules"], timeframes: [900, 3600], waiting: undefined });
+    for (const bad of [{ scanAuto: "yes" }, { scanAutoStrategies: [] }, { scanAutoStrategies: ["x"] }, { scanAutoTfs: [60] }, { scanAutoMaxOpen: "two" }]) {
+      const r = await c.post("/api/settings", bad);
+      assert.equal(r.status, 400, JSON.stringify(bad));
+      assert.equal(r.data.error, "bad_settings");
+    }
+    const clamped = await c.post("/api/settings", { scanAutoMaxDay: 50, scanAutoMaxOpen: 0 });
+    assert.deepEqual([clamped.data.settings.scanAutoMaxDay, clamped.data.settings.scanAutoMaxOpen], [10, 1]);
+    await c.post("/api/settings", { scanAutoMaxDay: 4, scanAutoMaxOpen: 2 });
+
+    // Demo only: refused on the real account, in plain words.
+    assert.equal((await c.post("/api/settings", { allowReal: true, confirmReal: "REAL" })).status, 200);
+    assert.equal((await c.post("/api/account", { id: "ROT10000001" })).status, 200);
+    let r = await c.post("/api/settings", { scanAuto: true });
+    assert.equal(r.status, 403);
+    assert.equal(r.data.error, "scanner_demo_only");
+    assert.match(r.data.message, /demo only.*never trades on a real money account/);
+    assert.equal((await c.post("/api/account", { id: "DOT90000001" })).status, 200);
+    assert.equal((await c.post("/api/settings", { allowReal: false })).status, 200);
+
+    // On the demo account, with the synthetic indices scanned: the ready R_100 setup is traded (the bot itself trades R_75).
+    assert.equal((await c.post("/api/scanner/settings", { synthetics: true })).status, 200);
+    r = await c.post("/api/settings", { scanAuto: true });
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+    assert.equal(r.data.status.scanAuto.on, true);
+    await until(async () => { const s = await c.get("/api/status"); return s.data.connection === "online" && !s.data.syncing && s; });
+    assert.equal((await c.post("/api/start", {})).status, 200);
+    st = (await until(async () => { const s = await c.get("/api/status"); return s.data.open.some((t) => t.source === "scanner") && s; }, 30000)).data;
+    const trade = st.open.find((t) => t.source === "scanner");
+    assert.equal(trade.symbol, "R_100");
+    assert.equal(trade.side, "BUY");
+    assert.equal(trade.scan.strategy, "ict");
+    assert.equal(trade.scan.name, "Volatility 100 Index");
+    assert.equal(st.symbol, "R_75", "the bot's own market is unchanged");
+    assert.equal(st.scanAuto.today, 1);
+    assert.equal(st.tradesToday, 1);
+    const v = (await c.get("/api/scanner")).data;
+    assert.equal(v.auto.on, true);
+    assert.equal(v.auto.today, 1);
+    const traded = v.items.filter((i) => i.traded);
+    assert.equal(traded.length, 1);
+    assert.equal(traded[0].symbol, "R_100");
+    for (const k of ["id", "side", "entry", "slDist", "tpDist", "symbol", "tf", "strategy", "price"]) assert.ok(traded[0][k] !== undefined, k);
+
+    // After a restart: the trade is followed with its tag, the count is kept, nothing is taken twice.
+    assert.equal(await srv.stop(), 0);
+    srv = await startServer(dir, env);
+    const c2 = client(srv.base);
+    c2.cookie = c.cookie;
+    st = (await until(async () => { const s = await c2.get("/api/status"); return s.data.connection === "online" && !s.data.syncing && s.data.open.length && s; }, 15000)).data;
+    assert.equal(st.running, true);
+    assert.equal(st.open[0].source, "scanner");
+    assert.equal(st.open[0].scan.tf, trade.scan.tf);
+    assert.equal(st.scanAuto.today, 1);
+    await until(async () => { const s = await c2.get("/api/scanner"); return s.data.lastScanAt && !s.data.scanning && s.data.items.some((i) => i.symbol === "R_100") && s; }, 20000);
+    await new Promise((res) => setTimeout(res, 500));
+    const log = await c2.get("/api/log?after=0");
+    assert.equal(log.data.entries.filter((e) => /^Opened BUY R_100 from the scanner/.test(e.title)).length, 1, "taken once");
+    assert.equal((await c2.get("/api/status")).data.open.length, 1);
+  } finally { await srv.stop(); mock.stop(); }
+});
+
 test("the mock accepts MOCK_PAT only with a Deriv-App-ID header", async () => {
   const mock = await startMock({ MOCK_PAT: "pat_only_for_tests" });
   try {

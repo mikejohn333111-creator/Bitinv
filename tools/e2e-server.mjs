@@ -1,4 +1,4 @@
-// End-to-end check of the server bot in a real browser (Playwright + Chromium):
+// End-to-end check of the server bot in a real browser (Playwright + Chromium), scanner auto-trade included:
 // the mock Deriv runs inside this process, the server runs as a child process.
 //
 //   node tools/e2e-server.mjs [--shots dir]
@@ -217,9 +217,56 @@ try {
     await page.waitForFunction(() => document.getElementById("chart").dataset.symbol === "R_75" && document.getElementById("chartFocus").hidden &&
       !document.getElementById("chart").dataset.plans?.split(" ").includes("scan"), null, { timeout: 15000 });
     if (scheme === "light") {
+      step = "scanner auto-trade (demo): turned on, the bot started, Scan now";
+      await mockClock(6000);   // slower prices, so the trade stays open long enough to look at
+      await page.click('#modeSeg label:has(input[value="auto"])');
+      await page.waitForFunction(() => document.getElementById("runBtn").textContent.trim() === "Start the bot");
+      await page.click("#secScanner summary");
+      assert.equal(await page.isChecked("#scanAutoInput"), false, "off by default");
+      assert.deepEqual(await page.$$eval('input[name="scanAutoStrategy"]:checked', (els) => els.map((e) => e.value)), ["ict", "rules"]);
+      await page.click('label[for="scanAutoInput"]');
+      await page.waitForFunction(() => /Auto-trade is on/.test(document.getElementById("scanAutoMsg").textContent));
+      await page.waitForFunction(() => /Auto-trade: on \(demo\) · 0 of 4 today/.test(document.getElementById("scanAuto").textContent) &&
+                                       /press Start/.test(document.getElementById("scanAuto").textContent));
+      await page.click("#secScanner summary");
+      await page.click("#runBtn");
+      await page.waitForFunction(() => document.getElementById("stateLabel").textContent === "Running");
       await page.click("#scanBtn");
       await page.waitForFunction(() => /Scan again in|Scanning/.test(document.getElementById("scanBtn").textContent));
       assert.equal(await page.isDisabled("#scanBtn"), true, "cooldown");
+
+      step = "scanner auto-trade (demo): the trade, its tag and the Traded badge";
+      await page.waitForFunction(() => [...document.querySelectorAll("#openList .from")].some((e) => /^from Scanner · ICT (15m|1h) Volatility 100 Index$/.test(e.textContent)),
+                                 null, { timeout: 60000 });
+      await page.waitForFunction(() => /Auto-trade: on \(demo\) · 1 of 4 today/.test(document.getElementById("scanAuto").textContent), null, { timeout: 20000 });
+      await page.waitForFunction(() => [...document.querySelectorAll("#scanList .scan-item")].some((b) =>
+        b.querySelector(".scan-name")?.textContent === "Volatility 100 Index" && b.querySelector(".scan-traded")), null, { timeout: 30000 });
+      assert.ok([...(await page.$$eval("#logList .title", (els) => els.map((e) => e.textContent)))].some((t) => /^Opened BUY R_100 from the scanner/.test(t)));
+      await page.$eval("#scanCard", (e) => e.scrollIntoView());
+      if (SHOTS) await page.locator("#scanCard").screenshot({ path: join(SHOTS, "auto-scanner-card-light.png") });
+      const tradeId = await page.$eval("#openList li:has(.from)", (li) => li.dataset.id);
+      if (SHOTS) await page.locator("#openList").screenshot({ path: join(SHOTS, "auto-open-trade-light.png") });
+
+      step = "scanner auto-trade (demo): the trade's plan on its market's chart";
+      await page.click(`#openList li[data-id="${tradeId}"] [data-chart]`);
+      await page.waitForFunction((id) => document.getElementById("chart").dataset.symbol === "R_100" &&
+        document.getElementById("chart").dataset.plans?.split(" ").includes(id) && Number(document.getElementById("chart").dataset.candles) > 50, tradeId, { timeout: 20000 });
+      assert.match(await page.textContent("#focusText"), /Volatility 100 Index · ICT on (15m|1h) · Open trade from the scanner/);
+      if (SHOTS) await page.locator("#chartCard").screenshot({ path: join(SHOTS, "auto-trade-chart-light.png") });
+      await page.click("#focusBack");
+      await page.waitForFunction(() => document.getElementById("chart").dataset.symbol === "R_75", null, { timeout: 15000 });
+
+      step = "scanner auto-trade (demo): stop, close the trade";
+      await page.click("#runBtn");
+      await page.waitForFunction(() => document.getElementById("stateLabel").textContent === "Stopped");
+      await page.click(`#openList li[data-id="${tradeId}"] [data-close]`);
+      await page.waitForSelector(`#openList li[data-id="${tradeId}"]`, { state: "detached", timeout: 15000 });
+      await mockClock(1000);
+    } else {
+      step = "scanner auto-trade (demo): shown while the bot is stopped";
+      await page.waitForFunction(() => /Auto-trade: on \(demo\) · 1 of 4 today/.test(document.getElementById("scanAuto").textContent), null, { timeout: 20000 });
+      await page.$eval("#scanCard", (e) => e.scrollIntoView());
+      if (SHOTS) await page.locator("#scanCard").screenshot({ path: join(SHOTS, "auto-scanner-card-dark.png") });
     }
 
     step = "page checks";

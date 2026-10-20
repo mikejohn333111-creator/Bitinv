@@ -143,20 +143,19 @@ export function mountChart() {
   // -------------------------------------------------------------- plans
   /** Open trades, the latest signal and the waiting plan from the status, as plans on the chart. */
   function showPlans(s) {
-    if (!ownMarket()) {   // another market on the chart: the bot's plans are not drawn on its prices
-      for (const id of view.tradeIds) plans.remove(id);
-      view.tradeIds = new Set();
-      plans.remove("signal"); plans.remove("pending");
-      return;
-    }
-    const ids = new Set();
+    // Open trades on the market shown (the bot's, or another one such as a scanner trade's).
+    const shown = wanted(), open = new Set((s.open || []).map((t) => t.id)), ids = new Set();
     for (const t of s.open || []) {
-      if (!t.plan || t.symbol !== s.symbol) continue;
+      if (!t.plan || t.symbol !== shown) continue;
       ids.add(t.id);
       plans.set(t.id, { ...t.plan, stale: false });
     }
-    for (const id of view.tradeIds) if (!ids.has(id)) plans.close(id);   // closed: fades out
+    for (const id of view.tradeIds) if (!ids.has(id)) { if (open.has(id)) plans.remove(id); else plans.close(id); }   // closed: fades out
     view.tradeIds = ids;
+    if (!ownMarket()) {   // another market on the chart: the bot's signal and waiting plan are not drawn on its prices
+      plans.remove("signal"); plans.remove("pending");
+      return;
+    }
     // A signal that wasn't traded (signals only): a traded one shows as its trade's plan.
     const sig = s.lastSignal;
     if (sig && !sig.traded && sig.symbol === s.symbol) {
@@ -180,7 +179,11 @@ export function mountChart() {
     if (!f) { plans.remove("scan"); return; }
     $("focusSide").textContent = f.side;
     $("focusSide").className = `tag ${f.side}`;
-    $("focusText").textContent = `${f.name} · ${STRATEGY[f.strategy] || f.strategy} on ${{ 900: "15m", 3600: "1h" }[f.tf] || ""} · ${f.status === "ready" ? "Ready now" : "Waiting for price"}`;
+    $("focusText").textContent = `${f.name} · ${f.strategy ? `${STRATEGY[f.strategy] || f.strategy} on ` : ""}${{ 900: "15m", 3600: "1h" }[f.tf] || ""} · ${
+      f.status === "traded" ? "Open trade from the scanner" : f.status === "ready" ? "Ready now" : "Waiting for price"}`;
+    // An open trade is drawn as itself (showPlans); a traded setup's own plan would only repeat it.
+    const traded = f.tradeId || (f.traded && (view.status?.open || []).some((t) => t.symbol === f.symbol && t.plan));
+    if (traded) { plans.remove("scan"); return; }
     plans.set("scan", f.status === "waiting"
       ? { kind: "pending", side: f.side, zone: f.zone, sl: f.sl, tp: f.tp, slMoney: NaN, tpMoney: NaN, start: f.start, end: f.end, stale: false }
       : { side: f.side, entry: f.entry, sl: f.sl, tp: f.tp, slMoney: NaN, tpMoney: NaN, start: f.start, end: f.end ?? null, stale: false });

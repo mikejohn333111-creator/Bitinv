@@ -69,6 +69,12 @@ export class RiskGuard {
       this.#save();
       return { justHalted: true };
     }
+    if (!this.state.halted && this.limits.dailyProfitPct > 0 && pl >= this.limits.dailyProfitPct) {
+      this.state.halted = true;
+      this.state.haltReason = `daily profit target reached (+${pl.toFixed(2)}%)`;
+      this.#save();
+      return { justHalted: true, profit: true };
+    }
     return { justHalted: false };
   }
 

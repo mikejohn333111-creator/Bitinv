@@ -486,14 +486,14 @@ function renderScanAuto() {
 }
 
 // ------------------------------------------------------------- settings
-const RISK_FIELDS = ["riskPct", "maxDailyLossPct", "scanAutoMaxDay", "scanAutoMaxOpen", "maxConsecLosses", "cooldownMinutes"];
+const RISK_FIELDS = ["riskPct", "maxDailyLossPct", "dailyProfitPct", "scanAutoMaxDay", "scanAutoMaxOpen", "maxConsecLosses", "cooldownMinutes"];
 
 function renderSettings(s) {
   const set = s.settings;
   // summaries
   $("sumDeriv").textContent = s.needsToken ? "Token not accepted" : s.hasToken ? "Connected" : "Not connected";
   $("sumAccount").textContent = s.account ? `${s.account.type === "real" ? "REAL" : "Demo"} · ${s.account.id}` : "None";
-  $("sumRisk").textContent = `${set.riskPct}% a trade · ${set.maxDailyLossPct}% a day · ${set.scanAutoMaxDay} a day`;
+  $("sumRisk").textContent = `${set.riskPct}% a trade · −${set.maxDailyLossPct}%${+set.dailyProfitPct > 0 ? ` / +${set.dailyProfitPct}%` : ""} a day · ${set.scanAutoMaxDay} a day`;
   $("sumVersion").textContent = s.version?.commit ? s.version.commit.slice(0, 7) : "";
   if (s.version?.commit && !$("versionText").dataset.set) {
     $("versionText").textContent = `You have version ${s.version.commit.slice(0, 7)}${s.version.date ? ` from ${new Date(s.version.date).toLocaleDateString()}` : ""}.`;

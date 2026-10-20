@@ -143,14 +143,14 @@ try {
       step = "risk limits are clamped";
       await page.click("#secRisk summary");
       await page.fill('#riskForm input[name="riskPct"]', "99");
-      await page.fill('#riskForm input[name="scanAutoMaxDay"]', "50");
+      await page.fill('#riskForm input[name="scanAutoMaxOpen"]', "50");
       await page.click('#riskForm button[type="submit"]');
       await page.waitForFunction(() => /adjusted/.test(document.getElementById("riskMsg").textContent));
       assert.equal(await page.inputValue('#riskForm input[name="riskPct"]'), "5");
-      assert.equal(await page.inputValue('#riskForm input[name="scanAutoMaxDay"]'), "10");
-      await page.fill('#riskForm input[name="scanAutoMaxDay"]', "4");
+      assert.equal(await page.inputValue('#riskForm input[name="scanAutoMaxOpen"]'), "5");
+      await page.fill('#riskForm input[name="scanAutoMaxOpen"]', "2");
       await page.click('#riskForm button[type="submit"]');
-      await page.waitForFunction(() => /Saved/.test(document.getElementById("riskMsg").textContent) && document.getElementById("tradesToday").textContent.endsWith("/ 4"));
+      await page.waitForFunction(() => /Saved/.test(document.getElementById("riskMsg").textContent) && /^\d+$/.test(document.getElementById("tradesToday").textContent));
       await page.click("#secRisk summary");
 
       step = "the mode switches while running";
@@ -224,7 +224,7 @@ try {
       step = "auto trade (demo): Start, Scan now";
       await mockClock(6000);   // slower prices, so the trade stays open long enough to look at
       await page.click('#modeSeg label:has(input[value="auto"])');
-      await page.waitForFunction(() => /Auto trade \(demo\) · 0 of 4 today/.test(document.getElementById("scanAuto").textContent) &&
+      await page.waitForFunction(() => /Auto trade \(demo\) · 0 today/.test(document.getElementById("scanAuto").textContent) &&
                                        /press Start/.test(document.getElementById("scanAuto").textContent));
       await page.click("#runBtn");
       await page.waitForFunction(() => document.getElementById("stateLabel").textContent === "Running");
@@ -235,7 +235,7 @@ try {
       step = "auto trade (demo): the trade, its tag and the Traded badge";
       await page.waitForFunction(() => [...document.querySelectorAll("#openList .from")].some((e) => /^from Scanner · ICT (15m|1h) Volatility 100 Index$/.test(e.textContent)),
                                  null, { timeout: 60000 });
-      await page.waitForFunction(() => /Auto trade \(demo\) · 1 of 4 today/.test(document.getElementById("scanAuto").textContent), null, { timeout: 20000 });
+      await page.waitForFunction(() => /Auto trade \(demo\) · 1 today/.test(document.getElementById("scanAuto").textContent), null, { timeout: 20000 });
       await page.waitForFunction(() => [...document.querySelectorAll("#scanList .scan-item")].some((b) =>
         b.querySelector(".scan-name")?.textContent === "Volatility 100 Index" && b.querySelector(".scan-traded")), null, { timeout: 30000 });
       assert.ok([...(await page.$$eval("#logList .title", (els) => els.map((e) => e.textContent)))].some((t) => /^Opened BUY R_100 from the scanner/.test(t)));
@@ -260,7 +260,7 @@ try {
       await mockClock(1000);
     } else {
       step = "auto trade (demo): shown while the bot is stopped";
-      await page.waitForFunction(() => /Auto trade \(demo\) · 1 of 4 today/.test(document.getElementById("scanAuto").textContent), null, { timeout: 20000 });
+      await page.waitForFunction(() => /Auto trade \(demo\) · 1 today/.test(document.getElementById("scanAuto").textContent), null, { timeout: 20000 });
     }
 
     step = "page checks";

@@ -34,13 +34,14 @@ const FEED_QUIET_MS = 3 * 60000;      // synthetic indices tick every 1-2 s, so 
 
 // ------------------------------------------------------------- settings
 /** Saved settings carry this version. A file without it is from before the bot became scanner-only. */
-export const SETTINGS_VERSION = 2;
+export const SETTINGS_VERSION = 3;
 export const DEFAULT_SETTINGS = {
   v: SETTINGS_VERSION,
   // "auto": the scanner's ready setups are traded (demo only). "signals": the scanner only shows them.
   mode: "auto",
   riskPct: 1, maxDailyLossPct: 3, dailyProfitPct: 1, maxConsecLosses: 3, cooldownMinutes: 15,
-  scanAutoMaxDay: 4, scanAutoMaxOpen: 2,      // trades per day and open at once
+  // A safety cap on trades per day, not on the page: the daily profit target and loss limit end the day.
+  scanAutoMaxDay: 20, scanAutoMaxOpen: 2,     // trades per day and open at once
   // The scanner's AI model reads these (not on the page).
   aiThreshold: 0.55, aiBarrier: AI_DEFAULTS.barrierATR, aiHorizon: AI_DEFAULTS.horizonBars,
   allowReal: false,
@@ -87,7 +88,7 @@ const NUMBERS = {
   aiBarrier:       { min: 0.5, max: 10, label: "AI stop distance" },
   aiHorizon:       { min: 5, max: 240, int: true, label: "AI time limit" },
   dailyProfitPct:  { min: 0, max: 20, label: "Daily profit target" },
-  scanAutoMaxDay:  { min: 1, max: 10, int: true, label: "Trades per day" },
+  scanAutoMaxDay:  { min: 1, max: 20, int: true, label: "Trades per day" },
   scanAutoMaxOpen: { min: 1, max: 5, int: true, label: "Trades open at once" },
 };
 const CHOICES = { mode: ["auto", "signals"] };
@@ -133,13 +134,13 @@ export function loadSettings(raw) {
   const { mode, allowReal, ...rest } = raw;
   const { settings } = cleanSettings(rest, DEFAULT_SETTINGS);
   const out = { ...DEFAULT_SETTINGS, ...settings, v: SETTINGS_VERSION, allowReal: allowReal === true };
-  const isLegacy = Object.keys(raw).length > 0 && raw.v !== SETTINGS_VERSION;
+  // Version 2 had "trades per day" on the page; now the daily targets end the day, so a saved number
+  // gives way to the safety cap.
+  if (raw.v === 2) out.scanAutoMaxDay = DEFAULT_SETTINGS.scanAutoMaxDay;
+  const isLegacy = Object.keys(raw).length > 0 && raw.v !== SETTINGS_VERSION && raw.v !== 2;
   if (!isLegacy) { out.mode = CHOICES.mode.includes(mode) ? mode : DEFAULT_SETTINGS.mode; return { settings: out, legacy: null }; }
   const autoOn = raw.scanAuto === true && mode !== "signals";
   out.mode = autoOn ? "auto" : "signals";
-  // One "trades per day" now: the old bot-wide limit, if it was the smaller one.
-  const day = Number(raw.maxTradesPerDay);
-  if (Number.isFinite(day) && day >= 1 && day < out.scanAutoMaxDay) out.scanAutoMaxDay = Math.round(day);
   const list = (v, ok) => (Array.isArray(v) ? ok.filter((x) => v.map((y) => (typeof x === "number" ? Number(y) : y)).includes(x)) : []);
   return { settings: out, legacy: { scanAuto: autoOn, strategies: list(renameRules(raw.scanAutoStrategies), SCAN_AUTO_STRATEGIES), timeframes: list(raw.scanAutoTfs, SCAN_AUTO_TFS),
                                     symbol: typeof raw.symbol === "string" ? raw.symbol.slice(0, 30) : "", strategy: typeof raw.strategy === "string" ? raw.strategy.slice(0, 10) : "" } };
@@ -948,7 +949,7 @@ export class TradingEngine {
     if (this.guard) this.guard.limits = this.limits();
     if (next.mode !== prev.mode)
       this.log("INFO", next.mode === "auto" ? "Mode: Auto trade (demo only)" : "Mode: Signals only",
-               next.mode === "auto" ? `${this.running ? "The bot" : "Once you press Start, the bot"} takes the scanner's "Ready now" setups, at most ${next.scanAutoMaxDay} a day and ${next.scanAutoMaxOpen} open at once.`
+               next.mode === "auto" ? `${this.running ? "The bot" : "Once you press Start, the bot"} takes the scanner's "Ready now" setups, at most ${next.scanAutoMaxOpen} open at once, until the daily profit target or loss limit.`
                                     : "The scanner shows setups. Nothing new is traded; open trades keep their stop loss and take profit.");
     if (partial.allowReal === true && !prev.allowReal) this.log("INFO", "Real money trading is now allowed");
     if (partial.allowReal === false && prev.allowReal) {

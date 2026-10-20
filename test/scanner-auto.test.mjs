@@ -122,12 +122,12 @@ test("the scanner's ready setups carry what an order needs: id, side, entry, sto
   assert.equal(staleReason(it, nowMs), "", "0.8 of a 4.65 stop away from the entry: fresh");
 });
 
-test("settings: Auto trade by default, 4 a day, 2 open; the scanner looks for ICT and SMC on 15m and 1h; bad values refused, numbers clamped", () => {
+test("settings: Auto trade by default, a 20-a-day safety cap, 2 open; the scanner looks for ICT and SMC on 15m and 1h; bad values refused, numbers clamped", () => {
   assert.equal(DEFAULT_SETTINGS.mode, "auto");
-  assert.deepEqual([DEFAULT_SETTINGS.scanAutoMaxDay, DEFAULT_SETTINGS.scanAutoMaxOpen], [4, 2]);
+  assert.deepEqual([DEFAULT_SETTINGS.scanAutoMaxDay, DEFAULT_SETTINGS.scanAutoMaxOpen], [20, 2]);
   assert.deepEqual([SCANNER_DEFAULTS.strategies, SCANNER_DEFAULTS.timeframes], [["ict", "smc"], [900, 3600]]);
   assert.deepEqual(cleanSettings({ mode: "signals", scanAutoMaxDay: 99, scanAutoMaxOpen: 0, scanAuto: true }),
-                   { settings: { mode: "signals", scanAutoMaxDay: 10, scanAutoMaxOpen: 1 }, errors: [] }, "the old on/off switch is ignored: the mode says it");
+                   { settings: { mode: "signals", scanAutoMaxDay: 20, scanAutoMaxOpen: 1 }, errors: [] }, "the old on/off switch is ignored: the mode says it");
   for (const bad of [{ mode: "on" }, { mode: true }, { scanAutoMaxDay: "x" }, { scanAutoMaxOpen: null }])
     assert.equal(cleanSettings(bad).errors.length, 1, JSON.stringify(bad));
 });
@@ -190,7 +190,7 @@ test("a ready setup is traded on its own market with the bot's sizing, tagged as
       { id: "9000", side: "BUY", symbol: "R_100", name: "Volatility 100 Index", stake: 200.2, profit: 0, opened: undefined, horizon: 0, barSec: 900, closing: false, plan: undefined,
         source: "scanner", scan: { strategy: "ict", tf: 900, name: "Volatility 100 Index" } });
     assert.equal(st.tradesToday, 1, "the risk guard counts it");
-    assert.deepEqual({ ...st.scanAuto }, { on: true, demoOnly: true, blocked: false, today: 1, maxDay: 4, open: 1, maxOpen: 2, waiting: "" });
+    assert.deepEqual({ ...st.scanAuto }, { on: true, demoOnly: true, blocked: false, today: 1, maxDay: 20, open: 1, maxOpen: 2, waiting: "" });
     assert.equal(engine.scanTraded(setup1().id), true);
     assert.equal(logged(engine, /^Opened BUY R_100 from the scanner \(ICT 15m Volatility 100 Index\)/).length, 1);
 

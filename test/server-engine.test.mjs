@@ -467,7 +467,7 @@ test("setCredentials checks the token with Deriv before saving it; the token is 
 test("settings: validated and clamped; the old market, strategy and multiplier keys are ignored; mode can change while running", async () => {
   assert.deepEqual(cleanSettings({ riskPct: 50, maxDailyLossPct: 0, scanAutoMaxOpen: 2.6, scanAutoMaxDay: 99, symbol: "R_10", strategy: "ict", multiplier: 100,
                                    maxOpen: 3, maxTradesPerDay: 9, aiFast: true, scanAuto: true, botTf: 900, junk: 1 }).settings,
-                   { riskPct: 5, maxDailyLossPct: 0.5, scanAutoMaxOpen: 3, scanAutoMaxDay: 10 });
+                   { riskPct: 5, maxDailyLossPct: 0.5, scanAutoMaxOpen: 3, scanAutoMaxDay: 20 });
   assert.equal(cleanSettings({ riskPct: "abc" }).errors.length, 1);
   assert.equal(cleanSettings({ mode: "yolo" }).errors.length, 1);
   assert.equal(cleanSettings([1]).errors.length, 1);
@@ -489,7 +489,11 @@ test("update from the single-market bot: scanner auto-trade on keeps Auto trade,
                             scanAutoMaxDay: 6, maxTradesPerDay: 3, riskPct: 2, multiplier: 100, aiFast: true, botTf: 900 });
   assert.equal(on.settings.mode, "auto");
   assert.equal(on.settings.v, SETTINGS_VERSION);
-  assert.equal(on.settings.scanAutoMaxDay, 3, "the smaller of the old daily limits");
+  assert.equal(on.settings.scanAutoMaxDay, 6, "kept as saved (the page no longer shows it)");
+  const v2 = loadSettings({ v: 2, mode: "auto", scanAutoMaxDay: 7, riskPct: 2 });
+  assert.equal(v2.legacy, null, "version 2 is the scanner-only bot: no move-over");
+  assert.deepEqual([v2.settings.mode, v2.settings.riskPct, v2.settings.scanAutoMaxDay, v2.settings.v], ["auto", 2, 20, SETTINGS_VERSION],
+                   "trades per day left the page: the saved number gives way to the safety cap");
   assert.equal(on.settings.riskPct, 2);
   for (const k of ["symbol", "strategy", "multiplier", "aiFast", "botTf", "scanAuto", "maxTradesPerDay", "scanAutoStrategies"]) assert.equal(k in on.settings, false, k);
   assert.deepEqual(on.legacy, { scanAuto: true, strategies: ["ict"], timeframes: [3600], symbol: "frxEURUSD", strategy: "ict" });

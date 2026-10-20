@@ -203,7 +203,7 @@ function render(s) {
   const pl = $("dayPL");
   pl.textContent = Number.isFinite(s.dayPL) ? `${s.dayPL > 0 ? "+" : ""}${s.dayPL.toFixed(2)}%` : "–";
   pl.className = s.dayPL > 0 ? "pos" : s.dayPL < 0 ? "neg" : "";
-  $("tradesToday").textContent = s.account ? `${s.tradesToday} / ${s.limits.maxTradesPerDay}` : "–";
+  $("tradesToday").textContent = s.account ? String(s.tradesToday) : "–";
   $("openCount").textContent = String(s.open.length);
   $("stateDetail").textContent = detailText(s);
   for (const r of document.querySelectorAll('input[name="mode"]')) r.checked = r.value === s.mode;
@@ -474,7 +474,7 @@ function renderScanAuto() {
   if (!a.on) state = "Signals only: setups are shown, not traded";
   else if (a.blocked) { state = "Auto trade: this is a REAL account"; why = "It is demo only, so nothing is traded here."; cls += " real"; }
   else {
-    state = `Auto trade (demo) · ${a.today} of ${a.maxDay} today`;
+    state = `Auto trade (demo) · ${a.today} today`;
     cls += " on";
     if (a.open) state += ` · ${a.open} open`;
     if (s && !s.running) why = "It takes setups once you press Start.";
@@ -486,14 +486,14 @@ function renderScanAuto() {
 }
 
 // ------------------------------------------------------------- settings
-const RISK_FIELDS = ["riskPct", "maxDailyLossPct", "dailyProfitPct", "scanAutoMaxDay", "scanAutoMaxOpen", "maxConsecLosses", "cooldownMinutes"];
+const RISK_FIELDS = ["riskPct", "maxDailyLossPct", "dailyProfitPct", "scanAutoMaxOpen", "maxConsecLosses", "cooldownMinutes"];
 
 function renderSettings(s) {
   const set = s.settings;
   // summaries
   $("sumDeriv").textContent = s.needsToken ? "Token not accepted" : s.hasToken ? "Connected" : "Not connected";
   $("sumAccount").textContent = s.account ? `${s.account.type === "real" ? "REAL" : "Demo"} · ${s.account.id}` : "None";
-  $("sumRisk").textContent = `${set.riskPct}% a trade · −${set.maxDailyLossPct}%${+set.dailyProfitPct > 0 ? ` / +${set.dailyProfitPct}%` : ""} a day · ${set.scanAutoMaxDay} a day`;
+  $("sumRisk").textContent = `${set.riskPct}% a trade · −${set.maxDailyLossPct}%${+set.dailyProfitPct > 0 ? ` / +${set.dailyProfitPct}%` : ""} a day`;
   $("sumVersion").textContent = s.version?.commit ? s.version.commit.slice(0, 7) : "";
   if (s.version?.commit && !$("versionText").dataset.set) {
     $("versionText").textContent = `You have version ${s.version.commit.slice(0, 7)}${s.version.date ? ` from ${new Date(s.version.date).toLocaleDateString()}` : ""}.`;

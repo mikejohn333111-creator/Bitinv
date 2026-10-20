@@ -484,7 +484,7 @@ test("auto trade: settings checked, demo only, takes the mock's ready setup once
     await until(async () => { const s = await c.get("/api/status"); return s.data.connection === "online" && s.data.balance !== null && !s.data.syncing && s; });
     let st = (await c.get("/api/status")).data;
     assert.equal(st.mode, "auto", "a new install: Auto trade");
-    assert.deepEqual({ ...st.scanAuto, waiting: undefined }, { on: true, demoOnly: true, blocked: false, today: 0, maxDay: 4, open: 0, maxOpen: 2, waiting: undefined });
+    assert.deepEqual({ ...st.scanAuto, waiting: undefined }, { on: true, demoOnly: true, blocked: false, today: 0, maxDay: 20, open: 0, maxOpen: 2, waiting: undefined });
     assert.match(st.scanAuto.waiting, /stopped/);
     for (const bad of [{ mode: "yes" }, { mode: true }, { scanAutoMaxOpen: "two" }, { scanAutoMaxDay: null }]) {
       const r = await c.post("/api/settings", bad);
@@ -492,7 +492,7 @@ test("auto trade: settings checked, demo only, takes the mock's ready setup once
       assert.equal(r.data.error, "bad_settings");
     }
     const clamped = await c.post("/api/settings", { scanAutoMaxDay: 50, scanAutoMaxOpen: 0 });
-    assert.deepEqual([clamped.data.settings.scanAutoMaxDay, clamped.data.settings.scanAutoMaxOpen], [10, 1]);
+    assert.deepEqual([clamped.data.settings.scanAutoMaxDay, clamped.data.settings.scanAutoMaxOpen], [20, 1]);
     await c.post("/api/settings", { scanAutoMaxDay: 4, scanAutoMaxOpen: 2 });
 
     // Demo only: refused on the real account, in plain words.

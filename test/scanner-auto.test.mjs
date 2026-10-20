@@ -377,3 +377,18 @@ test("a scanner trade's plan on the chart comes from the setup when Deriv's cont
     assert.deepEqual(engine.state.openMeta["9000"].plan.sl, 991, "kept for a restart");
   } finally { ctx.cleanup(); }
 });
+
+test("a setup's 'not taken' line is logged again when the reason changes, never twice for the same reason", async () => {
+  const ctx = await setup();
+  const { engine, sock } = ctx;
+  try {
+    engine.start();
+    const it = setup1();
+    for (const price of [1003, 1003, 989, 989]) { engine.autoScan([{ ...it, price }]); await flush(); }
+    const lines = logged(engine, /^Scanner setup not taken: BUY ICT 15m Volatility 100 Index/).map((e) => e.detail);
+    assert.equal(lines.length, 2, JSON.stringify(lines));
+    assert.match(lines[0], /more than 0.25R/);
+    assert.match(lines[1], /past its stop loss/);
+    assert.equal(sentOf(sock, "proposal").length, 0);
+  } finally { ctx.cleanup(); }
+});

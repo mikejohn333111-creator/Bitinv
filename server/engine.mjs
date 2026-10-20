@@ -209,7 +209,7 @@ export class TradingEngine {
     this.onlineAt = 0; this.watchdogTimer = null;
     this.symbolInfo = new Map();         // symbol -> {at, multipliers, minStake, maxStake, none}: for scanner trades on other markets
     this.scanBusy = false;               // a scanner setup is being taken
-    this.scanSkipped = new Set();        // setup ids whose "not taken" reason was logged
+    this.scanSkipped = new Set();        // "setup id|reason" already logged as "not taken" (a new reason is logged again)
     this.closed = false;
   }
 
@@ -686,8 +686,9 @@ export class TradingEngine {
   #scanName(it) { return `${scanStrategyName(it.strategy)} ${SCAN_TF_NAMES[it.tf] || ""} ${it.name || it.symbol}`.replace(/\s+/g, " ").trim(); }
 
   #scanSkip(it, why) {
-    if (this.scanSkipped.has(it.id)) return;
-    this.scanSkipped.add(it.id);
+    const key = `${it.id}|${why}`;
+    if (this.scanSkipped.has(key)) return;
+    this.scanSkipped.add(key);
     if (this.scanSkipped.size > 500) this.scanSkipped.delete(this.scanSkipped.values().next().value);
     this.log("INFO", `Scanner setup not taken: ${it.side} ${this.#scanName(it)}`, `${why.charAt(0).toUpperCase()}${why.slice(1)}.`);
   }

@@ -52,6 +52,15 @@ const SCAN_STRATEGY_NAMES = { ict: "ICT", rules: "Rules", ai: "AI model" };
 const SCAN_TF_NAMES = { 900: "15m", 3600: "1h" };
 const SCAN_TAKEN_KEEP = 300;          // setup ids remembered (each is taken at most once)
 const SYMBOL_INFO_MS = 60 * 60000;    // a market's Multiplier range and stake limits are asked again after this
+/** The stake limit in a Deriv refusal like "Maximum stake allowed is 2000.00.", or null. */
+export function stakeLimit(message) {
+  const m = /maximum stake[^0-9]*([0-9][0-9,]*(?:\.[0-9]+)?)/i.exec(String(message ?? ""));
+  const max = m ? Number(m[1].replace(/,/g, "")) : NaN;
+  return max > 0 ? { max } : null;
+}
+
+const round2 = (v) => Math.round(v * 100) / 100;
+
 /** A time limit in plain words: "60 min", "30 hours". */
 export function spanText(bars, barSec = 60) {
   const min = Math.round((bars * barSec) / 60);
@@ -531,11 +540,26 @@ export class TradingEngine {
     const sock = this.socket, up = side === "BUY";
     let stage = "proposal";
     try {
-      const p = await sock.send({
+      const ask = () => sock.send({
         proposal: 1, amount: size.stake, basis: "stake", contract_type: up ? "MULTUP" : "MULTDOWN",
         currency: this.currency, underlying_symbol: symbol, multiplier: mult, duration_unit: "s",
         limit_order: { stop_loss: size.stopLoss, take_profit: size.takeProfit },
       });
+      let p;
+      try { p = await ask(); }
+      catch (e) {
+        // Deriv's stake limit can be lower than contracts_for said (or it didn't say): the
+        // stake, stop loss and take profit are scaled down to that limit and asked once more.
+        const limit = stakeLimit(e.message);
+        if (!limit || limit.max >= size.stake) throw e;
+        this.#learnMaxStake(symbol, limit.max);
+        const k = limit.max / size.stake;
+        size = { ...size, stake: limit.max, stopLoss: Math.max(round2(size.stopLoss * k), 0.01), takeProfit: Math.max(round2(size.takeProfit * k), 0.01) };
+        size.risk = size.stopLoss;
+        sizeText = `stake ${this.#money(size.stake)} at x${mult} · risk ${this.#money(size.stopLoss)} · target ${this.#money(size.takeProfit)}`;
+        this.log("INFO", `Stake capped at ${this.#money(limit.max)}`, `Deriv's largest stake for ${symbol} is ${limit.max}, so this trade risks less than your Risk per trade.`);
+        p = await ask();
+      }
       const prop = p.proposal;
       const commission = Number(prop.commission ?? prop.contract_details?.commission ?? NaN);
       if (Number.isFinite(commission)) this.lastCost = { commission, r: commission / size.stopLoss, currency: this.currency };
@@ -654,6 +678,12 @@ export class TradingEngine {
     this.scanSkipped.add(it.id);
     if (this.scanSkipped.size > 500) this.scanSkipped.delete(this.scanSkipped.values().next().value);
     this.log("INFO", `Scanner setup not taken: ${it.side} ${this.#scanName(it)}`, `${why.charAt(0).toUpperCase()}${why.slice(1)}.`);
+  }
+
+  /** Remembers a stake limit Deriv named in a refusal, so later trades are sized under it. */
+  #learnMaxStake(symbol, max) {
+    const known = this.symbolInfo.get(symbol);
+    if (known) known.maxStake = Math.min(known.maxStake, max);
   }
 
   /** A market's Multiplier range and stake limits (contracts_for), asked once an hour. */

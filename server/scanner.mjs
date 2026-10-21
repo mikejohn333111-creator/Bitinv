@@ -368,7 +368,9 @@ export class Scanner {
         this.queue.unshift(job);
         this.pausedUntil = this.now() + this.gapMs * 5;
       } else {
-        this.series.set(`${job.symbol}:${job.tf}`, { at: this.now(), items: [], trend: null, error: String(err?.message || "no answer").slice(0, 120) });
+        // A failed look keeps what the last good one found (each setup still leaves at its own time).
+        const key = `${job.symbol}:${job.tf}`, was = this.series.get(key);
+        this.series.set(key, { at: this.now(), items: was?.items || [], trend: was?.trend ?? null, error: String(err?.message || "no answer").slice(0, 120) });
         this.batch.done++;
       }
     } finally {

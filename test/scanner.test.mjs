@@ -189,11 +189,16 @@ test("Scanner: Deriv's rate limit pauses it (longer each time) and the market is
   await flush();
   assert.equal(sc.queue[0].tries, 1, "a lost answer: asked again a little later");
   t.now += 5000;
+  // what the last good look at this market found stays after a failed look, until its own time is up
+  const job = sc.queue[0], kept = { symbol: job.symbol, name: job.symbol, tf: 900, strategy: "ict", side: "BUY", status: "waiting", at: t.now, id: "kept", validUntil: t.now + 3600000 };
+  sc.series.set(`${job.symbol}:900`, { at: t.now, items: [kept], trend: "up", error: "" });
   sc.step(); await flush();
   e.answers.shift().reject(Object.assign(new Error("Symbol is invalid."), { code: "InvalidSymbol" }));
   await flush();
   assert.equal(sc.queue.length, 0);
   assert.equal(sc.view().failed, 1);
+  assert.deepEqual(sc.view().items.map((i) => i.id), ["kept"]);
+  assert.equal(sc.series.get(`${job.symbol}:900`).trend, "up");
   assert.equal(e.sent.length, 5);
 });
 
